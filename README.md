@@ -18,16 +18,27 @@ Full design: `docs/ARCHITECTURE.md`.
 
 ## Build
 
+Development (unsigned, one pass):
+
 ```
-powershell -ExecutionPolicy Bypass -File helpers\build.ps1          # development (unsigned)
-powershell -ExecutionPolicy Bypass -File helpers\build.ps1 -Sign    # release (signed)
+powershell -ExecutionPolicy Bypass -File helpers\build.ps1
 ```
 
-Release order is fixed and enforced by the script: build client, sign
-client, embed the signed client + its hash into Setup, build Setup, sign
-Setup. Signing rides the existing VIRULE Microsoft Artifact Signing
-workflow (`VIRULE_SECURITY\artifact-signing`: same signtool, dlib,
-metadata, timestamp service; no new Azure configuration).
+Release is a fixed two-stage sequence because Setup EMBEDS the SIGNED
+client. Nothing in this repo signs; signing is centralized in
+`VIRULE_SECURITY\artifact-signing` (the existing VIRULE Microsoft
+Artifact Signing workflow; no new Azure configuration):
+
+```
+1. powershell -ExecutionPolicy Bypass -File helpers\build.ps1 -Stage client
+2. VIRULE_SECURITY\artifact-signing\sign_client.bat
+3. powershell -ExecutionPolicy Bypass -File helpers\build.ps1 -Stage setup
+4. VIRULE_SECURITY\artifact-signing\sign_client_setup.bat
+```
+
+Step 4's gate refuses to sign a Setup whose embedded payload is not
+byte-identical to the validly signed client, so the order cannot be
+silently violated.
 
 Output: `build\Release\x64\{virule-client.exe, Virule-Setup.exe}`.
 

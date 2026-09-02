@@ -15,6 +15,19 @@ The port binds 127.0.0.1 ONLY. If 47612 is held by a foreign process the
 client logs it and exits; there is no fallback port and no remote exposure
 of any kind.
 
+LOCAL NETWORK ACCESS (verified in Edge, 2026-09-02): current Chromium
+gates a public https origin's loopback sockets behind the
+`local-network-access` permission - the first attempt shows a browser
+permission prompt in headed browsing and fails with
+ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS when denied. The virule.app
+pages therefore probe quietly only while the permission is already
+granted (Permissions API query), attempt ungated only after an explicit
+user action (ACCEPT), and never depend on the bridge to complete QA
+verification (virule:// + /qa/link polling is the bridge-free path). Do
+not paper over a denial with flags or lesser transports; the permission
+prompt IS the standards path, and local origins (wrangler dev, vite) are
+exempt, which is why development never sees it.
+
 Origin policy: browser connections must present one of the explicit
 allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
 listed local development origins in `src/client/bridge.hpp`); anything
