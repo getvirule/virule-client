@@ -1,0 +1,4 @@
+build/
+src/setup/payload/virule-client.exe
+src/setup/payload/payload_hash.h
+*.user
