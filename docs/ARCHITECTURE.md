@@ -342,3 +342,72 @@ process-launch surface: install runs only the pipeline above against the
 approved manifest (package SHA-256 + Authenticode + signer identity are
 the trust decision, exactly Virule-Setup's), and open launches only the
 managed installation the client itself placed.
+
+## QA game delivery (Phase 4)
+
+A QA tester installs, plays, updates and removes exactly the build their
+invitation authorizes. The browser is the management surface; this client
+does the machine-local work.
+
+### What the browser may say
+
+The QA page supplies a `game_uuid` and nothing else. The command set is
+closed and page-only: `qa_build_status`, `qa_build_install`,
+`qa_build_update`, `qa_build_play`, `qa_build_remove`,
+`qa_build_choose_root`. There is deliberately no url, path, executable or
+archive parameter anywhere in the group, so a page can say WHICH game but
+never WHAT to run or WHERE to write. `game_uuid` is an identifier, never
+an authorization: the client re-derives what may be installed from the
+backend against the tester's own signed credential.
+
+### Trusted metadata comes from the backend
+
+`/v1/qa/build/current` answers which build this tester may have, what it
+must hash to, how large it is and which executable inside it may be
+launched. `/v1/qa/build/download` mints a SHORT-LIVED delegated location
+on GitHub's asset infrastructure. Both are authenticated with the QA
+tester credential the existing verification flow already wrote, plus a
+fresh proof that this machine holds the credentialed key. The client
+never holds a GitHub credential, and no game bytes pass through the
+VIRULE Worker.
+
+### The verified staged pipeline (install and update are ONE path)
+
+Stream to staging hashed in flight and capped at the declared size; exact
+size, then exact SHA-256, never waived; zip-slip-guarded extraction (the
+same guard the Admin package uses); confirm the package really contains
+its declared executable; then atomic placement, with the previous install
+renamed straight back if the swap fails.
+
+GAME BINARIES ARE NOT SIGNATURE-GATED. A QA build is a developer's own
+unreleased game, and requiring Authenticode on it would reject every
+legitimate build. The trust boundary is the server-authorized artifact
+record plus the exact package hash, which is why the hash check has no
+waiver.
+
+Once accepted, the operation belongs to the client: it finishes even if
+every page closes (`g_busy` also holds off idle exit), and it NEVER
+launches the game at the end. The tester presses Play.
+
+### The library root is the tester's
+
+Games are not the Admin: they are large, and where they live is the
+tester's call. On the first QA install the client opens one native folder
+picker and remembers the answer in `state.json` (`qa_games_root`, stored
+in generic forward-slash form because `json_scan` is a marker scanner,
+not a parser). It is never asked again unless that place stops working.
+
+Inside that root the client owns exactly `VIRULE QA/<game_uuid>/` per
+game plus its transient staging siblings, recorded in
+`client\qa_installs.json` by ID, never by title. `qa_build_remove`
+deletes that ONE directory after confirming it is the directory this
+client would itself have created, then forgets the record. The library
+root and everything else in it are untouched. Removing a QA game and
+removing VIRULE are separate actions and always will be.
+
+### Running state
+
+Reported from the real process table by image-path prefix under the
+managed directory, so another copy of the same game elsewhere never
+counts. A running game is never killed: an update finds it and answers
+`game_running` so the page can say "Close [Game] to update."

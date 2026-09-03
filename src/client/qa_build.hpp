@@ -465,11 +465,63 @@ inline std::vector<qa_credential::Entry> candidate_credentials() {
     return out;
 }
 
+// A short memo of the last answer per game. The page polls status while a
+// game is running or installing, and without this every poll would spend a
+// request against the service's per-IP rate limit for an answer that cannot
+// meaningfully have changed. Operations always resolve FRESH (they pass
+// through resolve_current_uncached), so the cache can only ever make an idle
+// view slightly stale, never an install.
+struct CurrentCache {
+    std::string game_uuid;
+    AuthorizedBuild build;
+    qa_credential::Entry cred;
+    std::string why;
+    bool ok = false;
+    unsigned long long tick = 0;
+};
+inline std::mutex g_cache_mutex;
+inline CurrentCache g_cache;
+inline constexpr unsigned long long kCurrentCacheMs = 15000;
+
+inline void invalidate_current_cache() {
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    g_cache = CurrentCache{};
+}
+
+inline bool resolve_current_uncached(const std::string& game_uuid, AuthorizedBuild& out,
+                                     qa_credential::Entry& used, std::string& why);
+
+// The cached form the status answer uses.
+inline bool resolve_current_cached(const std::string& game_uuid, AuthorizedBuild& out,
+                                   qa_credential::Entry& used, std::string& why) {
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (g_cache.game_uuid == game_uuid && g_cache.tick != 0 &&
+            GetTickCount64() - g_cache.tick < kCurrentCacheMs) {
+            out = g_cache.build;
+            used = g_cache.cred;
+            why = g_cache.why;
+            return g_cache.ok;
+        }
+    }
+    const bool ok = resolve_current_uncached(game_uuid, out, used, why);
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_cache.game_uuid = game_uuid;
+        g_cache.build = out;
+        g_cache.cred = used;
+        g_cache.why = why;
+        g_cache.ok = ok;
+        g_cache.tick = GetTickCount64();
+    }
+    return ok;
+}
+
 // Resolve the authorized build for a game, trying each held credential. A
 // 403 means "not this one"; anything else stops the search, so a server
 // fault is never mistaken for "unauthorized".
-inline bool resolve_current(const std::string& game_uuid, AuthorizedBuild& out,
-                            qa_credential::Entry& used, std::string& why) {
+inline bool resolve_current_uncached(const std::string& game_uuid, AuthorizedBuild& out,
+                                     qa_credential::Entry& used, std::string& why) {
     const auto creds = candidate_credentials();
     if (creds.empty()) { why = "no QA credential on this machine"; return false; }
     for (const auto& cred : creds) {
@@ -598,7 +650,7 @@ inline std::string status_json(const std::string& game_uuid) {
         AuthorizedBuild build;
         qa_credential::Entry cred;
         std::string why;
-        if (resolve_current(game_uuid, build, cred, why)) {
+        if (resolve_current_cached(game_uuid, build, cred, why)) {
             authorized_build = build.build_uuid;
             if (!installed) {
                 state = "not_installed";
@@ -705,10 +757,12 @@ inline void run_install(const std::string& game_uuid) {
         return;
     }
 
-    // 1. What may this tester have?
+    // 1. What may this tester have? FRESH, never the status cache: an
+    // operation must act on the authorization as it is right now.
+    invalidate_current_cache();
     AuthorizedBuild build;
     qa_credential::Entry cred;
-    if (!resolve_current(game_uuid, build, cred, why)) {
+    if (!resolve_current_uncached(game_uuid, build, cred, why)) {
         log::client("qa build: not authorized: " + why);
         broadcast_result(game_uuid, why == "no build" ? "no_build" : "not_authorized");
         return;
@@ -821,6 +875,22 @@ inline void run_install(const std::string& game_uuid) {
         ec.clear();
         fs::remove_all(previous, ec);
     } else {
+        // Not a known install, but the directory can still be there: a
+        // record whose files were deleted behind the client's back reads as
+        // "not installed", and the rename would then fail against the
+        // leftover. Clear it first so a broken install can always be
+        // repaired by installing again.
+        ec.clear();
+        if (fs::exists(target, ec) && !ec) {
+            ec.clear();
+            fs::remove_all(target, ec);
+            if (ec) {
+                log::client("qa build: a leftover install directory could not be cleared");
+                cleanup_staging(root, game_uuid);
+                broadcast_result(game_uuid, "failed");
+                return;
+            }
+        }
         if (!admin_install::rename_with_retries(staging, target)) {
             log::client("qa build: placement failed");
             cleanup_staging(root, game_uuid);
