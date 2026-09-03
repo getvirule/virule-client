@@ -59,12 +59,20 @@ function Require-Signed([string]$path, [string]$label) {
 function Sha256([string]$path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant() }
 
 function Invoke-Gh([string[]]$GhArgs, [switch]$AllowFail) {
-    $out = & gh @GhArgs 2>&1
-    $code = $LASTEXITCODE
+    # PS 5.1: redirecting a native exe's stderr wraps each line in an
+    # ErrorRecord and, under $ErrorActionPreference='Stop', turns expected
+    # nonzero exits into terminating errors. Neutralize locally and
+    # stringify.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = (& gh @GhArgs 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
     if ($code -ne 0 -and -not $AllowFail) {
-        Fail ("gh {0} failed (exit {1}):`n{2}" -f ($GhArgs -join ' '), $code, ($out | Out-String))
+        Fail ("gh {0} failed (exit {1}):`n{2}" -f ($GhArgs -join ' '), $code, $out)
     }
-    return @{ Code = $code; Out = ($out | Out-String) }
+    return @{ Code = $code; Out = $out }
 }
 
 # Downloads one published release asset to a temp file; $null when the
