@@ -38,15 +38,21 @@ origin check defends against the web, not against local code.
 
 ### Message set (closed, versioned)
 
+An invite token is either the CURRENT 32-character Base64URL mint
+(192-bit, case-sensitive) or the LEGACY 64-lowercase-hex mint, accepted
+until those invites expire (`protocol_reg::is_invite_token`, one grammar
+in both components).
+
 | From | Message | Effect |
 |---|---|---|
 | page | `{"type":"status"}` | version, capability list, connected-page count, the Admin status block |
-| page | `{"type":"qa_accept","token":"<64 hex>"}` | asynchronous QA redemption (below) |
-| page | `{"type":"admin_install","shortcut":true\|false}` | the verified staged Admin install/update (below) |
+| page | `{"type":"qa_accept","token":"<invite token>"}` | asynchronous QA redemption (below) |
+| page/local | `{"type":"admin_install","shortcut":true\|false}` | the verified staged Admin install/update (below); a LOCAL sender is the Admin's own Settings Update through its host, shortcut always false there |
 | page | `{"type":"admin_open"}` | launch the managed Admin installation, and nothing else |
-| page | `{"type":"uninstall","nonce","timestamp","signature"}` | full VIRULE uninstall after verification |
+| page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
+| local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale |
 
 Client pushes: `{"type":"qa_result","token","state"}` and
 `{"type":"admin_result","state","version"}` to every connected page.
@@ -112,7 +118,7 @@ exactly two grammars and they are never confused:
 
 | URL | Meaning |
 |---|---|
-| `virule://qa/...` | the QA namespace (`qa/verify/<64 hex>` is the invitation page's ACCEPT fallback) |
+| `virule://qa/...` | the QA namespace (`qa/verify/<invite token>` is the invitation page's ACCEPT fallback; token = 32 Base64URL or legacy 64 hex) |
 | `virule://open` | a GENERIC WAKE: no task, NEVER a QA event, never a QA surface |
 
 Anything else is rejected with no action and no UI. Both components decide
@@ -202,13 +208,16 @@ component list, no license page, no user choice of any kind.
 | State | Copy |
 |---|---|
 | Working | `Setting up VIRULE...` + a subtle indeterminate bar |
-| Complete | `Setup is complete.` briefly, then it closes itself |
+| Complete | `VIRULE is ready` over `Return to your browser to finish.` briefly, then it closes itself |
 | Failed | one short human sentence; the technical reason goes to the log only |
 
-The status line sits at the same coordinates in every state. The copy never
-says "return to your browser": by then the browser may be closed, and
-recovering it is Setup's job. Setup never sits open indefinitely (a failure
-surface is dismissible and leaves on its own after 60 s).
+The status line sits at the same coordinates in every state. The completion
+copy CAN say "return to your browser" (owner spec 2026-09-03: Setup must
+say what to do next) because Setup makes it true either way: an open
+virule.app page continues the flow itself, and when none is left Setup
+reopens the resume URL in the originating browser. Setup never sits open
+indefinitely (a failure surface is dismissible and leaves on its own after
+60 s).
 
 ### Setup's browser handoff
 
@@ -277,19 +286,26 @@ no stopping point and no second install button. An already-installed
 Admin means the work is done (the client finished it after the page
 closed); the intent is cleared and the page settles.
 
-Full VIRULE uninstall removes an EXPLICIT ownership inventory and nothing
-else (see `src/shared/uninstall.hpp`): the install dir (the managed
-`Admin\` installation included), the client state dir, `qa_tester*.cred`,
-`dev_machine.cred` ONLY when client-created AND no `virule.db` exists,
-`virule://` ONLY while it points at this client, the uninstall entry, the
-desktop `VIRULE.lnk` ONLY when the client created it (state.json
-provenance), and the shared `VIRULE\` folders only if left empty. The
-running exe hands removal to a `%TEMP%` copy (`--finish-uninstall <pid>`)
-so no broken executable is left behind. Development trees (the VIRULE
-repository, its `virule\publish\Virule` folder) are outside every
-inventory root and can never be touched. A full VIRULE uninstall and
-removing an individual future game are SEPARATE actions forever; this
-inventory must never grow a recursive game-library delete.
+VIRULE uninstall has TWO EXPLICIT MODES (owner spec 2026-09-03; see
+`src/shared/uninstall.hpp`), both driven by an explicit ownership
+inventory. The DEFAULT preserves user data: it removes the install dir
+(the managed `Admin\` installation included), the client state dir,
+`virule://` ONLY while it points at this client, the uninstall entry, and
+the desktop `VIRULE.lnk` ONLY when the client created it (state.json
+provenance); `virule.db`, `workspace\`, `logs\`, `backup.json` and the
+whole `security\` credential store (dev_machine.cred AND qa_tester*.cred)
+all stay, and the shared `VIRULE\` folder goes only if left empty. The
+explicit DELETE LOCAL DATA mode (the `delete_data` flag behind the site
+modal's toggle / the native dialog's checkbox, each with its "cannot be
+undone" warning) additionally removes the entire `%LOCALAPPDATA%\VIRULE\`
+user-data root. Both surfaces say "Uninstall VIRULE" (never "Remove").
+The running exe hands removal to a `%TEMP%` copy
+(`--finish-uninstall <pid> [--delete-data]`) so no broken executable is
+left behind. Development trees (the VIRULE repository, its
+`virule\publish\Virule` folder) and the user's chosen build root are
+outside every inventory root and can never be touched. A full VIRULE
+uninstall and removing an individual future game are SEPARATE actions
+forever; this inventory must never grow a recursive game-library delete.
 
 ## The managed VIRULE Admin installation (Phase 2)
 
@@ -323,18 +339,31 @@ known-good install always survives. The manifest's version is recorded in
 state.json (`admin_version`); the Admin binaries are never probed for a
 version.
 
-A RUNNING ADMIN IS NEVER KILLED: an update that finds any process running
-out of the managed directory (or its files locked) answers
-`admin_running` and changes nothing; the page says "Close VIRULE to
-update." and offers a retry.
+THE CLIENT OWNS THE UPDATE LIFECYCLE (owner spec 2026-09-03). An update
+that finds the Admin running no longer refuses: after a ~4 s grace (the
+initiating surface shows the approved "Shutting down VIRULE" / "One
+moment..." messaging), the client closes the Admin GRACEFULLY (WM_CLOSE to
+its top-level window; never TerminateProcess, never any unrelated
+process), waits bounded for every managed-directory process to exit, runs
+the verified staged pipeline, and RELAUNCHES the Admin it closed. An
+Admin that refuses to close still answers `admin_running` and changes
+nothing (the safe fallback, no longer the normal path); an already-closed
+Admin skips the grace entirely and is not relaunched.
+
+THE SILENT UPDATE CHECK: the client caches the approved manifest's
+version (client startup, a quiet 6-hour recheck while serving, and a
+15-minute-fresh refetch on the local `admin_update_check` ask), only ever
+while a managed install exists. Checking is automatic; INSTALLING is
+always user-initiated (Admin Settings > GENERAL > Update, or virule.app's
+Update VIRULE). The Admin host owns no manifest logic: it asks over a
+local control connection, starting the on-demand client when needed.
 
 Once accepted, the operation finishes even if every page closes
 (`g_busy` also holds off the idle-exit policy), and a FRESH install
-launches the installed Admin automatically at the end; an update leaves
-the user where they are. The desktop shortcut (`VIRULE.lnk`, target =
-the managed `virule.exe`) is created when the browser's intent asked for
-one, and its provenance is recorded so uninstall removes exactly what the
-client created.
+launches the installed Admin automatically at the end. The desktop
+shortcut (`VIRULE.lnk`, target = the managed `virule.exe`) is created
+when the browser's intent asked for one, and its provenance is recorded
+so uninstall removes exactly what the client created.
 
 `admin_install`/`admin_open` are page messages behind the same origin
 policy, but they are CLOSED operations, not a filesystem or

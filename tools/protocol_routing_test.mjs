@@ -80,11 +80,28 @@ console.log("A. the wake grammar is one grammar, implemented twice");
       adminToken.includes('"virule://qa/verify/"'),
   );
   check(
-    "both require 64 lowercase hex",
+    "both parse-token implementations are identical",
     clientToken !== null && adminToken !== null &&
-      clientToken.includes("0123456789abcdef") &&
-      adminToken.includes("0123456789abcdef") &&
-      clientToken.includes("!= 64") === adminToken.includes("!= 64"),
+      normalize(clientToken) === normalize(adminToken),
+    "the two components would accept different QA verify URLs",
+  );
+  check(
+    "both preserve token case (Base64URL is case-sensitive)",
+    clientToken !== null && adminToken !== null &&
+      clientToken.includes("url.substr(prefix.size())") &&
+      adminToken.includes("url.substr(prefix.size())"),
+    "extracting from the lowered string would corrupt Base64URL tokens",
+  );
+
+  const clientIsToken = body(clientHeader, "bool is_invite_token(");
+  const adminIsToken = body(adminMain, "bool is_invite_token(");
+  check(
+    "both token grammars exist and are identical (32 Base64URL or 64 hex)",
+    clientIsToken !== null && adminIsToken !== null &&
+      normalize(clientIsToken) === normalize(adminIsToken) &&
+      clientIsToken.includes("0123456789abcdef") &&
+      clientIsToken.includes("0123456789-_"),
+    "the two components would disagree about what an invite token is",
   );
 }
 

@@ -33,8 +33,21 @@
 //   9. desktop shortcut if the browser's pending intent asked for one;
 //  10. on a FRESH install, launch the installed Admin automatically.
 //
-// A running Admin is never killed: an update that finds the Admin running
-// (or its files locked) reports admin_running and changes nothing.
+// THE CLIENT OWNS THE UPDATE LIFECYCLE (owner spec 2026-09-03): an update
+// that finds the Admin running tells no one to close anything by hand.
+// After a short grace (the surfaces that initiated the update show the
+// approved "Shutting down VIRULE" messaging during it), the client closes
+// the Admin GRACEFULLY (WM_CLOSE, the same path as the user's own close
+// button; never TerminateProcess), waits for it to exit, performs the
+// verified staged update, and relaunches the Admin it closed. An Admin
+// that refuses to close changes nothing: admin_running is still the
+// answer, and the known-good install survives untouched.
+//
+// THE SILENT UPDATE CHECK: the client caches the approved manifest's
+// version (startup, a periodic recheck while serving, and on the Admin
+// Settings query) so the Admin can show "Update available" without owning
+// any manifest logic itself. Checking is automatic; INSTALLING is always
+// user-initiated.
 //
 // BROWSER STATE IS INTENT, NOT AUTHORIZATION - and this operation needs no
 // browser-side authorization because everything installed is gated by the
@@ -45,6 +58,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #include "client/bridge.hpp"
@@ -169,14 +183,15 @@ inline std::string status_json() {
 
 // ---- open ----
 
-// Bring the running managed Admin's window to the front (best effort). The
-// Admin's main window is a CEF Views window (Chromium's own class), so the
-// stable match is: a visible, unowned top-level window whose owning process
-// runs out of the managed Admin directory.
-inline void focus_running_admin() {
+// The running managed Admin's top-level window, or nullptr. The Admin's
+// main window is a CEF Views window (Chromium's own class), so the stable
+// match is: a visible, unowned top-level window whose owning process runs
+// out of the managed Admin directory.
+inline HWND find_running_admin_window() {
     const auto dir = paths::admin_install_dir();
-    if (dir.empty()) return;
+    if (dir.empty()) return nullptr;
     std::wstring prefix = dir.wstring();
+    if (prefix.empty()) return nullptr;
     if (prefix.back() != L'\\') prefix += L'\\';
     for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
 
@@ -205,9 +220,41 @@ inline void focus_running_admin() {
             return FALSE;
         },
         (LPARAM)&ctx);
-    if (ctx.found == nullptr) return;
-    if (IsIconic(ctx.found)) ShowWindow(ctx.found, SW_RESTORE);
-    SetForegroundWindow(ctx.found);
+    return ctx.found;
+}
+
+// Bring the running managed Admin's window to the front (best effort).
+inline void focus_running_admin() {
+    HWND hwnd = find_running_admin_window();
+    if (hwnd == nullptr) return;
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+}
+
+// GRACEFUL shutdown of the running managed Admin for an update: WM_CLOSE
+// to its top-level window (exactly the user's own close button; never
+// TerminateProcess, never any unrelated process), then wait for every
+// managed-directory process to exit. One repeat close request midway
+// covers a message that was swallowed while the window was busy. False =
+// the Admin refused or timed out; NOTHING was changed and the caller
+// answers admin_running.
+inline bool close_running_admin(unsigned long long wait_ms) {
+    HWND hwnd = find_running_admin_window();
+    if (hwnd != nullptr) PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    const ULONGLONG deadline = GetTickCount64() + wait_ms;
+    bool reposted = false;
+    for (;;) {
+        if (!admin_running()) return true;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return false;
+        if (!reposted && deadline - now < wait_ms / 2) {
+            if (HWND again = find_running_admin_window()) {
+                PostMessageW(again, WM_CLOSE, 0, 0);
+            }
+            reposted = true;
+        }
+        Sleep(500);
+    }
 }
 
 // Launch the INSTALLED Admin, and only it. Not a process-launch surface:
@@ -354,6 +401,73 @@ inline bool fetch_manifest(Manifest& out, std::string& why) {
         }
     }
     return true;
+}
+
+// ---- the silent Admin update check ----
+// AUTOMATIC CHECKING, USER-INITIATED INSTALLING (owner spec 2026-09-03).
+// The client is the one component that reads the approved manifest, so it
+// caches the approved version here; the Admin's Settings page asks over a
+// local control connection and owns no manifest logic. No check ever runs
+// while no managed Admin install exists (nothing to update = no traffic).
+
+// A fresh explicit ask (Settings opening) tolerates a cache this old;
+// beyond it the manifest is refetched.
+constexpr unsigned long long kUpdateCheckFreshMs = 15ull * 60ull * 1000ull;
+// The quiet periodic recheck while the client happens to be serving.
+constexpr unsigned long long kUpdateCheckPeriodMs = 6ull * 60ull * 60ull * 1000ull;
+
+inline std::mutex g_update_mutex;
+inline std::string g_approved_version;             // "" = no answer yet
+inline unsigned long long g_update_check_tick = 0; // 0 = never attempted
+
+// Refresh the cached approved version when the cache is older than
+// `fresh_ms`. The attempt instant is stamped up front so a failing network
+// can never turn the quiet check into a hammer.
+inline void refresh_update_check(unsigned long long fresh_ms) {
+    if (!admin_installed()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        const unsigned long long now = GetTickCount64();
+        if (g_update_check_tick != 0 && now - g_update_check_tick < fresh_ms) {
+            return;
+        }
+        g_update_check_tick = now;
+    }
+    Manifest manifest;
+    std::string why;
+    if (!fetch_manifest(manifest, why)) {
+        log::client("admin: update check failed: " + why);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (g_approved_version != manifest.version) {
+        log::client("admin: update check: approved version " + manifest.version);
+    }
+    g_approved_version = manifest.version;
+}
+
+// The admin_update_status answer for the bridge's local
+// admin_update_check message.
+inline std::string update_status_json() {
+    const bool installed = admin_installed();
+    std::string admin_version;
+    if (installed) admin_version = state::load().admin_version;
+    if (installed) refresh_update_check(kUpdateCheckFreshMs);
+    std::string approved;
+    {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        approved = g_approved_version;
+    }
+    const bool update = installed && !approved.empty() &&
+                        approved != admin_version;
+    std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
+    out += installed ? "true" : "false";
+    out += ",\"admin_version\":\"" + json_scan::json_escape(admin_version) + "\"";
+    out += ",\"approved_version\":\"" + json_scan::json_escape(approved) + "\"";
+    out += ",\"update\":";
+    out += update ? "true" : "false";
+    out += "}";
+    return out;
 }
 
 // ---- extraction (miniz over a file-backed reader; nothing buffers the
@@ -543,11 +657,24 @@ inline void run(bool shortcut) {
     log::client(std::string("admin: ") + (was_installed ? "update" : "install") +
                 " requested" + (shortcut ? " (desktop shortcut)" : ""));
 
-    // An update of a running Admin never proceeds; check before any work.
+    // THE CLIENT OWNS THE SHUTDOWN (owner spec 2026-09-03). A running
+    // Admin is closed GRACEFULLY for the update: the initiating surface
+    // (Admin Settings, virule.app) has already shown the approved
+    // "Shutting down VIRULE" messaging, so a short grace lets it be seen,
+    // then WM_CLOSE and a bounded wait. A refusal changes nothing and
+    // still answers admin_running (the safe fallback, no longer the
+    // normal path). An already-closed Admin skips all of this.
+    bool closed_admin_for_update = false;
     if (was_installed && admin_running()) {
-        log::client("admin: update refused; the Admin is running");
-        broadcast_result("admin_running", "");
-        return;
+        log::client("admin: update requested while running; closing the Admin gracefully");
+        Sleep(4000); // the approved shutdown-message grace
+        if (!close_running_admin(25000)) {
+            log::client("admin: the Admin did not close; nothing changed");
+            broadcast_result("admin_running", "");
+            return;
+        }
+        closed_admin_for_update = true;
+        log::client("admin: the Admin closed; continuing the update");
     }
 
     // 1-2. The approved manifest.
@@ -699,9 +826,11 @@ inline void run(bool shortcut) {
         }
     }
 
-    // 10. A FRESH install opens the Admin automatically; an update leaves
-    // the user where they are.
-    if (!was_installed) {
+    // 10. A FRESH install opens the Admin automatically, and the client
+    // RELAUNCHES an Admin it closed for this update (the user never
+    // reopens VIRULE by hand). An update of an Admin that was already
+    // closed leaves the user where they are.
+    if (!was_installed || closed_admin_for_update) {
         (void)open_installed_admin();
     }
 

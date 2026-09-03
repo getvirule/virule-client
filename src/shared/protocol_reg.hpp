@@ -129,20 +129,34 @@ inline bool is_wake_url(const std::string& url) {
     return rest.empty() || rest[0] == '/' || rest[0] == '?' || rest[0] == '#';
 }
 
-// virule://qa/verify/<64 lowercase hex> (a trailing slash or a
-// query/fragment suffix is tolerated; anything else is not a QA
-// verification URL).
+// An invitation token, exactly as the service mints them: the CURRENT
+// 32-character Base64URL form (192-bit, no padding, case-SENSITIVE) or the
+// LEGACY 64-lowercase-hex form (accepted until those invites expire).
+inline bool is_invite_token(const std::string& s) {
+    if (s.size() == 64) {
+        return s.find_first_not_of("0123456789abcdef") == std::string::npos;
+    }
+    if (s.size() == 32) {
+        return s.find_first_not_of(
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                   "abcdefghijklmnopqrstuvwxyz0123456789-_") ==
+               std::string::npos;
+    }
+    return false;
+}
+
+// virule://qa/verify/<token> (a trailing slash or a query/fragment suffix
+// is tolerated; anything else is not a QA verification URL). The prefix
+// matches case-insensitively but the token is taken from the ORIGINAL
+// string: Base64URL tokens are case-sensitive and must never be lowercased.
 inline std::optional<std::string> parse_qa_verify_token(const std::string& url) {
     const std::string lower = lowered(url);
     const std::string prefix = "virule://qa/verify/";
     if (lower.rfind(prefix, 0) != 0) return std::nullopt;
-    std::string rest = lower.substr(prefix.size());
+    std::string rest = url.substr(prefix.size());
     const size_t end = rest.find_first_of("/?#");
     if (end != std::string::npos) rest = rest.substr(0, end);
-    if (rest.size() != 64 ||
-        rest.find_first_not_of("0123456789abcdef") != std::string::npos) {
-        return std::nullopt;
-    }
+    if (!is_invite_token(rest)) return std::nullopt;
     return rest;
 }
 

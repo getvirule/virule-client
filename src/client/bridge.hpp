@@ -34,20 +34,26 @@
 //     public key. The bridge itself never trusts a bare localhost caller
 //     with a destructive action.
 //
-// MESSAGES (text frames, JSON):
+// MESSAGES (text frames, JSON). An invite token is either the current
+// 32-character Base64URL mint or the legacy 64-lowercase-hex mint
+// (protocol_reg::is_invite_token):
 //   page -> client   {"type":"status"}
-//                    {"type":"qa_accept","token":"<64 hex>"}
+//                    {"type":"qa_accept","token":"<invite token>"}
 //                    {"type":"admin_install","shortcut":true|false}
 //                    {"type":"admin_open"}
 //                    {"type":"uninstall","nonce":"<32 hex>",
-//                     "timestamp":"<UTC>","signature":"<128 hex>"}
-//   local -> client  {"type":"qa_verify_url","token":"<64 hex>"}  (2nd instance)
+//                     "timestamp":"<UTC>","signature":"<128 hex>",
+//                     "delete_data":true|false}
+//   local -> client  {"type":"qa_verify_url","token":"<invite token>"} (2nd instance)
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
+//                    {"type":"admin_install"}          (Admin Settings Update)
+//                    {"type":"admin_update_check"}     (Admin Settings query)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin"}
 //                    {"type":"accepted"}
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
+//                    {"type":"admin_update_status","installed",...,"update"}
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"admin_result","state":...,"version":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
@@ -71,6 +77,7 @@
 
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
+#include "shared/protocol_reg.hpp"
 #include "shared/version.h"
 #include "virule/core/embargo_signing.hpp"
 #include "virule/core/launch_policy.hpp"
@@ -124,8 +131,15 @@ struct Callbacks {
     // The Admin status block embedded in every status answer
     // ({"installed","version","running"}), or empty = "null".
     std::function<std::string()> admin_status_json;
-    // A verified uninstall authorization arrived from a page.
-    std::function<void()> on_uninstall;
+    // A local caller (the Admin's Settings page, through its host) asked
+    // whether an approved Admin update exists. Answers the FULL
+    // admin_update_status JSON message; may fetch the manifest (bounded)
+    // when the cached answer is stale.
+    std::function<std::string()> admin_update_status_json;
+    // A verified uninstall authorization arrived from a page. The flag is
+    // the page's explicit Delete local data choice; false (the default)
+    // preserves every piece of user-owned VIRULE data.
+    std::function<void(bool delete_data)> on_uninstall;
     // A local process asked this instance to exit (Setup replacing us).
     std::function<void()> on_shutdown;
 };
@@ -448,8 +462,7 @@ inline void handle_client(SOCKET client) {
         std::string type, token;
         (void)js::find_string_in(payload, 0, payload.size(), "type", type);
         (void)js::find_string_in(payload, 0, payload.size(), "token", token);
-        const bool token_ok = token.size() == 64 &&
-            token.find_first_not_of("0123456789abcdef") == std::string::npos;
+        const bool token_ok = protocol_reg::is_invite_token(token);
 
         if (type == "status") {
             // "pages" is the number of connected virule.app pages (this one
@@ -473,18 +486,32 @@ inline void handle_client(SOCKET client) {
                             ",\"admin\":" + admin + "}")) {
                 return;
             }
-        } else if (type == "admin_install" && is_page) {
+        } else if (type == "admin_install") {
             // The verified staged Admin install/update. The pipeline itself
             // is the authorization (approved manifest hash + Authenticode +
-            // the VIRULE signer identity); the page only expresses intent,
-            // including the desktop-shortcut preference it captured.
+            // the VIRULE signer identity); the caller only expresses intent.
+            // A PAGE carries the desktop-shortcut preference it captured; a
+            // LOCAL caller is the Admin's own Settings Update (through the
+            // Admin host's control connection), which never asks for one.
+            // Local trust model: a local process could run Setup itself, so
+            // accepting a local install request weakens nothing.
             if (g_callbacks.on_admin_install) {
-                const bool shortcut =
+                const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
                 g_callbacks.on_admin_install(shortcut);
                 if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
             } else {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            }
+        } else if (type == "admin_update_check" && !is_page) {
+            // The Admin Settings row's availability question. Local-only:
+            // virule.app pages read /client/admin-manifest.json themselves.
+            const std::string answer = g_callbacks.admin_update_status_json
+                ? g_callbacks.admin_update_status_json() : std::string();
+            if (answer.empty()) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            } else {
+                if (!reply(0x1, answer)) return;
             }
         } else if (type == "admin_open" && is_page) {
             const bool opened = g_callbacks.on_admin_open &&
@@ -508,9 +535,14 @@ inline void handle_client(SOCKET client) {
             (void)js::find_string_in(payload, 0, payload.size(), "timestamp", timestamp);
             (void)js::find_string_in(payload, 0, payload.size(), "signature", signature);
             if (uninstall_authorization_valid(nonce, timestamp, signature)) {
+                // The explicit destructive option. Absent or false = the
+                // default uninstall, which PRESERVES user-owned local data.
+                const bool delete_data =
+                    payload.find("\"delete_data\":true") != std::string::npos;
                 if (!reply(0x1, "{\"type\":\"uninstall_started\"}")) return;
-                log::client("bridge: verified uninstall authorization accepted");
-                if (g_callbacks.on_uninstall) g_callbacks.on_uninstall();
+                log::client(std::string("bridge: verified uninstall authorization accepted") +
+                            (delete_data ? " (delete local data)" : " (keep local data)"));
+                if (g_callbacks.on_uninstall) g_callbacks.on_uninstall(delete_data);
                 return;
             }
             log::client("bridge: uninstall refused (invalid authorization)");

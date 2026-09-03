@@ -257,6 +257,17 @@ async function main() {
     check("qa_result pushed with state invalid",
       !!r2 && r2.includes('"qa_result"') && r2.includes(`"${bogus}"`) && r2.includes('"invalid"'),
       r2 ?? "none");
+    // The CURRENT token mint: 32 Base64URL characters. A random one is
+    // accepted by the grammar and resolves invalid at the service.
+    const bogus32 = crypto.randomBytes(24).toString("base64url");
+    c.sendText(`{"type":"qa_accept","token":"${bogus32}"}`);
+    const r3 = await c.next();
+    check("qa_accept accepts the 32-character Base64URL token grammar",
+      r3 === '{"type":"accepted"}', r3 ?? "none");
+    const r4 = await c.next(20000);
+    check("32-character token resolves invalid at the service",
+      !!r4 && r4.includes('"qa_result"') && r4.includes(`"${bogus32}"`) && r4.includes('"invalid"'),
+      r4 ?? "none");
     c.end();
   }
 
@@ -285,17 +296,33 @@ async function main() {
     }
     c.end();
 
+    // admin_install is deliberately NOT sent from the local connection
+    // either: since the client-owned update lifecycle (2026-09-03) a local
+    // admin_install is the Admin Settings Update path and runs the real
+    // pipeline. Only the non-mutating local surface is exercised.
     const local = await connect({ origin: null });
     await local.next(); // hello
-    local.sendText('{"type":"admin_install","shortcut":false}');
-    const r1 = await local.next();
-    check("admin_install from a local no-origin connection is refused",
-      r1 === '{"type":"error"}', r1 ?? "none");
+    local.sendText('{"type":"admin_update_check"}');
+    const r1 = await local.next(25000);
+    check("admin_update_check from a local connection answers admin_update_status",
+      !!r1 && r1.includes('"admin_update_status"') &&
+      r1.includes('"installed":') && r1.includes('"update":'),
+      r1 ?? "none");
     local.sendText('{"type":"admin_open"}');
     const r2 = await local.next();
     check("admin_open from a local no-origin connection is refused",
       r2 === '{"type":"error"}', r2 ?? "none");
     local.end();
+
+    // admin_update_check stays local-only: pages read the manifest
+    // themselves, so a page asking gets the closed-set error answer.
+    const page = await connect();
+    await page.next(); // hello
+    page.sendText('{"type":"admin_update_check"}');
+    const r3 = await page.next();
+    check("admin_update_check from a page is refused",
+      r3 === '{"type":"error"}', r3 ?? "none");
+    page.end();
   }
 
   console.log(`\n${pass} passed, ${fail} failed`);

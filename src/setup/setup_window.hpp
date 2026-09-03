@@ -10,17 +10,22 @@
 //
 // NOT A WIZARD. No pages, no Next/Back, no destination picker, no component
 // list, no license page, no technical terminology, no user choices of any
-// kind. Three states, one line of copy each:
+// kind. Three states:
 //
 //   Working    "Setting up VIRULE..."   + a subtle indeterminate bar
-//   Complete   "Setup is complete."     briefly, then the window closes
+//   Complete   "VIRULE is ready" over "Return to your browser to finish."
+//              briefly, then the window closes itself (owner spec
+//              2026-09-03: Setup must clearly say what to do next)
 //   Failed     one short human sentence; the technical reason goes to the
 //              log, never here
 //
-// The copy never says "return to your browser": by the time Setup finishes
-// the browser may be closed, and recovering that is Setup's job, not the
-// user's. Layout is fixed: the status line sits at the same coordinates in
-// every state, so moving between them never shifts anything.
+// The completion copy CAN say "return to your browser" because Setup makes
+// it true either way: an already-open virule.app page continues the flow
+// on its own (Setup opens nothing), and when none is left, Setup itself
+// reopens the resume URL in the originating browser, so a browser to
+// return to always exists. Layout is fixed: the status line sits at the
+// same coordinates in every state, so moving between them never shifts
+// anything.
 
 #include <atomic>
 #include <mutex>
@@ -207,19 +212,49 @@ inline void paint(HWND hwnd) {
     }
 
     // The status line. Fixed top edge in EVERY state, so the states never
-    // shift each other; up to two lines for a failure sentence.
+    // shift each other; up to two lines for a failure sentence. When the
+    // copy carries a '\n' (the completion state), the FIRST line is the
+    // primary statement and paints in the word color; the rest stays muted.
     {
         const std::wstring line = current_line();
-        HFONT f = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old_f = SelectObject(mem, f);
-        SetTextColor(mem, g_pal.muted);
+        const size_t nl = line.find(L'\n');
+        const std::wstring first =
+            nl == std::wstring::npos ? line : line.substr(0, nl);
+        const std::wstring rest =
+            nl == std::wstring::npos ? L"" : line.substr(nl + 1);
         RECT tr{ sc(26), sc(152), w - sc(26), h - sc(14) };
-        DrawTextW(mem, line.c_str(), (int)line.size(), &tr,
-                  DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
+        if (rest.empty()) {
+            HFONT f = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HGDIOBJ old_f = SelectObject(mem, f);
+            SetTextColor(mem, g_pal.muted);
+            DrawTextW(mem, first.c_str(), (int)first.size(), &tr,
+                      DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+            SelectObject(mem, old_f);
+            DeleteObject(f);
+        } else {
+            HFONT f1 = CreateFontW(-sc(12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HGDIOBJ old_f = SelectObject(mem, f1);
+            SetTextColor(mem, g_pal.word);
+            RECT r1{ tr.left, tr.top, tr.right, tr.top + sc(18) };
+            DrawTextW(mem, first.c_str(), (int)first.size(), &r1,
+                      DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(mem, old_f);
+            DeleteObject(f1);
+            HFONT f2 = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+            HGDIOBJ old_f2 = SelectObject(mem, f2);
+            SetTextColor(mem, g_pal.muted);
+            RECT r2{ tr.left, tr.top + sc(20), tr.right, tr.bottom };
+            DrawTextW(mem, rest.c_str(), (int)rest.size(), &r2,
+                      DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+            SelectObject(mem, old_f2);
+            DeleteObject(f2);
+        }
     }
 
     BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -330,7 +365,12 @@ inline void set_state(Stage stage, const std::wstring& line) {
     if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
 }
 
-inline void set_complete() { set_state(Stage::Complete, L"Setup is complete."); }
+// The approved completion state (owner spec 2026-09-03): what happened,
+// then exactly what to do next. Shown briefly; the window closes itself.
+inline void set_complete() {
+    set_state(Stage::Complete,
+              L"VIRULE is ready\nReturn to your browser to finish.");
+}
 
 // One short, human, non-technical sentence. The reason belongs in the log.
 inline void set_failed(const std::wstring& human_line) {

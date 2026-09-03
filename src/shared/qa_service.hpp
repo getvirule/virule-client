@@ -21,6 +21,7 @@
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/machine_identity.hpp"
+#include "shared/protocol_reg.hpp"
 #include "virule/core/launch_policy.hpp"
 #include "virule/core/time.hpp"
 
@@ -55,9 +56,8 @@ inline bool redeem_invite(const std::string& token,
     namespace js = vclient::json_scan;
     outcome = RedeemOutcome{};
     error_out.clear();
-    const bool token_ok = token.size() == 64 &&
-        token.find_first_not_of("0123456789abcdef") == std::string::npos;
-    if (!token_ok) {
+    // 32-character Base64URL (current mint) or 64 lowercase hex (legacy).
+    if (!protocol_reg::is_invite_token(token)) {
         outcome.state = "invalid";
         return true;
     }

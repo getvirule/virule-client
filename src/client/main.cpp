@@ -41,6 +41,7 @@
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
+#include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
 #include "shared/logging.hpp"
 #include "shared/paths.hpp"
@@ -92,26 +93,16 @@ bool forward_to_running_instance(const std::string& message) {
         vclient::bridge::kPort, nullptr, "\"virule_client\"", message, response);
 }
 
-// The minimal native removal confirmation (Windows Apps & Features entry
-// point; the browser owns this confirmation whenever the flow starts
-// there). Sparse by rule: title, one sentence, Cancel / Remove VIRULE.
-bool confirm_uninstall_native() {
-    // MessageBox keeps this dependency-free; the button labels are the
-    // standard system pair and the text carries the owner's exact copy.
-    const int r = MessageBoxW(nullptr,
-        L"This removes VIRULE and its local data from this computer.",
-        L"Remove VIRULE?",
-        MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND);
-    return r == IDOK;
-}
-
 // A verified uninstall: leave Serving, free the port, hand the removal to
 // the %TEMP% helper and exit. Never deletes anything in-process.
-void begin_uninstall_and_exit() {
+// `delete_data` is the explicit destructive option; the default preserves
+// every piece of user-owned VIRULE data.
+void begin_uninstall_and_exit(bool delete_data) {
     g_state.store(RunState::Uninstalling);
-    vclient::log::client("uninstall: starting (helper handoff)");
+    vclient::log::client(std::string("uninstall: starting (helper handoff, ") +
+                         (delete_data ? "delete local data)" : "keep local data)"));
     vclient::bridge::stop_listening();
-    if (!vclient::uninstall::spawn_uninstall_helper()) {
+    if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) {
         vclient::log::client("uninstall: helper could not be started; nothing removed");
         g_state.store(RunState::Serving);
         return;
@@ -166,7 +157,12 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     callbacks.admin_status_json = []() {
         return vclient::admin_install::status_json();
     };
-    callbacks.on_uninstall = []() { begin_uninstall_and_exit(); };
+    callbacks.admin_update_status_json = []() {
+        return vclient::admin_install::update_status_json();
+    };
+    callbacks.on_uninstall = [](bool delete_data) {
+        begin_uninstall_and_exit(delete_data);
+    };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
         g_exit_requested.store(true);
@@ -174,6 +170,25 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     vclient::bridge::start(callbacks);
     g_state.store(RunState::Serving);
     vclient::log::client(std::string("serving, version ") + VIRULE_CLIENT_VERSION_STRING);
+
+    // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
+    // INSTALLING): one check at startup, then a quiet periodic recheck
+    // while this process happens to be serving. Both no-op instantly when
+    // no managed Admin install exists, so machines without one create no
+    // background traffic. The thread is detached and dies with the process.
+    if (HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID) -> DWORD {
+                vclient::admin_install::refresh_update_check(
+                    vclient::admin_install::kUpdateCheckFreshMs);
+                for (;;) {
+                    Sleep(60000);
+                    vclient::admin_install::refresh_update_check(
+                        vclient::admin_install::kUpdateCheckPeriodMs);
+                }
+            },
+            nullptr, 0, nullptr)) {
+        CloseHandle(h);
+    }
 
     // A virule:// launch that made this process the instance carries its
     // work in. The grace window lets the invitation page reconnect to
@@ -214,8 +229,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring arg1 = (argc > 1) ? argv[1] : L"";
     std::wstring arg2 = (argc > 2) ? argv[2] : L"";
     bool no_register = false;
+    bool delete_data_arg = false;
     for (int i = 1; i < argc; ++i) {
         if (std::wstring(argv[i]) == L"--no-register") no_register = true;
+        if (std::wstring(argv[i]) == L"--delete-data") delete_data_arg = true;
     }
     LocalFree(argv);
     if (arg1 == L"--no-register") arg1.clear();
@@ -224,17 +241,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (arg1 == L"--finish-uninstall") {
         unsigned long pid = 0;
         try { pid = std::stoul(arg2); } catch (...) {}
-        return vclient::uninstall::finish_uninstall(pid);
+        return vclient::uninstall::finish_uninstall(pid, delete_data_arg);
     }
 
     // ---- Windows-initiated uninstall (Apps & Features / command line) ----
     if (arg1 == L"--uninstall") {
-        if (!confirm_uninstall_native()) return 0;
+        // The native confirmation mirrors the site's uninstall modal: the
+        // DEFAULT preserves the user's local VIRULE data, and only the
+        // explicit Delete local data option (with its own warning) makes
+        // the removal destructive.
+        bool delete_data = false;
+        if (!vclient::uninstall_dialog::run(delete_data)) return 0;
         // May be the installed exe itself: single instance must not block
         // the removal. Ask a running instance to leave first.
         (void)forward_to_running_instance("{\"type\":\"shutdown\"}");
         Sleep(300);
-        if (!vclient::uninstall::spawn_uninstall_helper()) return 1;
+        if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) return 1;
         return 0;
     }
 

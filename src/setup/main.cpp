@@ -12,9 +12,10 @@
 // No elevation, no machine-wide state, no service, no login task.
 //
 // VISIBLE SURFACE (setup_window.hpp): one small native card, "Setting up
-// VIRULE..." then "Setup is complete.", then it closes itself. Running and
-// vanishing with no window at all was technically correct and read as
-// untrustworthy.
+// VIRULE..." then "VIRULE is ready" / "Return to your browser to finish.",
+// then it closes itself. Running and vanishing with no window at all was
+// technically correct and read as untrustworthy; finishing without saying
+// what to do next read as a dead end (owner spec 2026-09-03).
 //
 // BROWSER HANDOFF (the normal path, then the recovery):
 //   1. Setup starts the client.
@@ -126,8 +127,10 @@ constexpr DWORD kPageGraceMs = 12000;
 // through virule:// without ever appearing in the pages count.
 constexpr DWORD kExtendedGraceMs = 48000;
 
-// The completion state is seen, not read: brief and then gone.
-constexpr DWORD kCompleteVisibleMs = 1400;
+// The completion state now carries an instruction ("VIRULE is ready" /
+// "Return to your browser to finish."), so it stays long enough to read,
+// still brief, then gone.
+constexpr DWORD kCompleteVisibleMs = 2600;
 
 std::string narrow(const std::wstring& w) {
     if (w.empty()) return "";
