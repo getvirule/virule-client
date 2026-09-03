@@ -39,6 +39,7 @@
 
 #include "client/admin_install.hpp"
 #include "client/bridge.hpp"
+#include "client/qa_build.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
 #include "shared/client_state.hpp"
@@ -166,6 +167,50 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     callbacks.admin_status_json = []() {
         return vclient::admin_install::status_json();
     };
+    // ---- QA GAME DELIVERY (Phase 4) ----
+    callbacks.on_qa_build_status = [](const std::string& game_uuid) {
+        // Consults the backend, so it can take a moment; it runs on the
+        // asking connection's own thread and blocks nothing else.
+        return vclient::qa_build::status_json(game_uuid);
+    };
+    callbacks.on_qa_build_install = [](const std::string& game_uuid) {
+        // Download, verify, extract and place run off the connection thread.
+        // Once accepted the operation is the CLIENT'S: it finishes even if
+        // every page closes (g_busy also holds off idle exit), and it never
+        // launches the game at the end.
+        struct Arg { std::string game_uuid; };
+        auto* arg = new Arg{ game_uuid };
+        HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID p) -> DWORD {
+                Arg* a = (Arg*)p;
+                vclient::qa_build::run_install(a->game_uuid);
+                delete a;
+                return 0;
+            },
+            arg, 0, nullptr);
+        if (h) CloseHandle(h); else delete arg;
+    };
+    callbacks.on_qa_build_play = [](const std::string& game_uuid) {
+        return vclient::qa_build::play(game_uuid);
+    };
+    callbacks.on_qa_build_remove = [](const std::string& game_uuid) {
+        return vclient::qa_build::remove(game_uuid);
+    };
+    callbacks.on_qa_build_choose_root = []() {
+        // The picker is modal; it must never hold a bridge socket open.
+        HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID) -> DWORD {
+                std::string chosen, why;
+                const bool ok = vclient::qa_build::choose_root(chosen, why);
+                vclient::bridge::broadcast_to_pages(
+                    std::string("{\"type\":\"qa_build_root\",\"chosen\":") +
+                    (ok ? "true" : "false") + "}");
+                if (!ok) vclient::log::client("qa build: library root not set (" + why + ")");
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    };
     callbacks.on_uninstall = []() { begin_uninstall_and_exit(); };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
@@ -193,7 +238,8 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             break;
         }
         if (vclient::bridge::g_open_connections.load() == 0 &&
-            !vclient::admin_install::g_busy.load()) {
+            !vclient::admin_install::g_busy.load() &&
+            !vclient::qa_build::g_busy.load()) {
             const unsigned long long last = vclient::bridge::g_last_activity_tick.load();
             if (last != 0 && GetTickCount64() - last > kIdleExitMs) {
                 vclient::log::client("idle; exiting");

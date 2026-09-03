@@ -57,6 +57,40 @@ inline bool signature_valid(const Entry& e) {
         credential_message(e), e.signature);
 }
 
+// Read every credential this machine holds (Phase 4: the QA build client
+// authenticates with one of them). Same flat scan the writer's merge step
+// uses, so reader and writer can never disagree about the shape. Entries
+// whose signature does not verify are dropped: a credential this service did
+// not sign is not a credential.
+inline std::vector<Entry> load_all(const std::filesystem::path& security_dir,
+                                   const char* file_name = kFileName) {
+    namespace js = vclient::json_scan;
+    std::vector<Entry> out;
+    std::ifstream in(security_dir / file_name, std::ios::binary);
+    if (!in) return out;
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    size_t p = text.find('[');
+    const size_t end = text.rfind(']');
+    while (p != std::string::npos && end != std::string::npos && p < end) {
+        const size_t ob = text.find('{', p);
+        if (ob == std::string::npos || ob >= end) break;
+        const size_t oe = text.find('}', ob);
+        if (oe == std::string::npos || oe > end) break;
+        Entry e;
+        if (js::find_string_in(text, ob, oe, "organization_id", e.organization_id) &&
+            js::find_string_in(text, ob, oe, "tester_id", e.tester_id)) {
+            (void)js::find_string_in(text, ob, oe, "machine_key", e.machine_key);
+            (void)js::find_string_in(text, ob, oe, "bound_utc", e.bound_utc);
+            (void)js::find_string_in(text, ob, oe, "signature", e.signature);
+            (void)js::find_string_in(text, ob, oe, "organization_name", e.organization_name);
+            if (signature_valid(e)) out.push_back(std::move(e));
+        }
+        p = oe + 1;
+    }
+    return out;
+}
+
 // Save one verified credential, replacing any earlier entry for the same
 // relationship. Best-effort atomic: temp file + rename. Byte-compatible
 // with the Admin's writer.
