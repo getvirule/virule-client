@@ -589,7 +589,18 @@ inline bool resolve_download(const qa_credential::Entry& cred,
 // somewhere else never reads as running.
 inline bool game_running(const fs::path& dir) {
     if (dir.empty()) return false;
-    std::wstring prefix = dir.wstring();
+    // NORMALIZE THE SEPARATORS FIRST. Managed install paths are stored in
+    // GENERIC (forward slash) form, and path::wstring() preserves exactly
+    // what it was given, while QueryFullProcessImageNameW always answers with
+    // backslashes. Comparing the two raw makes this prefix test never match,
+    // so every game reads as "not running": the running state never appears,
+    // remove would happily delete a live install, and update falls through to
+    // the rename-lock fallback instead of refusing cleanly.
+    std::error_code ec;
+    fs::path canon = fs::weakly_canonical(dir, ec);
+    if (ec || canon.empty()) canon = dir;
+    canon.make_preferred();
+    std::wstring prefix = canon.wstring();
     if (prefix.empty()) return false;
     if (prefix.back() != L'\\') prefix += L'\\';
     for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
