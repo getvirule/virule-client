@@ -1,12 +1,9 @@
-// Virule-Setup.exe resources: VERSIONINFO + the embedded SIGNED client
-// payload. helpers/build.ps1 stages the signed virule-client.exe into
-// payload\ (and generates payload\payload_hash.h) before this compiles.
+// Virule-Setup.exe resources: VERSIONINFO only. Setup embeds NO client
+// payload: it downloads the approved client release from
+// downloads.virule.app and verifies it (manifest SHA-256 + Authenticode +
+// the VIRULE signing identity) before installing.
 #include <winres.h>
 #include "../shared/version.h"
-
-// The signed client payload (RCDATA id 1001; setup main.cpp's
-// kPayloadResourceId).
-1001 RCDATA "payload\\virule-client.exe"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION VIRULE_CLIENT_VERSION_MAJOR,VIRULE_CLIENT_VERSION_MINOR,VIRULE_CLIENT_VERSION_PATCH,0
