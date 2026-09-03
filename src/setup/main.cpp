@@ -29,10 +29,12 @@
 //
 // CLIENT ACQUISITION (Setup and the client are INDEPENDENT signed
 // artifacts; Setup embeds nothing):
-//   1. fetch https://downloads.virule.app/client/manifest.json - the small
-//      mutable pointer to the approved client release;
-//   2. validate it structurally (version grammar, a downloads.virule.app
-//      /client/ HTTPS url, a 64-hex SHA-256, a bounded size);
+//   1. fetch manifest.json from the getvirule/virule-client LATEST GitHub
+//      Release - the small mutable pointer to the approved client release
+//      (publishing a release is what moves it);
+//   2. validate it structurally (version grammar, an HTTPS
+//      github.com/getvirule/virule-client/releases/download/ url, a 64-hex
+//      SHA-256, a bounded size);
 //   3. download the approved client binary, capped at the manifest's own
 //      declared size;
 //   4. the downloaded bytes must match the manifest SHA-256 EXACTLY;
@@ -40,6 +42,9 @@
 //      expected VIRULE signing identity.
 // Any failure refuses the install. The hash gate always holds;
 // --dev-unsigned (development only) waives only the signature gates.
+// GitHub is a HOST, not a trust anchor: nothing is weakened because the
+// bytes come from a public release; the manifest hash + Authenticode +
+// signer identity remain the whole trust decision.
 
 #include <filesystem>
 #include <fstream>
@@ -75,10 +80,19 @@
 
 namespace {
 
-// The R2-backed VIRULE distribution surface. The manifest is the ONLY
-// mutable object; every client binary lives at an immutable versioned path.
-constexpr wchar_t kDownloadsHost[] = L"downloads.virule.app";
-constexpr wchar_t kManifestPath[] = L"/client/manifest.json";
+// The GitHub-Releases-backed VIRULE distribution surface
+// (getvirule/virule-client). The LATEST release's manifest is the mutable
+// pointer; every client binary lives at its release's own immutable
+// versioned asset URL. GitHub serves release assets through an
+// https -> https redirect to its CDN, which WinHTTP's default redirect
+// policy follows.
+constexpr wchar_t kManifestUrl[] =
+    L"https://github.com/getvirule/virule-client/releases/latest/download/manifest.json";
+
+// The prefix every manifest client url must carry in production: a DIRECT
+// versioned release-asset URL of this repository, nothing else.
+constexpr char kClientUrlPrefix[] =
+    "https://github.com/getvirule/virule-client/releases/download/";
 
 // The identity every downloaded client must be signed with. Public
 // certificate subject material, not a secret; authenticode_valid remains
@@ -219,9 +233,10 @@ bool is_version_grammar(const std::string& s) {
 
 // Structural validation IS the manifest contract: anything that does not
 // parse into exactly this shape is refused before a single payload byte is
-// fetched. `pin_host` is the production rule (the url must live under
-// https://downloads.virule.app/client/); the --manifest-url= development
-// seam relaxes only the pin, never the grammar and never the hash gate.
+// fetched. `pin_host` is the production rule (the url must be a direct
+// versioned release asset under kClientUrlPrefix); the --manifest-url=
+// development seam relaxes only the pin, never the grammar and never the
+// hash gate.
 bool parse_manifest(const std::string& body, bool pin_host, Manifest& out,
                     std::string& why) {
     if (!vclient::json_scan::find_string_in(body, 0, body.size(), "version", out.version) ||
@@ -251,10 +266,8 @@ bool parse_manifest(const std::string& body, bool pin_host, Manifest& out,
         return false;
     }
     if (pin_host) {
-        const std::string prefix =
-            std::string("https://") + narrow(kDownloadsHost) + "/client/";
-        if (out.url.rfind(prefix, 0) != 0) {
-            why = "manifest url is not under https://downloads.virule.app/client/";
+        if (out.url.rfind(kClientUrlPrefix, 0) != 0) {
+            why = std::string("manifest url is not under ") + kClientUrlPrefix;
             return false;
         }
     }
@@ -323,8 +336,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             resume_url = arg.substr(13);
         } else if (arg.rfind(L"--manifest-url=", 0) == 0) {
             // Development seam: fetch the release manifest from a local
-            // server instead of downloads.virule.app. Relaxes only the
-            // host pin; the hash gate and (without --dev-unsigned) the
+            // server instead of the GitHub release. Relaxes only the
+            // repository pin; the hash gate and (without --dev-unsigned) the
             // signature gates hold exactly as in production.
             manifest_url = arg.substr(15);
         }
@@ -361,11 +374,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         "unparseable --manifest-url");
         }
         vclient::log::setup("DEV manifest url: " + narrow(manifest_url));
-    } else {
-        murl.secure = true;
-        murl.host = kDownloadsHost;
-        murl.port = 443;
-        murl.path = kManifestPath;
+    } else if (!parse_url(kManifestUrl, murl)) {
+        // A compile-time constant; unreachable unless the constant rots.
+        return fail(L"VIRULE couldn't be downloaded. Try again later.",
+                    "built-in manifest url unparseable");
     }
     unsigned long status = 0;
     std::string manifest_body;

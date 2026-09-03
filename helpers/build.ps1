@@ -3,16 +3,16 @@
 # (sign_client.bat / sign_client_setup.bat).
 #
 # virule-client.exe and Virule-Setup.exe are INDEPENDENT signed artifacts.
-# Setup embeds nothing: it downloads the approved client release from
-# downloads.virule.app at install time and verifies it (manifest SHA-256 +
-# Authenticode + the VIRULE signing identity). There is no build coupling
-# and no required order between the two; sign whichever artifact was
-# rebuilt.
+# Setup embeds nothing: it downloads the approved client release from the
+# getvirule/virule-client GitHub Release at install time and verifies it
+# (manifest SHA-256 + Authenticode + the VIRULE signing identity). There is
+# no build coupling and no required order between the two; sign whichever
+# artifact was rebuilt.
 #
 # Release flow per artifact:
 #   client: helpers\build.ps1 -Stage client  ->  sign_client.bat
 #   setup : helpers\build.ps1 -Stage setup   ->  sign_client_setup.bat
-# Publishing to R2 (downloads.virule.app) is helpers\publish.ps1.
+# Publishing to the GitHub Release is helpers\publish.ps1.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File helpers\build.ps1 [-Stage all|client|setup]
 

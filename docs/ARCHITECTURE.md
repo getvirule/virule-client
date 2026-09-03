@@ -139,29 +139,39 @@ Single instance: `Local\ViruleClient.Singleton` mutex; a second launch
 forwards its URL (or a wake) to the running instance over the bridge and
 exits.
 
-## Distribution (downloads.virule.app)
+## Distribution (GitHub Releases, getvirule/virule-client)
 
-Setup and the client are INDEPENDENT signed artifacts served from the
-Cloudflare R2 bucket `virule-downloads` behind
-`https://downloads.virule.app`:
+Setup and the client are INDEPENDENT signed artifacts published as GitHub
+Release assets on `getvirule/virule-client` (a public repository; release
+assets are only publicly downloadable from public repositories):
 
-| Object | Mutability | Cache |
-|---|---|---|
-| `/Virule-Setup.exe` | replaced when Setup changes | normal (max-age 300) |
-| `/client/manifest.json` | THE mutable pointer to the approved client release | no-cache |
-| `/client/<version>/virule-client.exe` | IMMUTABLE; a version is never rewritten | max-age 1y, immutable |
+| Asset (per release tag `v<version>`) | Mutability |
+|---|---|
+| `Virule-Setup.exe` | replaced when Setup changes |
+| `virule-client.exe` | IMMUTABLE; a published version is never rewritten |
+| `manifest.json` | describes THAT release's client |
+
+The LATEST release is the approved release. Setup follows
+`releases/latest/download/manifest.json`; the site links
+`releases/latest/download/Virule-Setup.exe`; publishing a new release is
+the act that moves the pointer. Direct asset URLs only (they redirect
+https to https onto GitHub's CDN; WinHTTP follows that by default), never
+the human release page.
 
 The manifest is minimal and secret-free:
-`{"version","url","sha256","size"}`. `helpers/publish.ps1` is the only
-writer: it refuses unsigned artifacts, refuses to overwrite a published
-version with different bytes, and verifies every uploaded object by
-re-downloading it.
+`{"version","url","sha256","size"}` in COMPACT JSON (the marker scanner
+takes no whitespace). `helpers/publish.ps1` is the only writer: it refuses
+unsigned artifacts, refuses to overwrite a published version with
+different bytes, and verifies every public asset URL by re-downloading it.
+GitHub is a HOST, not a trust anchor: everything a user runs is still
+gated by the manifest hash plus the VIRULE Authenticode identity below.
 
 ## Install / uninstall
 
-Setup fetches the manifest, validates it structurally (version grammar,
-an `https://downloads.virule.app/client/` url, 64-hex sha256, bounded
-size), downloads the approved client capped at the declared size, and
+Setup fetches the manifest, validates it structurally (version grammar, an
+HTTPS `github.com/getvirule/virule-client/releases/download/` url, 64-hex
+sha256, bounded size), downloads the approved client capped at the
+declared size, and
 enforces IN ORDER: exact size, manifest SHA-256 (never waived),
 Authenticode validity, and the VIRULE signer identity
 (`CN=Heath Michaels`) on the staged file. Any failure refuses the install
@@ -173,7 +183,7 @@ registers `virule://` + the `ViruleClient` HKCU uninstall entry
 version (the manifest's) in state.json, starts the client, hands the
 browser back, exits. Development seams: `--dev-unsigned` waives only the
 signature gates; `--manifest-url=` fetches the manifest elsewhere and
-relaxes only the host pin.
+relaxes only the repository pin.
 
 ### Setup's one native surface
 

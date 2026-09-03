@@ -12,7 +12,7 @@ Two Windows executables, one repository:
 | Executable | Role |
 |---|---|
 | `virule-client.exe` | Persistent per-user client: loopback bridge (`ws://127.0.0.1:47612/v1`), `virule://` handler, QA tester credential writer, full VIRULE uninstall. Single-instance, on-demand (no service, no login task), idle-exits after 20 minutes with no connections. |
-| `Virule-Setup.exe` | Disposable installer: fetches `https://downloads.virule.app/client/manifest.json`, downloads the approved SIGNED client release and verifies it (manifest SHA-256 + Authenticode + the VIRULE signing identity), installs to `%LOCALAPPDATA%\Programs\VIRULE`, registers `virule://` and the uninstall entry per-user (HKCU, no elevation), starts the client, hands the browser back, exits. ONE small native card ("Setting up VIRULE..." / "Setup is complete."); no wizard, no pages, no choices. Embeds NO client payload. |
+| `Virule-Setup.exe` | Disposable installer: fetches the latest GitHub Release's `manifest.json`, downloads the approved SIGNED client release and verifies it (manifest SHA-256 + Authenticode + the VIRULE signing identity), installs to `%LOCALAPPDATA%\Programs\VIRULE`, registers `virule://` and the uninstall entry per-user (HKCU, no elevation), starts the client, hands the browser back, exits. ONE small native card ("Setting up VIRULE..." / "Setup is complete."); no wizard, no pages, no choices. Embeds NO client payload. |
 
 Full design: `docs/ARCHITECTURE.md`.
 
@@ -37,32 +37,37 @@ setup : helpers\build.ps1 -Stage setup   ->  sign_client_setup.bat
 
 Output: `build\Release\x64\{virule-client.exe, Virule-Setup.exe}`.
 
-## Distribution (downloads.virule.app, Cloudflare R2)
+## Distribution (GitHub Releases on getvirule/virule-client)
 
-The R2 bucket `virule-downloads` behind `https://downloads.virule.app`
-serves exactly three things:
+GitHub Releases are the MVP binary distribution source. Each release tag
+`v<version>` carries exactly three assets:
 
 ```
-/Virule-Setup.exe                       the installer (stable URL)
-/client/manifest.json                   the ONE mutable pointer to the
-                                        approved client release (no-cache)
-/client/<version>/virule-client.exe     immutable versioned client binaries
+Virule-Setup.exe        the installer
+virule-client.exe       the immutable versioned client binary
+manifest.json           describes THAT release's client
+                        (version / direct asset url / sha256 / size)
 ```
+
+The LATEST release is the approved release: Setup fetches
+`https://github.com/getvirule/virule-client/releases/latest/download/manifest.json`
+and the site links
+`.../releases/latest/download/Virule-Setup.exe`; publishing a new release
+is what moves the pointer. Direct asset URLs only, never the release page.
 
 `helpers\publish.ps1` is the deterministic publisher: it refuses unsigned
-artifacts, uploads the client to its immutable versioned path (an existing
-version with different bytes is a hard failure, never an overwrite),
-regenerates the manifest (`version`/`url`/`sha256`/`size`), uploads Setup
-only when its bytes changed, and re-downloads everything to verify. It uses
-the established `CLOUDFLARE_VIRULE_API_TOKEN` credential convention. The
-client version comes from `src\shared\version.h`; bump it before publishing
-a changed client.
+artifacts, refuses to replace a published version's virule-client.exe with
+different bytes (bump `src\shared\version.h` instead), regenerates the
+manifest, uploads Setup only when its bytes changed, and re-downloads
+every public asset URL to verify. It uses the machine's existing `gh`
+login.
 
-At install time Setup enforces: manifest structure, the declared size, the
+At install time Setup enforces: manifest structure, an HTTPS
+`releases/download/` url pinned to this repository, the declared size, the
 manifest SHA-256 (never waived), Authenticode, and the VIRULE signer
-identity. `--dev-unsigned` (development only) waives only the signature
-gates; `--manifest-url=` points Setup at a local test manifest and relaxes
-only the downloads.virule.app host pin.
+identity. GitHub is a host, not a trust anchor. `--dev-unsigned`
+(development only) waives only the signature gates; `--manifest-url=`
+points Setup at a local test manifest and relaxes only the repository pin.
 
 ## Test
 

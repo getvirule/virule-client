@@ -3,8 +3,10 @@
 // product's press_key_service::detail::https_post_json (WinHTTP, TLS
 // validation ON - the WinHTTP default - bounded response, the same timeout
 // posture), plus the bounded GET Virule-Setup uses to fetch the release
-// manifest and the client binary from downloads.virule.app. Every response
-// is size-capped by the caller; nothing here ever writes a file.
+// manifest and the client binary from the GitHub release-asset URLs (an
+// https -> https redirect to GitHub's CDN, which WinHTTP's default
+// redirect policy follows). Every response is size-capped by the caller;
+// nothing here ever writes a file.
 
 #include <string>
 

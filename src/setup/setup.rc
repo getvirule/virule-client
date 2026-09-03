@@ -1,7 +1,7 @@
 // Virule-Setup.exe resources: VERSIONINFO only. Setup embeds NO client
-// payload: it downloads the approved client release from
-// downloads.virule.app and verifies it (manifest SHA-256 + Authenticode +
-// the VIRULE signing identity) before installing.
+// payload: it downloads the approved client release from the
+// getvirule/virule-client GitHub Release and verifies it (manifest
+// SHA-256 + Authenticode + the VIRULE signing identity) before installing.
 #include <winres.h>
 #include "../shared/version.h"
 
