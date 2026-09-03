@@ -90,15 +90,50 @@ inline void unregister_protocol() {
     RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\virule");
 }
 
-// virule://qa/verify/<64 lowercase hex> (a trailing slash or a
-// query/fragment suffix is tolerated; anything else is not a QA
-// verification URL). The Admin's parser, ported.
-inline std::optional<std::string> parse_qa_verify_token(const std::string& url) {
+// ---- the virule:// grammar (ONE grammar, implemented in two components) ----
+//
+// The scheme carries exactly two shapes and they are never confused:
+//
+//   virule://qa/...    the QA namespace (qa/verify/<token> is the invitation
+//                      page's ACCEPT fallback);
+//   virule://open      a GENERIC WAKE. It carries no task, it is NEVER a QA
+//                      event, and it must never produce a QA surface.
+//
+// Anything else is rejected without action. The VIRULE Admin implements the
+// identical functions (src/cli/main.cpp, namespace qa_protocol) and
+// tools/protocol_routing_test.mjs fails if the two ever diverge.
+
+inline std::string lowered(const std::string& url) {
     std::string lower;
     lower.reserve(url.size());
     for (const char c : url) {
         lower += (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
     }
+    return lower;
+}
+
+// The QA namespace. Only a URL inside it may ever reach QA verification, so
+// a malformed invite still gets the QA answer while nothing outside qa/ can
+// produce a QA surface.
+inline bool is_qa_url(const std::string& url) {
+    return lowered(url).rfind("virule://qa/", 0) == 0;
+}
+
+// The plain wake URL: virule://open (a trailing slash or a query/fragment
+// suffix is tolerated). The browser's install flow uses it to start local
+// VIRULE without commanding anything.
+inline bool is_wake_url(const std::string& url) {
+    const std::string lower = lowered(url);
+    if (lower.rfind("virule://open", 0) != 0) return false;
+    const std::string rest = lower.substr(13);
+    return rest.empty() || rest[0] == '/' || rest[0] == '?' || rest[0] == '#';
+}
+
+// virule://qa/verify/<64 lowercase hex> (a trailing slash or a
+// query/fragment suffix is tolerated; anything else is not a QA
+// verification URL).
+inline std::optional<std::string> parse_qa_verify_token(const std::string& url) {
+    const std::string lower = lowered(url);
     const std::string prefix = "virule://qa/verify/";
     if (lower.rfind(prefix, 0) != 0) return std::nullopt;
     std::string rest = lower.substr(prefix.size());
@@ -109,20 +144,6 @@ inline std::optional<std::string> parse_qa_verify_token(const std::string& url) 
         return std::nullopt;
     }
     return rest;
-}
-
-// A plain wake URL: virule://open (optionally with a trailing slash or
-// suffix). The browser's install flow uses it to start the client without
-// commanding anything.
-inline bool is_wake_url(const std::string& url) {
-    std::string lower;
-    lower.reserve(url.size());
-    for (const char c : url) {
-        lower += (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-    }
-    if (lower.rfind("virule://open", 0) != 0) return false;
-    const std::string rest = lower.substr(13);
-    return rest.empty() || rest[0] == '/' || rest[0] == '?' || rest[0] == '#';
 }
 
 } // namespace vclient::protocol_reg

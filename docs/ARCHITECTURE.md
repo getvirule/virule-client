@@ -40,7 +40,7 @@ origin check defends against the web, not against local code.
 
 | From | Message | Effect |
 |---|---|---|
-| page | `{"type":"status"}` | version + capability list |
+| page | `{"type":"status"}` | version, capability list, connected-page count |
 | page | `{"type":"qa_accept","token":"<64 hex>"}` | asynchronous QA redemption (below) |
 | page | `{"type":"uninstall","nonce","timestamp","signature"}` | full VIRULE uninstall after verification |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
@@ -50,6 +50,12 @@ Client pushes: `{"type":"qa_result","token","state"}` to every connected
 page (each page filters by token). Everything else answers
 `{"type":"error"}`. Frames over 4 KB, unmasked client frames, and
 malformed handshakes drop the connection.
+
+`status` carries `"pages"`, the number of connected virule.app PAGES.
+Local control connections are never counted, which is what makes it
+usable by Setup: Setup asks over its own local connection whether a
+browser page reached the freshly installed client, and so whether the
+browser is still driving the flow (see "Setup's browser handoff").
 
 ## Security model
 
@@ -96,13 +102,38 @@ anywhere does the minimal native result card appear.
 
 ## virule://
 
-Registered per-user (`HKCU\Software\Classes\virule`), byte-identical shape
-to the Admin's registration, self-healed on every client run (`--no-register`
-skips this for development). The Admin also re-registers on every GUI
-launch: whichever VIRULE component ran last holds the protocol, and BOTH
-handle `virule://qa/verify/<token>` identically, so the QA flow works
-either way. `virule://open` is the plain wake URL. Anything else is
-rejected without action.
+ONE protocol, TWO components, DETERMINISTIC routing. The scheme carries
+exactly two grammars and they are never confused:
+
+| URL | Meaning |
+|---|---|
+| `virule://qa/...` | the QA namespace (`qa/verify/<64 hex>` is the invitation page's ACCEPT fallback) |
+| `virule://open` | a GENERIC WAKE: no task, NEVER a QA event, never a QA surface |
+
+Anything else is rejected with no action and no UI. Both components decide
+the wake FIRST and only then the QA namespace, so a wake can never fall
+into QA. The grammar functions are implemented identically in
+`src/shared/protocol_reg.hpp` and the Admin's `src/cli/main.cpp`
+(`qa_protocol`); `tools/protocol_routing_test.mjs` fails if they diverge.
+
+REGRESSION THIS ENCODES (2026-09-02): a homepage `virule://open` was caught
+by VIRULE Admin, which treated every `virule://` launch as QA and, with
+Super Admin QA TEST MODE on, showed an expired QA invitation. A generic
+wake must never produce a QA surface in either component.
+
+OWNERSHIP: registration is per-user (`HKCU\Software\Classes\virule`), the
+same registry shape in both components. When the client is INSTALLED it is
+the canonical handler, because it is the process the browser's bridge is
+waiting for. The client self-heals its registration on every run
+(`--no-register` skips this for development). The Admin no longer takes
+the scheme back on every GUI launch: it prefers the installed client, heals
+a registration that names neither, and registers itself only when no client
+is installed. Both still handle `qa/verify` identically, so QA works
+whoever holds it.
+
+A generic wake reaching the Admin is a no-op that heals the registration
+and, if the client is installed, launches it with `virule://open` so the
+browser's bridge finds it. It reads no QA state at all, test mode included.
 
 Single instance: `Local\ViruleClient.Singleton` mutex; a second launch
 forwards its URL (or a wake) to the running instance over the bridge and
@@ -113,8 +144,92 @@ exits.
 Setup installs to `%LOCALAPPDATA%\Programs\VIRULE\virule-client.exe`,
 registers `virule://` + the `ViruleClient` HKCU uninstall entry
 (DisplayName "VIRULE", `--uninstall`), records the version in state.json,
-starts the client, exits. Payload verification order: baked SHA-256 first,
-then Authenticode on the staged file.
+starts the client, hands the browser back, exits. Payload verification
+order: baked SHA-256 first, then Authenticode on the staged file.
+
+### Setup's one native surface
+
+Setup used to run and vanish with no window: technically correct (the
+browser owns the flow) and, in practice, untrustworthy. It now shows ONE
+small card in VIRULE's native visual language (the Admin splash grammar:
+rounded card, yellow V mark, spaced wordmark, one muted line), and nothing
+more. NOT A WIZARD: no pages, no Next/Back, no destination picker, no
+component list, no license page, no user choice of any kind.
+
+| State | Copy |
+|---|---|
+| Working | `Setting up VIRULE...` + a subtle indeterminate bar |
+| Complete | `Setup is complete.` briefly, then it closes itself |
+| Failed | one short human sentence; the technical reason goes to the log only |
+
+The status line sits at the same coordinates in every state. The copy never
+says "return to your browser": by then the browser may be closed, and
+recovering it is Setup's job. Setup never sits open indefinitely (a failure
+surface is dismissible and leaves on its own after 60 s).
+
+### Setup's browser handoff
+
+Setup has ONE job: install, register and start the client. It does not
+decide whether the user wanted Admin, QA or anything else. THE BROWSER OWNS
+THAT INTENT (see "Browser-owned pending intent").
+
+After starting the client, Setup allows a short grace period (12 s) for a
+virule.app page to reach the client's bridge, asking over its own local
+connection (`status` -> `pages`). That is the NORMAL first-install outcome:
+the page that sent the user here is still open and picks the flow back up.
+When it happens Setup opens NOTHING; a duplicate tab would be a bug.
+
+Only when no page appears does Setup reopen the resume URL
+(`https://virule.app/?resume=setup`; `--resume-url=` is the development
+seam). The browser choice is a hierarchy, so a flow begun in Brave comes
+back in Brave even when Edge is the machine default:
+
+1. the ORIGINATING browser process is still alive -> open the URL through
+   that browser's executable, so it lands in that same running instance;
+2. that process is gone but its executable was captured -> launch that same
+   browser application with the URL;
+3. the originating browser cannot be determined -> the Windows default
+   browser, and only then.
+
+### Originating-browser capture
+
+`src/setup/origin_browser.hpp`, run FIRST at Setup startup, before any
+install work, because that is the only moment the browser is certain to
+still exist. It walks the process ANCESTRY upward (up to 8 levels): a
+downloaded-file launch may arrive through a shell hop or Explorer, so the
+immediate parent is never assumed to be the browser. Recognized names:
+Brave, Edge, Chrome, Firefox, Opera, Opera GX, Vivaldi. It records the
+image name, the full executable path, the PID, and a LIVE HANDLE, so
+liveness can never be fooled by PID reuse (a parent whose creation time is
+later than its child's is rejected as a recycled PID). The whole ancestry
+chain goes to the Setup log.
+
+NOT A SECURITY INPUT. Browser identity authorizes nothing, is never sent
+anywhere and is never written into installed state; it only decides which
+application shows a URL that is a compile-time constant. A wrong guess
+costs the user one tab.
+
+## Browser-owned pending intent
+
+The browser remembers WHY the user started, because that is where the user
+said it: "Get VIRULE" on the homepage is `INSTALL_ADMIN`, ACCEPT on an
+invitation is `QA_ACCEPT`. The record is persistent (localStorage, key
+`virule.pending`, 24 h expiry) on the virule.app origin, so it survives the
+browser closing during setup; sessionStorage would be gone exactly when it
+is needed. Shape and expiry are implemented twice, in the site's
+`src/client/pendingIntent.ts` and inline in the Worker's QA page
+(`VIRULE_BACKEND/src/qa_page.ts`); change one, change both.
+
+UX STATE, NEVER AUTHORIZATION. QA remains authorized end to end by the
+existing signed flow (service-minted invitation token, redemption with this
+machine's proof, credential signature verified against the embedded VIRULE
+key). A forged record can at most reopen a page. It is cleared at every
+terminal state.
+
+`INSTALL_ADMIN` also carries the desktop-shortcut preference asked at the
+protocol preflight. Nothing acts on it yet: installing VIRULE Admin is
+Phase 2, and a connected client with `INSTALL_ADMIN` pending says only
+"Ready to install VIRULE" and never claims the Admin is installed.
 
 Full VIRULE uninstall removes an EXPLICIT ownership inventory and nothing
 else (see `src/shared/uninstall.hpp`): the install dir, the client state

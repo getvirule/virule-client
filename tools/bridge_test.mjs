@@ -151,6 +151,37 @@ async function main() {
     c.end();
   }
 
+  console.log("A2. connected-page count (Setup's browser-handoff signal)");
+  {
+    // Setup asks over a LOCAL control connection whether a virule.app PAGE
+    // reached the client. A non-zero answer means the browser is still
+    // driving the flow and Setup must not open a second window.
+    const pagesFrom = (text) => {
+      const m = /"pages":(\d+)/.exec(text ?? "");
+      return m ? Number(m[1]) : null;
+    };
+
+    const local = await connect({ origin: null });
+    await local.next(); // hello
+    local.sendText('{"type":"status"}');
+    const idle = await local.next();
+    check("no pages connected reads 0", pagesFrom(idle) === 0, idle ?? "none");
+
+    const page = await connect();
+    await page.next(); // hello
+    local.sendText('{"type":"status"}');
+    const withPage = await local.next();
+    check("one open page reads 1 (local connections never count)",
+      pagesFrom(withPage) === 1, withPage ?? "none");
+
+    page.end();
+    await new Promise((r) => setTimeout(r, 400));
+    local.sendText('{"type":"status"}');
+    const after = await local.next();
+    check("a closed page stops counting", pagesFrom(after) === 0, after ?? "none");
+    local.end();
+  }
+
   console.log("B. versioned path");
   {
     let refused = false;

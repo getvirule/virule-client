@@ -12,7 +12,7 @@ Two Windows executables, one repository:
 | Executable | Role |
 |---|---|
 | `virule-client.exe` | Persistent per-user client: loopback bridge (`ws://127.0.0.1:47612/v1`), `virule://` handler, QA tester credential writer, full VIRULE uninstall. Single-instance, on-demand (no service, no login task), idle-exits after 20 minutes with no connections. |
-| `Virule-Setup.exe` | Disposable installer: verifies its embedded SIGNED client payload (baked SHA-256 + Authenticode), installs to `%LOCALAPPDATA%\Programs\VIRULE`, registers `virule://` and the uninstall entry per-user (HKCU, no elevation), starts the client, exits. No wizard, no pages, no windows on success. |
+| `Virule-Setup.exe` | Disposable installer: verifies its embedded SIGNED client payload (baked SHA-256 + Authenticode), installs to `%LOCALAPPDATA%\Programs\VIRULE`, registers `virule://` and the uninstall entry per-user (HKCU, no elevation), starts the client, hands the browser back, exits. ONE small native card ("Setting up VIRULE..." / "Setup is complete."); no wizard, no pages, no choices. |
 
 Full design: `docs/ARCHITECTURE.md`.
 
@@ -48,9 +48,15 @@ payload hash gate always holds; only the Authenticode gate is waived).
 ## Test
 
 ```
-build\Release\x64\virule-client.exe --no-register    # dev: keep the machine's virule:// as-is
+node tools\protocol_routing_test.mjs                  # virule:// routing (no client needed)
+build\Release\x64\virule-client.exe --no-register     # dev: keep the machine's virule:// as-is
 node tools\bridge_test.mjs                            # bridge protocol/security matrix
 ```
+
+`protocol_routing_test.mjs` is the regression for the homepage-to-QA
+misroute: it reads the routing source of BOTH components and fails if a
+generic `virule://open` could reach QA, or if the two implementations of
+the grammar ever drift apart.
 
 ## Boundaries
 

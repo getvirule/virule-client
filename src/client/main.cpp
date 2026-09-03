@@ -228,15 +228,27 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::string protocol_url;
     if (arg1.rfind(L"virule://", 0) == 0) protocol_url = narrow(arg1);
 
+    // DETERMINISTIC ROUTING (the same order the VIRULE Admin uses). The
+    // grammar decides and nothing else: a generic wake is decided FIRST and
+    // can never fall into QA, and only a URL inside the QA namespace may
+    // reach QA verification.
     std::string qa_token;
     if (!protocol_url.empty()) {
-        const auto token = vclient::protocol_reg::parse_qa_verify_token(protocol_url);
-        if (token) {
+        if (vclient::protocol_reg::is_wake_url(protocol_url)) {
+            // Generic wake: start (or keep) serving, carry no task. The
+            // browser owns whatever the user actually came for.
+        } else if (vclient::protocol_reg::is_qa_url(protocol_url)) {
+            const auto token = vclient::protocol_reg::parse_qa_verify_token(protocol_url);
+            if (!token) {
+                // Inside the QA namespace but malformed: rejected. Never
+                // trusted, never partially interpreted, no UI (the browser
+                // side owns messaging; a crafted URL earns nothing).
+                vclient::log::client("rejected virule:// input");
+                return 0;
+            }
             qa_token = *token;
-        } else if (!vclient::protocol_reg::is_wake_url(protocol_url)) {
-            // Malformed or unknown virule:// input: rejected. Never
-            // trusted, never partially interpreted, no UI (the browser
-            // side owns messaging; an attacker-crafted URL earns nothing).
+        } else {
+            // Unknown grammar: rejected with no action and no UI.
             vclient::log::client("rejected virule:// input");
             return 0;
         }

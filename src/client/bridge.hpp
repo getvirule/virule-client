@@ -43,7 +43,8 @@
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
-//                    {"type":"status",...} / {"type":"accepted"}
+//                    {"type":"status","version","capabilities","pages"}
+//                    {"type":"accepted"}
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
 //
@@ -179,6 +180,16 @@ inline bool page_send(PageConn* page, unsigned char opcode, const std::string& p
 inline bool any_page_open() {
     std::lock_guard<std::mutex> lock(g_pages_mutex);
     return !g_pages.empty();
+}
+
+// How many virule.app PAGES are connected right now. Local control
+// connections (a second instance, Setup) are never counted, which is what
+// makes this answer usable by Setup: it asks over its own local connection
+// whether a BROWSER page reached the freshly installed client, and so
+// whether the browser is still driving the flow.
+inline int open_page_count() {
+    std::lock_guard<std::mutex> lock(g_pages_mutex);
+    return (int)g_pages.size();
 }
 
 // Push one QA verification result to every connected page (each page
@@ -406,9 +417,14 @@ inline void handle_client(SOCKET client) {
             token.find_first_not_of("0123456789abcdef") == std::string::npos;
 
         if (type == "status") {
+            // "pages" is the number of connected virule.app pages (this one
+            // included when a page asks). Setup asks over a local control
+            // connection, which is not counted, so a non-zero answer there
+            // means a browser page found the client and still owns the flow.
             if (!reply(0x1, std::string("{\"type\":\"status\",\"v\":1,\"version\":\"")
                             + VIRULE_CLIENT_VERSION_STRING +
-                            "\",\"capabilities\":[\"qa\",\"uninstall\"]}")) {
+                            "\",\"capabilities\":[\"qa\",\"uninstall\"],\"pages\":" +
+                            std::to_string(open_page_count()) + "}")) {
                 return;
             }
         } else if (type == "qa_accept" && token_ok && is_page) {
