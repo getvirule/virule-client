@@ -6,15 +6,27 @@
 # removes LESS than it does: credentials under security\ are never touched,
 # so the machine identity and QA tester credentials survive the reset.
 #
+# Phase 2 changed the install layout: %LOCALAPPDATA%\Programs\VIRULE is now
+# a SHARED root. The client owns only virule-client.exe inside it; the
+# managed Admin lives at Programs\VIRULE\Admin\ and MUST SURVIVE this reset
+# (along with its Admin.previous / Admin.staging siblings from the update
+# pipeline). This helper therefore never deletes the Programs\VIRULE
+# directory recursively; it removes the exact client-owned entries only.
+#
 # Removes (and nothing else):
-#   %LOCALAPPDATA%\Programs\VIRULE\                          (installed client)
+#   %LOCALAPPDATA%\Programs\VIRULE\virule-client.exe         (installed client)
+#   %LOCALAPPDATA%\Programs\VIRULE\virule-client.exe.new     (stale staging)
 #   %LOCALAPPDATA%\VIRULE\client\                            (client state)
+#   %LOCALAPPDATA%\Programs\VIRULE\   ONLY when the reset leaves it EMPTY
+#                                    (i.e. no Admin is installed)
 #   HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ViruleClient
 #   HKCU:\Software\Classes\virule    ONLY if its shell\open\command points
 #                                    at virule-client.exe
 #
-# Never touched: virule.db, workspace\, logs\, backup.json, security\
-# (dev_machine.cred, qa_tester*.cred), qa_test_mode, any game files,
+# Never touched: Programs\VIRULE\Admin\ (the managed Admin, verified intact
+# before AND after), virule.db, workspace\, logs\, backup.json, security\
+# (dev_machine.cred, qa_tester*.cred), qa_test_mode, the desktop VIRULE.lnk
+# (it targets the managed Admin, which stays installed), any game files,
 # SidecarK, OverlayProducerCEF, anything in the development tree.
 #
 # Dry run:      .\helpers\reset_client_dev.ps1 -WhatIf
@@ -34,7 +46,9 @@ if (-not $localAppData) {
 }
 
 $installDir     = Join-Path $localAppData 'Programs\VIRULE'
+$adminDir       = Join-Path $installDir   'Admin'
 $clientExe      = Join-Path $installDir   'virule-client.exe'
+$clientExeNew   = Join-Path $installDir   'virule-client.exe.new'
 $clientStateDir = Join-Path $localAppData 'VIRULE\client'
 
 $uninstallKey   = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ViruleClient'
@@ -43,6 +57,9 @@ $protocolCmdKey = 'HKCU:\Software\Classes\virule\shell\open\command'
 
 # Must-never-touch inventory, verified before and after.
 $preserved = @(
+    $adminDir,
+    (Join-Path $adminDir 'virule.exe'),
+    (Join-Path $adminDir '.resources\admin\ViruleAdminHost.exe'),
     (Join-Path $localAppData 'VIRULE\virule.db'),
     (Join-Path $localAppData 'VIRULE\workspace'),
     (Join-Path $localAppData 'VIRULE\logs'),
@@ -55,29 +72,39 @@ $preserved = @(
     'D:\Dropbox\Dropbox\development\VIRULE\v2_mvp\virule\publish\Virule'
 )
 
-# ---- safety: every filesystem deletion target must live INSIDE one of the
-# two client-owned roots. Anything else is refused outright.
+# ---- safety: every filesystem deletion target must be EXACTLY one of the
+# client-owned entries. The shared Programs\VIRULE root is NEVER a recursive
+# deletion target, and nothing under Admin\ is ever eligible.
 
-$allowedRoots = @($installDir, $clientStateDir)
+$allowedFiles = @($clientExe, $clientExeNew)   # exact file paths only
+$allowedDirs  = @($clientStateDir)             # recursive removal allowed
 
 function Assert-ClientOwned([string]$Path) {
     $full = [System.IO.Path]::GetFullPath($Path)
-    foreach ($root in $allowedRoots) {
+    $adminFull = [System.IO.Path]::GetFullPath($adminDir)
+    if ($full.Equals($adminFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $full.StartsWith(($adminFull.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "REFUSED: '$Path' is inside the managed Admin installation. Nothing was deleted."
+    }
+    foreach ($f in $allowedFiles) {
+        if ($full.Equals([System.IO.Path]::GetFullPath($f), [System.StringComparison]::OrdinalIgnoreCase)) { return }
+    }
+    foreach ($root in $allowedDirs) {
         $rootFull = [System.IO.Path]::GetFullPath($root)
         if ($full.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) { return }
         if ($full.StartsWith(($rootFull.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)) { return }
     }
-    throw "REFUSED: '$Path' is outside the client-owned locations ($($allowedRoots -join '; ')). Nothing was deleted."
+    throw "REFUSED: '$Path' is not a client-owned entry (allowed files: $($allowedFiles -join '; '); allowed dirs: $($allowedDirs -join '; ')). Nothing was deleted."
 }
 
-# The client-owned roots must never be, or contain, a preserved path.
-foreach ($root in $allowedRoots) {
-    $rootFull = [System.IO.Path]::GetFullPath($root)
+# The client-owned targets must never be, or contain, a preserved path.
+foreach ($target in ($allowedFiles + $allowedDirs)) {
+    $targetFull = [System.IO.Path]::GetFullPath($target)
     foreach ($p in $preserved) {
         $pFull = [System.IO.Path]::GetFullPath($p)
-        if ($pFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
-            $pFull.StartsWith(($rootFull.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "REFUSED: preserved path '$p' lies inside deletion root '$root'."
+        if ($pFull.Equals($targetFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $pFull.StartsWith(($targetFull.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "REFUSED: preserved path '$p' lies inside deletion target '$target'."
         }
     }
 }
@@ -88,6 +115,20 @@ Write-Host ''
 Write-Host '=== VIRULE Client developer reset ===' -ForegroundColor Yellow
 if ($isDryRun) { Write-Host '--- DRY RUN (-WhatIf): nothing will be changed ---' -ForegroundColor Cyan }
 Write-Host ''
+
+# ---- 0. snapshot the managed Admin so its integrity is provable afterwards
+
+$adminSnapshot = $null
+if (Test-Path -LiteralPath $adminDir) {
+    $adminFiles = @(Get-ChildItem -LiteralPath $adminDir -Recurse -Force -File -ErrorAction SilentlyContinue)
+    $adminSnapshot = [pscustomobject]@{
+        FileCount  = $adminFiles.Count
+        TotalBytes = ($adminFiles | Measure-Object -Property Length -Sum).Sum
+    }
+    Write-Host ("Managed Admin present: {0} files, {1} bytes (will be verified untouched)." -f $adminSnapshot.FileCount, $adminSnapshot.TotalBytes)
+} else {
+    Write-Host 'Managed Admin not installed (nothing to protect there).'
+}
 
 # ---- 1. running client processes (match by executable path, not just name)
 
@@ -100,12 +141,13 @@ $clientProcs = @(Get-Process -Name 'virule-client' -ErrorAction SilentlyContinue
 
 # ---- 2. build the removal plan (only what actually exists right now)
 
-$planFs  = @()   # filesystem targets
-$planReg = @()   # registry targets
+$planFiles = @()   # exact files
+$planDirs  = @()   # recursive directories
+$planReg   = @()   # registry targets
 
-if (Test-Path -LiteralPath $installDir)     { $planFs += $installDir }
-if (Test-Path -LiteralPath $clientStateDir) { $planFs += $clientStateDir }
-foreach ($t in $planFs) { Assert-ClientOwned $t }
+foreach ($f in $allowedFiles) { if (Test-Path -LiteralPath $f) { $planFiles += $f } }
+if (Test-Path -LiteralPath $clientStateDir) { $planDirs += $clientStateDir }
+foreach ($t in ($planFiles + $planDirs)) { Assert-ClientOwned $t }
 
 if (Test-Path -LiteralPath $uninstallKey) { $planReg += $uninstallKey }
 
@@ -121,6 +163,10 @@ if (Test-Path -LiteralPath $protocolKey) {
     }
 }
 
+# Programs\VIRULE itself is removed only when the reset leaves it empty
+# (no Admin, no leftovers). Announced in the plan, decided after removal.
+$mayRemoveEmptyInstallDir = (Test-Path -LiteralPath $installDir) -and -not (Test-Path -LiteralPath $adminDir)
+
 # ---- 3. print the exact plan
 
 Write-Host 'Will remove:' -ForegroundColor Yellow
@@ -129,8 +175,12 @@ if ($clientProcs.Count -gt 0) {
 } else {
     Write-Host '  [process]   (no running virule-client.exe under the install directory)'
 }
-if ($planFs.Count -gt 0) { foreach ($t in $planFs) { Write-Host "  [directory] $t" } }
-else { Write-Host '  [directory] (no installed client directories present)' }
+if ($planFiles.Count -gt 0) { foreach ($t in $planFiles) { Write-Host "  [file]      $t" } }
+else { Write-Host '  [file]      (no installed client files present)' }
+if ($planDirs.Count -gt 0) { foreach ($t in $planDirs) { Write-Host "  [directory] $t" } }
+else { Write-Host '  [directory] (no client state directory present)' }
+if ($mayRemoveEmptyInstallDir) { Write-Host "  [directory] $installDir (only if left empty)" }
+elseif (Test-Path -LiteralPath $adminDir) { Write-Host "  [directory] $installDir LEFT IN PLACE: it holds the managed Admin installation." }
 if ($planReg.Count -gt 0) { foreach ($t in $planReg) { Write-Host "  [registry]  $t" } }
 else { Write-Host '  [registry]  (no client registry entries present)' }
 if ((Test-Path -LiteralPath $protocolKey) -and -not $protocolPointsAtClient) {
@@ -158,7 +208,7 @@ if ($isDryRun) {
     return
 }
 
-if ($clientProcs.Count -eq 0 -and $planFs.Count -eq 0 -and $planReg.Count -eq 0) {
+if ($clientProcs.Count -eq 0 -and $planFiles.Count -eq 0 -and $planDirs.Count -eq 0 -and $planReg.Count -eq 0) {
     Write-Host 'Nothing to do: virule-client is already absent from this machine.' -ForegroundColor Green
     return
 }
@@ -179,12 +229,28 @@ Start-Sleep -Milliseconds 500
 
 # ---- 5. filesystem removal (each target re-verified client-owned)
 
-foreach ($t in $planFs) {
+foreach ($t in $planFiles) {
+    Assert-ClientOwned $t
+    if ($PSCmdlet.ShouldProcess($t, 'Remove file')) {
+        Write-Host "Removing $t"
+        Remove-Item -LiteralPath $t -Force -Confirm:$false
+    }
+}
+foreach ($t in $planDirs) {
     Assert-ClientOwned $t
     if ($PSCmdlet.ShouldProcess($t, 'Remove directory')) {
         Write-Host "Removing $t"
         Remove-Item -LiteralPath $t -Recurse -Force -Confirm:$false
     }
+}
+
+# Programs\VIRULE only when it ended up empty. Deliberately NOT -Recurse:
+# even if the emptiness check raced, a non-empty directory cannot be removed.
+if ($mayRemoveEmptyInstallDir -and (Test-Path -LiteralPath $installDir) -and
+    @(Get-ChildItem -LiteralPath $installDir -Force -ErrorAction SilentlyContinue).Count -eq 0 -and
+    $PSCmdlet.ShouldProcess($installDir, 'Remove empty install directory')) {
+    Write-Host "Removing empty $installDir"
+    Remove-Item -LiteralPath $installDir -Force -Confirm:$false
 }
 
 # ---- 6. registry removal
@@ -213,7 +279,7 @@ if ($stillRunning.Count -gt 0) {
     $fail = $true
 } else { Write-Host '  OK    no virule-client.exe process running' }
 
-foreach ($t in @($installDir, $clientStateDir)) {
+foreach ($t in @($clientExe, $clientExeNew, $clientStateDir)) {
     if (Test-Path -LiteralPath $t) { Write-Host "  FAIL  still present: $t" -ForegroundColor Red; $fail = $true }
     else { Write-Host "  OK    removed/absent: $t" }
 }
@@ -224,6 +290,24 @@ if ($protocolPointsAtClient) {
     else { Write-Host "  OK    removed: $protocolKey" }
 }
 
+# The managed Admin must be exactly as it was.
+if ($adminSnapshot) {
+    if (-not (Test-Path -LiteralPath $adminDir)) {
+        Write-Host "  FAIL  managed Admin disappeared: $adminDir" -ForegroundColor Red
+        $fail = $true
+    } else {
+        $adminFilesAfter = @(Get-ChildItem -LiteralPath $adminDir -Recurse -Force -File -ErrorAction SilentlyContinue)
+        $bytesAfter = ($adminFilesAfter | Measure-Object -Property Length -Sum).Sum
+        if ($adminFilesAfter.Count -ne $adminSnapshot.FileCount -or $bytesAfter -ne $adminSnapshot.TotalBytes) {
+            Write-Host ("  FAIL  managed Admin changed: {0} files/{1} bytes before, {2} files/{3} bytes after" -f `
+                $adminSnapshot.FileCount, $adminSnapshot.TotalBytes, $adminFilesAfter.Count, $bytesAfter) -ForegroundColor Red
+            $fail = $true
+        } else {
+            Write-Host ("  OK    managed Admin intact: {0} files, {1} bytes (unchanged)" -f $adminFilesAfter.Count, $bytesAfter)
+        }
+    }
+}
+
 foreach ($p in $preserved) {
     # Only flag preserved items that vanished during this run; ones that were
     # already absent (e.g. no Admin install) are fine.
@@ -231,7 +315,7 @@ foreach ($p in $preserved) {
         Write-Host "  FAIL  preserved item disappeared: $p" -ForegroundColor Red; $fail = $true
     }
 }
-Write-Host '  OK    preserved inventory untouched (only client-owned roots were eligible for deletion)'
+if (-not $fail) { Write-Host '  OK    preserved inventory untouched (only exact client-owned entries were eligible for deletion)' }
 
 Write-Host ''
 if ($fail) { Write-Host 'Reset finished WITH FAILURES (see above).' -ForegroundColor Red; exit 1 }
