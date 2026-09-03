@@ -38,18 +38,6 @@ struct State {
     std::string installed_version;
     std::string admin_version;
     bool created_desktop_shortcut = false;
-    // The tester's chosen QA GAME LIBRARY ROOT (Phase 4). Games are not the
-    // Admin: they are large, and where they live is the tester's call, asked
-    // once with a native folder picker and remembered here. The client owns
-    // the per-game directory it creates INSIDE this root and never treats the
-    // root itself as disposable.
-    //
-    // STORED IN GENERIC (FORWARD SLASH) FORM. json_scan is a marker scanner,
-    // not a parser: it returns the raw bytes between the quotes, so a written
-    // "D:\\QA" would read back with its escape intact. Forward slashes are
-    // accepted everywhere by std::filesystem on Windows and sidestep that
-    // entirely; qa_build converts at the edges.
-    std::string qa_games_root;
 };
 
 inline State load() {
@@ -68,8 +56,6 @@ inline State load() {
                                     s.admin_version);
     s.created_desktop_shortcut =
         text.find("\"created_desktop_shortcut\":true") != std::string::npos;
-    (void)json_scan::find_string_in(text, 0, text.size(), "qa_games_root",
-                                    s.qa_games_root);
     return s;
 }
 
@@ -84,7 +70,6 @@ inline bool save(const State& s) {
     body += ",\"admin_version\":\"" + json_scan::json_escape(s.admin_version) + "\"";
     body += ",\"created_desktop_shortcut\":";
     body += s.created_desktop_shortcut ? "true" : "false";
-    body += ",\"qa_games_root\":\"" + json_scan::json_escape(s.qa_games_root) + "\"";
     body += "}";
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     if (!out) return false;

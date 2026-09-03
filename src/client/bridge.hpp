@@ -41,12 +41,6 @@
 //                    {"type":"admin_open"}
 //                    {"type":"uninstall","nonce":"<32 hex>",
 //                     "timestamp":"<UTC>","signature":"<128 hex>"}
-//                    {"type":"qa_build_status","game_uuid":"<32 hex>"}
-//                    {"type":"qa_build_install","game_uuid":"<32 hex>"}
-//                    {"type":"qa_build_update","game_uuid":"<32 hex>"}
-//                    {"type":"qa_build_play","game_uuid":"<32 hex>"}
-//                    {"type":"qa_build_remove","game_uuid":"<32 hex>"}
-//                    {"type":"qa_build_choose_root"}
 //   local -> client  {"type":"qa_verify_url","token":"<64 hex>"}  (2nd instance)
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
@@ -56,19 +50,7 @@
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"admin_result","state":...,"version":...}
-//                    {"type":"qa_build_status",...} / {"type":"qa_build_started"}
-//                    {"type":"qa_build_playing"} / {"type":"qa_build_removed"}
-//                    {"type":"qa_build_root_choosing"}
-//                    {"type":"qa_build_result","game_uuid":...,"state":...}
-//                    {"type":"qa_build_root","chosen":true|false}
 //                    {"type":"uninstall_started"} / {"type":"error"}
-//
-// THE QA BUILD GROUP carries a game_uuid and nothing else: no url, no path,
-// no executable, no archive. The client resolves every piece of trusted
-// metadata from the VIRULE backend against the tester's own signed
-// credential, downloads through a short-lived delegated location, and
-// launches or deletes only what its own managed-install record names. So the
-// page can say WHICH game, never WHAT to run or WHERE to write.
 //
 // admin_install / admin_open are page messages behind the same origin
 // policy. They are CLOSED operations, not a filesystem or process surface:
@@ -146,25 +128,6 @@ struct Callbacks {
     std::function<void()> on_uninstall;
     // A local process asked this instance to exit (Setup replacing us).
     std::function<void()> on_shutdown;
-
-    // ---- QA GAME DELIVERY (Phase 4) ----
-    // Every one takes a game_uuid and NOTHING else. There is deliberately no
-    // url, path, executable or archive parameter anywhere in this group: the
-    // client resolves all of that from the backend against the tester's own
-    // credential, so the page can name a game but can never name a target.
-    //
-    // The full status of one game, as a JSON object the bridge sends back.
-    std::function<std::string(const std::string& game_uuid)> on_qa_build_status;
-    // Install or update (the client decides which from its own managed
-    // record). Runs asynchronously; the outcome arrives as qa_build_result.
-    std::function<void(const std::string& game_uuid)> on_qa_build_install;
-    // Launch the recorded executable of a managed install. Synchronous.
-    std::function<bool(const std::string& game_uuid)> on_qa_build_play;
-    // Remove THIS managed game installation only. Synchronous.
-    std::function<bool(const std::string& game_uuid)> on_qa_build_remove;
-    // Ask the tester where QA games should live (first install only).
-    // Asynchronous: the picker is modal and must not hold a socket.
-    std::function<void()> on_qa_build_choose_root;
 };
 
 // Listener ownership: 0 unresolved, 1 this process listens, 2 the port is
@@ -487,7 +450,7 @@ inline void handle_client(SOCKET client) {
                 ? g_callbacks.admin_status_json() : std::string("null");
             if (!reply(0x1, std::string("{\"type\":\"status\",\"v\":1,\"version\":\"")
                             + VIRULE_CLIENT_VERSION_STRING +
-                            "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\",\"qa_build\"],\"pages\":" +
+                            "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
                             std::to_string(open_page_count()) +
                             ",\"admin\":" + admin + "}")) {
                 return;
@@ -534,58 +497,6 @@ inline void handle_client(SOCKET client) {
             }
             log::client("bridge: uninstall refused (invalid authorization)");
             if (!reply(0x1, "{\"type\":\"error\"}")) return;
-        } else if (type.rfind("qa_build_", 0) == 0 && is_page) {
-            // QA GAME DELIVERY. The page names a game and an action; it can
-            // name nothing else. game_uuid is an IDENTIFIER, never an
-            // authorization: the client re-derives what may be installed
-            // from the backend against the tester's signed credential, so a
-            // page asking about a game it has no business with is simply
-            // answered "unauthorized".
-            std::string game_uuid;
-            (void)js::find_string_in(payload, 0, payload.size(), "game_uuid", game_uuid);
-            const bool game_ok = game_uuid.size() == 32 &&
-                game_uuid.find_first_not_of("0123456789abcdef") == std::string::npos;
-
-            if (type == "qa_build_choose_root") {
-                if (g_callbacks.on_qa_build_choose_root) {
-                    g_callbacks.on_qa_build_choose_root();
-                    if (!reply(0x1, "{\"type\":\"qa_build_root_choosing\"}")) return;
-                } else {
-                    if (!reply(0x1, "{\"type\":\"error\"}")) return;
-                }
-            } else if (!game_ok) {
-                if (!reply(0x1, "{\"type\":\"error\"}")) return;
-            } else if (type == "qa_build_status") {
-                const std::string body = g_callbacks.on_qa_build_status
-                    ? g_callbacks.on_qa_build_status(game_uuid) : std::string();
-                if (!reply(0x1, body.empty() ? "{\"type\":\"error\"}" : body)) return;
-            } else if (type == "qa_build_install" || type == "qa_build_update") {
-                // ONE verified pipeline serves both: which it is depends on
-                // whether the client already holds a managed install, not on
-                // which word the page used.
-                if (g_callbacks.on_qa_build_install) {
-                    g_callbacks.on_qa_build_install(game_uuid);
-                    if (!reply(0x1, "{\"type\":\"qa_build_started\"}")) return;
-                } else {
-                    if (!reply(0x1, "{\"type\":\"error\"}")) return;
-                }
-            } else if (type == "qa_build_play") {
-                const bool ok = g_callbacks.on_qa_build_play &&
-                                g_callbacks.on_qa_build_play(game_uuid);
-                if (!reply(0x1, ok ? "{\"type\":\"qa_build_playing\"}"
-                                   : "{\"type\":\"error\"}")) {
-                    return;
-                }
-            } else if (type == "qa_build_remove") {
-                const bool ok = g_callbacks.on_qa_build_remove &&
-                                g_callbacks.on_qa_build_remove(game_uuid);
-                if (!reply(0x1, ok ? "{\"type\":\"qa_build_removed\"}"
-                                   : "{\"type\":\"error\"}")) {
-                    return;
-                }
-            } else {
-                if (!reply(0x1, "{\"type\":\"error\"}")) return;
-            }
         } else if (type == "wake" && !is_page) {
             if (!reply(0x1, "{\"type\":\"ok\"}")) return;
         } else if (type == "shutdown" && !is_page) {
