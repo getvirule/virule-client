@@ -109,10 +109,22 @@ constexpr size_t kMaxClientBytes = 64 * 1024 * 1024;
 constexpr wchar_t kResumeUrl[] = L"https://virule.app/?resume=setup";
 
 // How long an already-open virule.app page gets to find the freshly
-// installed client before Setup decides the browser is gone. The page's own
-// reconnect loop runs every 1.5 s, so this is several attempts plus room for
-// the browser's local-network-access permission ask.
+// installed client before Setup's card completes. The page's own reconnect
+// loop runs every 1.5 s, so this is several attempts plus room for the
+// browser's local-network-access permission ask.
 constexpr DWORD kPageGraceMs = 12000;
+
+// The QUIET extension after the card has closed, before Setup concludes no
+// page exists. A live page can be much slower than kPageGraceMs: browsers
+// throttle timers in background tabs (the user is watching Setup's card,
+// not the tab), Brave gates or blocks loopback WebSockets entirely, and a
+// permission ask may sit unanswered. Observed in production 2026-09-03: a
+// live Brave page finished the QA flow 21 s after the client started, 9 s
+// after the old 12 s decision had already opened a wrong browser. During
+// this window Setup also accepts NATIVE progress (status qa_last_s) as
+// proof the page is alive, since a bridge-blocked page drives the flow
+// through virule:// without ever appearing in the pages count.
+constexpr DWORD kExtendedGraceMs = 48000;
 
 // The completion state is seen, not read: brief and then gone.
 constexpr DWORD kCompleteVisibleMs = 1400;
@@ -286,32 +298,42 @@ void stop_running_client() {
     }
 }
 
-// How many virule.app PAGES are connected to the client right now, or -1
-// when no client answered at all. Setup's own connection carries no Origin,
-// so it is a local control connection and is never counted.
-int connected_pages() {
+// One status probe against the freshly installed client, over Setup's own
+// local (no-Origin, never-counted) connection. `pages` is how many
+// virule.app pages are connected (-1 = no client answered); `qa_last_s` is
+// how many seconds ago the client last handled a QA verification (-1 =
+// never, or an older client without the field).
+bool probe_client(long long& pages, long long& qa_last_s) {
+    pages = -1;
+    qa_last_s = -1;
     std::string response;
     if (!vclient::bridge::loopback_roundtrip(
             vclient::bridge::kPort, nullptr, "\"virule_client\"",
             "{\"type\":\"status\"}", response)) {
-        return -1;
+        return false;
     }
-    long long pages = 0;
-    if (!vclient::json_scan::find_number_in(response, 0, response.size(),
-                                            "pages", pages)) {
-        return -1;
-    }
-    return (int)pages;
+    (void)vclient::json_scan::find_number_in(response, 0, response.size(),
+                                             "pages", pages);
+    (void)vclient::json_scan::find_number_in(response, 0, response.size(),
+                                             "qa_last_s", qa_last_s);
+    return true;
 }
 
-// THE HANDOFF DECISION. True when a virule.app page reached the client
-// inside the grace window, which means the browser is still driving the
-// flow and Setup must not open anything.
-bool wait_for_page(DWORD grace_ms) {
+// THE HANDOFF DECISION. True when the browser is demonstrably still driving
+// the flow, in either of two ways: a virule.app page reached the client's
+// bridge, OR the client handled a QA verification since it started (a page
+// in a bridge-blocked browser progresses through virule:// and never shows
+// up in the pages count). Either way Setup must not open anything.
+bool wait_for_browser_signal(DWORD grace_ms) {
     const ULONGLONG deadline = GetTickCount64() + grace_ms;
     for (;;) {
-        const int pages = connected_pages();
-        if (pages > 0) return true;
+        long long pages = -1, qa_last_s = -1;
+        if (probe_client(pages, qa_last_s)) {
+            if (pages > 0) return true;
+            // The client just got installed, so ANY QA activity it reports
+            // belongs to the flow that ran this Setup.
+            if (qa_last_s >= 0) return true;
+        }
         if (GetTickCount64() >= deadline) return false;
         Sleep(400);
     }
@@ -525,11 +547,30 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     // 9. THE BROWSER. An existing virule.app page is always the first
-    // choice; recovery happens only when none appears.
-    const bool page_connected = wait_for_page(kPageGraceMs);
+    // choice; recovery happens only when Setup is genuinely convinced no
+    // page is left. The card completes after the short grace; the extended
+    // wait is quiet (card already gone) so a truly-gone browser costs the
+    // user nothing visible, only a delayed resume tab.
+    bool browser_owns_flow = wait_for_browser_signal(kPageGraceMs);
     vclient::setup_window::set_complete();
-    if (page_connected) {
-        vclient::log::setup("a virule.app page connected; the browser owns the flow");
+    Sleep(kCompleteVisibleMs);
+    vclient::setup_window::close();
+
+    if (!browser_owns_flow) {
+        // A live page may just be slow (throttled background tab, a
+        // pending permission ask, a bridge-blocked browser working through
+        // virule://). Only an originating browser KNOWN to have exited
+        // proves the page cannot exist; everything else earns the quiet
+        // extended wait before any browser is opened.
+        const bool origin_gone =
+            origin.found && !vclient::origin_browser::still_alive(origin);
+        if (!origin_gone) {
+            browser_owns_flow = wait_for_browser_signal(kExtendedGraceMs);
+        }
+    }
+
+    if (browser_owns_flow) {
+        vclient::log::setup("a virule.app page (or native QA progress) owns the flow; opening nothing");
     } else {
         const bool alive = vclient::origin_browser::still_alive(origin);
         const auto opened =
@@ -546,9 +587,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         vclient::log::setup(how);
     }
     vclient::origin_browser::release(origin);
-
-    Sleep(kCompleteVisibleMs);
-    vclient::setup_window::close();
 
     vclient::log::setup("setup complete");
     return 0;

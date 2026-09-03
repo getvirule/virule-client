@@ -149,6 +149,10 @@ inline bool report_via_admin_bridge(const std::string& token, const std::string&
 // `wait_grace_ms` gives a just-launched browser handoff a moment to
 // (re)connect to this client's bridge before deciding no page is watching.
 inline void run(const std::string& token, unsigned wait_grace_ms = 3000) {
+    // Stamp QA activity BEFORE the debounce: even a duplicate ACCEPT proves
+    // a browser page is driving the flow natively (what Setup's handoff
+    // decision reads via status qa_last_s).
+    bridge::touch_qa_activity();
     if (!debounce(token)) return;
     const Outcome out = redeem_and_store(token);
 

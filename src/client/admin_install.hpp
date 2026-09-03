@@ -169,11 +169,71 @@ inline std::string status_json() {
 
 // ---- open ----
 
+// Bring the running managed Admin's window to the front (best effort). The
+// Admin's main window is a CEF Views window (Chromium's own class), so the
+// stable match is: a visible, unowned top-level window whose owning process
+// runs out of the managed Admin directory.
+inline void focus_running_admin() {
+    const auto dir = paths::admin_install_dir();
+    if (dir.empty()) return;
+    std::wstring prefix = dir.wstring();
+    if (prefix.back() != L'\\') prefix += L'\\';
+    for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
+
+    struct Ctx { const std::wstring* prefix; HWND found; };
+    Ctx ctx{ &prefix, nullptr };
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* ctx = (Ctx*)lp;
+            if (!IsWindowVisible(hwnd)) return TRUE;
+            if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == 0) return TRUE;
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                      FALSE, pid);
+            if (!proc) return TRUE;
+            wchar_t image[MAX_PATH * 2] = {};
+            DWORD n = (DWORD)(sizeof(image) / sizeof(image[0]));
+            const bool got = QueryFullProcessImageNameW(proc, 0, image, &n) != 0;
+            CloseHandle(proc);
+            if (!got) return TRUE;
+            std::wstring path(image, n);
+            for (wchar_t& c : path) c = (wchar_t)towlower(c);
+            if (path.rfind(*ctx->prefix, 0) != 0) return TRUE;
+            ctx->found = hwnd;
+            return FALSE;
+        },
+        (LPARAM)&ctx);
+    if (ctx.found == nullptr) return;
+    if (IsIconic(ctx.found)) ShowWindow(ctx.found, SW_RESTORE);
+    SetForegroundWindow(ctx.found);
+}
+
 // Launch the INSTALLED Admin, and only it. Not a process-launch surface:
-// the path is derived, never received. A second GUI launch is safe (the
-// Admin foregrounds its existing window and exits).
+// the path is derived, never received. IDEMPOTENT BY DESIGN: the Admin also
+// enforces single instance itself, but this side never knowingly launches a
+// second copy - a running Admin is focused instead, and a launch already in
+// flight (process not yet visible) is not repeated. "Open VIRULE" clicked
+// twenty times still means one Admin.
+inline std::atomic<unsigned long long> g_last_admin_launch_tick{ 0 };
+
 inline bool open_installed_admin() {
     if (!admin_installed()) return false;
+    if (admin_running()) {
+        focus_running_admin();
+        log::client("admin: already running; focused existing window");
+        return true;
+    }
+    // A just-launched Admin takes a moment to show up in the process scan;
+    // treat a repeat inside that window as the same open, not a new one.
+    const unsigned long long last = g_last_admin_launch_tick.load();
+    const unsigned long long now = GetTickCount64();
+    if (last != 0 && now - last < 10000) {
+        log::client("admin: launch already in flight; not launching again");
+        return true;
+    }
+    g_last_admin_launch_tick.store(now);
     const auto exe = paths::installed_admin_exe();
     const auto dir = paths::admin_install_dir();
     STARTUPINFOW si{};

@@ -17,6 +17,18 @@
 // where it can be read safely, its PID, and a LIVE HANDLE on the process, so
 // later liveness checks can never be fooled by PID reuse.
 //
+// ANCESTRY IS NOT ENOUGH ON ITS OWN: Windows routinely launches a
+// downloaded exe through the shell, so the whole ancestry reads
+// "Virule-Setup.exe <- explorer.exe" even when the user clicked the
+// download inside Brave (observed in production, 2026-09-03). When no
+// browser appears in the ancestry, capture() falls back to the running
+// browsers themselves: if exactly ONE recognized browser family currently
+// has a visible top-level window, that browser is the originator for all
+// practical purposes and is recorded the same way. A browser process with
+// no visible window (Edge startup boost keeps msedge.exe resident) is not
+// an open browser and never counts. Zero or several open families =
+// genuinely unknown, and only then does the Windows default get the URL.
+//
 // HOW IT IS USED (the owner's hierarchy):
 //   A. the originating browser process is still alive -> open the resume URL
 //      through that browser's executable, so it lands as a tab/window in
@@ -138,6 +150,71 @@ inline std::wstring image_path(HANDLE process) {
     return std::wstring(buf, size);
 }
 
+// PIDs owning at least one visible, unowned top-level window right now.
+// This is what separates an OPEN browser from a resident background one.
+inline std::vector<DWORD> pids_with_visible_windows() {
+    std::vector<DWORD> pids;
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* out = (std::vector<DWORD>*)lp;
+            if (!IsWindowVisible(hwnd)) return TRUE;
+            if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != 0) out->push_back(pid);
+            return TRUE;
+        },
+        (LPARAM)&pids);
+    return pids;
+}
+
+// The running-browser fallback: when the ancestry names no browser, the one
+// browser family that is visibly open (if there is exactly one) is taken as
+// the originator. Fills `origin` and returns true only on that unambiguous
+// case.
+inline bool capture_unique_open_browser(const std::vector<ProcEntry>& all,
+                                        Origin& origin) {
+    const auto visible = pids_with_visible_windows();
+    auto has_visible_window = [&](DWORD pid) {
+        for (const DWORD v : visible) {
+            if (v == pid) return true;
+        }
+        return false;
+    };
+    std::wstring family;           // the one open family seen so far
+    const ProcEntry* pick = nullptr; // one visible-window process of it
+    for (const auto& e : all) {
+        if (!is_known_browser(e.name)) continue;
+        if (!has_visible_window(e.pid)) continue;
+        const std::wstring name = lower(e.name);
+        if (family.empty()) {
+            family = name;
+            pick = &e;
+        } else if (family != name) {
+            origin.chain += L"; open browsers ambiguous (" + family + L", " +
+                            name + L")";
+            return false; // two different browsers open: cannot pick
+        }
+    }
+    if (pick == nullptr) {
+        origin.chain += L"; no open browser found";
+        return false;
+    }
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                           FALSE, pick->pid);
+    if (h == nullptr) {
+        origin.chain += L"; open browser " + pick->name + L" unreadable";
+        return false;
+    }
+    origin.found = true;
+    origin.exe_name = pick->name;
+    origin.exe_path = image_path(h);
+    origin.pid = pick->pid;
+    origin.handle = h; // kept open on purpose
+    origin.chain += L"; unique open browser " + pick->name;
+    return true;
+}
+
 // Walk the ancestry now, while the browser is still certain to be there.
 inline Origin capture() {
     Origin origin;
@@ -186,6 +263,9 @@ inline Origin capture() {
         cur_pid = parent->pid;
         cur_created = parent_created;
     }
+    // No browser in the ancestry (the shell-hop launch): fall back to the
+    // one visibly open browser when that is unambiguous.
+    (void)capture_unique_open_browser(all, origin);
     return origin;
 }
 

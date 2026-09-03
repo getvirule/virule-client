@@ -143,6 +143,16 @@ inline std::atomic<int> g_open_connections{ 0 };
 
 inline void touch_activity() { g_last_activity_tick.store(GetTickCount64()); }
 
+// When this instance last handled a QA verification (an ACCEPT from a page
+// or a virule:// launch), as a GetTickCount64 value; 0 = never. Surfaced in
+// the status answer as qa_last_s so Setup can tell that a browser page is
+// driving the flow NATIVELY even when that browser blocks loopback
+// WebSockets entirely (Brave does by default) and the page therefore never
+// shows up in the "pages" count.
+inline std::atomic<unsigned long long> g_last_qa_tick{ 0 };
+
+inline void touch_qa_activity() { g_last_qa_tick.store(GetTickCount64()); }
+
 // ---- page-connection registry (broadcast + liveness) ----
 struct PageConn {
     SOCKET socket = INVALID_SOCKET;
@@ -448,10 +458,18 @@ inline void handle_client(SOCKET client) {
             // means a browser page found the client and still owns the flow.
             const std::string admin = g_callbacks.admin_status_json
                 ? g_callbacks.admin_status_json() : std::string("null");
+            // qa_last_s: seconds since this instance last handled a QA
+            // verification, -1 = never. Additive status field; see
+            // g_last_qa_tick above for why Setup needs it.
+            const unsigned long long qa_tick = g_last_qa_tick.load();
+            const long long qa_last_s = qa_tick == 0
+                ? -1
+                : (long long)((GetTickCount64() - qa_tick) / 1000ull);
             if (!reply(0x1, std::string("{\"type\":\"status\",\"v\":1,\"version\":\"")
                             + VIRULE_CLIENT_VERSION_STRING +
                             "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
                             std::to_string(open_page_count()) +
+                            ",\"qa_last_s\":" + std::to_string(qa_last_s) +
                             ",\"admin\":" + admin + "}")) {
                 return;
             }
