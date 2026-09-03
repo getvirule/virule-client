@@ -1,4 +1,4 @@
-# VIRULE Client architecture (Phase 1)
+# VIRULE Client architecture (Phase 2)
 
 Current state only. When a change makes something here untrue, REPLACE it.
 
@@ -40,16 +40,21 @@ origin check defends against the web, not against local code.
 
 | From | Message | Effect |
 |---|---|---|
-| page | `{"type":"status"}` | version, capability list, connected-page count |
+| page | `{"type":"status"}` | version, capability list, connected-page count, the Admin status block |
 | page | `{"type":"qa_accept","token":"<64 hex>"}` | asynchronous QA redemption (below) |
+| page | `{"type":"admin_install","shortcut":true\|false}` | the verified staged Admin install/update (below) |
+| page | `{"type":"admin_open"}` | launch the managed Admin installation, and nothing else |
 | page | `{"type":"uninstall","nonce","timestamp","signature"}` | full VIRULE uninstall after verification |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
 
-Client pushes: `{"type":"qa_result","token","state"}` to every connected
-page (each page filters by token). Everything else answers
-`{"type":"error"}`. Frames over 4 KB, unmasked client frames, and
-malformed handshakes drop the connection.
+Client pushes: `{"type":"qa_result","token","state"}` and
+`{"type":"admin_result","state","version"}` to every connected page.
+The status answer's `"admin"` block is
+`{"installed":bool,"version":"...","running":bool}` - the managed
+installation only (below); a development tree is never reported.
+Everything else answers `{"type":"error"}`. Frames over 4 KB, unmasked
+client frames, and malformed handshakes drop the connection.
 
 `status` carries `"pages"`, the number of connected virule.app PAGES.
 Local control connections are never counted, which is what makes it
@@ -265,24 +270,75 @@ key). A forged record can at most reopen a page. It is cleared at every
 terminal state.
 
 `INSTALL_ADMIN` also carries the desktop-shortcut preference asked at the
-protocol preflight. Nothing acts on it yet: installing VIRULE Admin is
-Phase 2, and a connected client with `INSTALL_ADMIN` pending says only
-"Ready to install VIRULE" and never claims the Admin is installed.
+protocol preflight. The moment a client is connected with `INSTALL_ADMIN`
+pending, the page hands the install over (`admin_install`, the shortcut
+preference riding along) and shows only "Installing VIRULE..." - there is
+no stopping point and no second install button. An already-installed
+Admin means the work is done (the client finished it after the page
+closed); the intent is cleared and the page settles.
 
 Full VIRULE uninstall removes an EXPLICIT ownership inventory and nothing
-else (see `src/shared/uninstall.hpp`): the install dir, the client state
-dir, `qa_tester*.cred`, `dev_machine.cred` ONLY when client-created AND no
-`virule.db` exists, `virule://` ONLY while it points at this client, the
-uninstall entry, and the shared `VIRULE\` folders only if left empty. The
+else (see `src/shared/uninstall.hpp`): the install dir (the managed
+`Admin\` installation included), the client state dir, `qa_tester*.cred`,
+`dev_machine.cred` ONLY when client-created AND no `virule.db` exists,
+`virule://` ONLY while it points at this client, the uninstall entry, the
+desktop `VIRULE.lnk` ONLY when the client created it (state.json
+provenance), and the shared `VIRULE\` folders only if left empty. The
 running exe hands removal to a `%TEMP%` copy (`--finish-uninstall <pid>`)
-so no broken executable is left behind. A full VIRULE uninstall and
+so no broken executable is left behind. Development trees (the VIRULE
+repository, its `virule\publish\Virule` folder) are outside every
+inventory root and can never be touched. A full VIRULE uninstall and
 removing an individual future game are SEPARATE actions forever; this
 inventory must never grow a recursive game-library delete.
 
-## Phase 2 integration point
+## The managed VIRULE Admin installation (Phase 2)
 
-The browser's `status` message and the versioned message set are the seam:
-Phase 2 adds an authenticated "what VIRULE Admin version is installed"
-answer plus install/update commands driven by the remote manifest, behind
-the same bridge, the same origin policy, and the same
-server-issued-authorization pattern. Nothing in Phase 1 fakes any of it.
+The client owns exactly one Admin install location:
+`%LOCALAPPDATA%\Programs\VIRULE\Admin\` (`virule.exe` + `.resources\`).
+ONLY that location counts as "Admin installed"; the development publish
+folder or a manually extracted copy elsewhere is never reported, updated,
+or launched. `src/client/admin_install.hpp` is the whole implementation.
+
+THE APPROVED MANIFEST lives at
+`https://virule.app/client/admin-manifest.json` (no-store; the
+VIRULE_BACKEND Worker serves it):
+`{version, channel, url, sha256, size, minimumClientVersion}`. virule.app
+decides which Admin release is approved; the package bytes live on the
+`getvirule/virule-overlay-releases` GitHub Release
+(`Virule-v<version>.zip`, the folder contents at the zip root, generated
+and verified by `helpers/publish_admin.ps1`). The manifest url is pinned
+to that repository's `releases/download/` prefix.
+
+THE VERIFIED STAGED PIPELINE (install and update are the same path; an
+update never touches the live install file-by-file): fetch manifest ->
+validate structurally -> streamed download capped at the declared size,
+hashed on the way through -> exact size -> exact SHA-256 (never waived) ->
+zip-slip-guarded extraction into `Admin.staging\` -> Authenticode + the
+VIRULE signer identity (`CN=Heath Michaels`) on every VIRULE-owned binary
+(virule.exe, ViruleAdminHost.exe, SidecarK32/64.dll, both
+SidecarKHost.exe) -> atomic placement. A fresh install is ONE directory
+rename; an update renames live -> `Admin.previous`, staging -> `Admin`,
+and a failed swap renames the previous install straight back, so a
+known-good install always survives. The manifest's version is recorded in
+state.json (`admin_version`); the Admin binaries are never probed for a
+version.
+
+A RUNNING ADMIN IS NEVER KILLED: an update that finds any process running
+out of the managed directory (or its files locked) answers
+`admin_running` and changes nothing; the page says "Close VIRULE to
+update." and offers a retry.
+
+Once accepted, the operation finishes even if every page closes
+(`g_busy` also holds off the idle-exit policy), and a FRESH install
+launches the installed Admin automatically at the end; an update leaves
+the user where they are. The desktop shortcut (`VIRULE.lnk`, target =
+the managed `virule.exe`) is created when the browser's intent asked for
+one, and its provenance is recorded so uninstall removes exactly what the
+client created.
+
+`admin_install`/`admin_open` are page messages behind the same origin
+policy, but they are CLOSED operations, not a filesystem or
+process-launch surface: install runs only the pipeline above against the
+approved manifest (package SHA-256 + Authenticode + signer identity are
+the trust decision, exactly Virule-Setup's), and open launches only the
+managed installation the client itself placed.

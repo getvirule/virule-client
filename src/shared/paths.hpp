@@ -3,9 +3,13 @@
 // (LOCALAPPDATA, then USERPROFILE - the same resolution order the VIRULE
 // product uses for its user-data root). No database, no registry.
 //
-// Ownership map (Phase 1):
+// Ownership map (Phase 2):
 //   %LOCALAPPDATA%\Programs\VIRULE\           the installed program
 //       virule-client.exe
+//       Admin\                                the managed VIRULE Admin
+//           virule.exe, .resources\, ...      installation (Phase 2; the
+//                                             development publish folder is
+//                                             NEVER an installed Admin)
 //   %LOCALAPPDATA%\VIRULE\client\             VIRULE Client state
 //       state.json, logs\
 //   %LOCALAPPDATA%\VIRULE\security\           shared credential store
@@ -31,6 +35,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shlobj.h>
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #endif
 
 namespace vclient::paths {
@@ -82,6 +89,49 @@ inline std::filesystem::path install_dir() {
 inline std::filesystem::path installed_client_exe() {
     const auto d = install_dir();
     return d.empty() ? d : d / L"virule-client.exe";
+}
+
+// The managed VIRULE Admin installation. ONLY this location counts as "Admin
+// installed": a development tree or a manually extracted copy elsewhere is
+// never reported or launched by the client.
+inline std::filesystem::path admin_install_dir() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"Admin";
+}
+
+inline std::filesystem::path installed_admin_exe() {
+    const auto d = admin_install_dir();
+    return d.empty() ? d : d / L"virule.exe";
+}
+
+// Admin install/update staging, beside the target on the same volume so the
+// final placement is an atomic directory rename.
+inline std::filesystem::path admin_staging_dir() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"Admin.staging";
+}
+
+inline std::filesystem::path admin_previous_dir() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"Admin.previous";
+}
+
+inline std::filesystem::path admin_download_zip() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"admin-download.zip";
+}
+
+// The desktop shortcut the client creates for the installed Admin when the
+// browser's install intent asked for one. Removed by uninstall ONLY when
+// client-created (state.json provenance).
+inline std::filesystem::path desktop_shortcut() {
+    PWSTR desktop = nullptr;
+    std::filesystem::path out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop))) {
+        out = std::filesystem::path(desktop) / L"VIRULE.lnk";
+    }
+    if (desktop) CoTaskMemFree(desktop);
+    return out;
 }
 
 } // namespace vclient::paths

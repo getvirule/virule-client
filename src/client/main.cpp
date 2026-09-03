@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 
+#include "client/admin_install.hpp"
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
@@ -142,6 +143,29 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             arg, 0, nullptr);
         if (h) CloseHandle(h); else delete arg;
     };
+    callbacks.on_admin_install = [](bool shortcut) {
+        // The verified staged pipeline runs off the connection thread. Once
+        // accepted it finishes even if every page closes (g_busy keeps the
+        // idle-exit policy from ending the process mid-operation), and a
+        // fresh install still launches the Admin at the end.
+        struct Arg { bool shortcut; };
+        auto* arg = new Arg{ shortcut };
+        HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID p) -> DWORD {
+                Arg* a = (Arg*)p;
+                vclient::admin_install::run(a->shortcut);
+                delete a;
+                return 0;
+            },
+            arg, 0, nullptr);
+        if (h) CloseHandle(h); else delete arg;
+    };
+    callbacks.on_admin_open = []() {
+        return vclient::admin_install::open_installed_admin();
+    };
+    callbacks.admin_status_json = []() {
+        return vclient::admin_install::status_json();
+    };
     callbacks.on_uninstall = []() { begin_uninstall_and_exit(); };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
@@ -168,7 +192,8 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             vclient::log::client("no listener could be established; exiting");
             break;
         }
-        if (vclient::bridge::g_open_connections.load() == 0) {
+        if (vclient::bridge::g_open_connections.load() == 0 &&
+            !vclient::admin_install::g_busy.load()) {
             const unsigned long long last = vclient::bridge::g_last_activity_tick.load();
             if (last != 0 && GetTickCount64() - last > kIdleExitMs) {
                 vclient::log::client("idle; exiting");

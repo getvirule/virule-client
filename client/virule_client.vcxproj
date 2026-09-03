@@ -36,7 +36,7 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(SolutionDir)src;$(SolutionDir)third_party\virule_core\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)src;$(SolutionDir)third_party\virule_core\include;$(SolutionDir)third_party;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <ExceptionHandling>Sync</ExceptionHandling>
     </ClCompile>
@@ -50,6 +50,12 @@
   <ItemGroup>
     <ClCompile Include="..\src\client\main.cpp" />
     <ClCompile Include="..\third_party\virule_core\time.cpp" />
+    <ClCompile Include="..\third_party\miniz\miniz.c">
+      <!-- C, not C++; miniz is warning-noisy at W4 and third-party. -->
+      <CompileAs>CompileAsC</CompileAs>
+      <WarningLevel>Level1</WarningLevel>
+      <ConformanceMode>false</ConformanceMode>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="..\src\client\client.rc" />

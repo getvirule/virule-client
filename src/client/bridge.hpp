@@ -37,16 +37,27 @@
 // MESSAGES (text frames, JSON):
 //   page -> client   {"type":"status"}
 //                    {"type":"qa_accept","token":"<64 hex>"}
+//                    {"type":"admin_install","shortcut":true|false}
+//                    {"type":"admin_open"}
 //                    {"type":"uninstall","nonce":"<32 hex>",
 //                     "timestamp":"<UTC>","signature":"<128 hex>"}
 //   local -> client  {"type":"qa_verify_url","token":"<64 hex>"}  (2nd instance)
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
-//                    {"type":"status","version","capabilities","pages"}
+//                    {"type":"status","version","capabilities","pages","admin"}
 //                    {"type":"accepted"}
+//                    {"type":"admin_install_started"} / {"type":"admin_opened"}
 //                    {"type":"qa_result","token":...,"state":...}
+//                    {"type":"admin_result","state":...,"version":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
+//
+// admin_install / admin_open are page messages behind the same origin
+// policy. They are CLOSED operations, not a filesystem or process surface:
+// install runs the verified staged pipeline against the approved virule.app
+// manifest (package SHA-256 + Authenticode + the VIRULE signer identity are
+// the trust decision, exactly Virule-Setup's), and open launches only the
+// managed Admin installation the client itself placed.
 //
 // The WebSocket plumbing below (handshake, SHA-1 accept, frame codec) is
 // ported from the VIRULE Admin's qa_bridge, which is live in production.
@@ -104,6 +115,15 @@ struct Callbacks {
     // ACCEPT arrived from a page (or a second instance forwarded a
     // virule:// URL). Runs the redemption asynchronously.
     std::function<void(const std::string& token)> on_qa_accept;
+    // A page asked for the Admin install/update pipeline. Runs
+    // asynchronously; the result is pushed as admin_result.
+    std::function<void(bool shortcut)> on_admin_install;
+    // A page asked to open the managed Admin installation. Synchronous;
+    // false = not installed / could not launch.
+    std::function<bool()> on_admin_open;
+    // The Admin status block embedded in every status answer
+    // ({"installed","version","running"}), or empty = "null".
+    std::function<std::string()> admin_status_json;
     // A verified uninstall authorization arrived from a page.
     std::function<void()> on_uninstall;
     // A local process asked this instance to exit (Setup replacing us).
@@ -192,11 +212,9 @@ inline int open_page_count() {
     return (int)g_pages.size();
 }
 
-// Push one QA verification result to every connected page (each page
-// filters by token). Returns whether ANY page was open to receive it.
-inline bool broadcast_qa_result(const std::string& token, const std::string& state) {
-    const std::string payload = "{\"type\":\"qa_result\",\"token\":\"" + token +
-        "\",\"state\":\"" + state + "\"}";
+// Push one message to every connected page. Returns whether ANY page was
+// open to receive it.
+inline bool broadcast_to_pages(const std::string& payload) {
     std::lock_guard<std::mutex> lock(g_pages_mutex);
     bool any = false;
     for (PageConn* p : g_pages) {
@@ -204,6 +222,13 @@ inline bool broadcast_qa_result(const std::string& token, const std::string& sta
         (void)page_send(p, 0x1, payload);
     }
     return any;
+}
+
+// Push one QA verification result to every connected page (each page
+// filters by token).
+inline bool broadcast_qa_result(const std::string& token, const std::string& state) {
+    return broadcast_to_pages("{\"type\":\"qa_result\",\"token\":\"" + token +
+                              "\",\"state\":\"" + state + "\"}");
 }
 
 inline std::string b64(const unsigned char* data, size_t n) {
@@ -421,10 +446,33 @@ inline void handle_client(SOCKET client) {
             // included when a page asks). Setup asks over a local control
             // connection, which is not counted, so a non-zero answer there
             // means a browser page found the client and still owns the flow.
+            const std::string admin = g_callbacks.admin_status_json
+                ? g_callbacks.admin_status_json() : std::string("null");
             if (!reply(0x1, std::string("{\"type\":\"status\",\"v\":1,\"version\":\"")
                             + VIRULE_CLIENT_VERSION_STRING +
-                            "\",\"capabilities\":[\"qa\",\"uninstall\"],\"pages\":" +
-                            std::to_string(open_page_count()) + "}")) {
+                            "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
+                            std::to_string(open_page_count()) +
+                            ",\"admin\":" + admin + "}")) {
+                return;
+            }
+        } else if (type == "admin_install" && is_page) {
+            // The verified staged Admin install/update. The pipeline itself
+            // is the authorization (approved manifest hash + Authenticode +
+            // the VIRULE signer identity); the page only expresses intent,
+            // including the desktop-shortcut preference it captured.
+            if (g_callbacks.on_admin_install) {
+                const bool shortcut =
+                    payload.find("\"shortcut\":true") != std::string::npos;
+                g_callbacks.on_admin_install(shortcut);
+                if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
+            } else {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            }
+        } else if (type == "admin_open" && is_page) {
+            const bool opened = g_callbacks.on_admin_open &&
+                                g_callbacks.on_admin_open();
+            if (!reply(0x1, opened ? "{\"type\":\"admin_opened\"}"
+                                   : "{\"type\":\"error\"}")) {
                 return;
             }
         } else if (type == "qa_accept" && token_ok && is_page) {

@@ -8,6 +8,9 @@
 // redirect policy follows). Every response is size-capped by the caller;
 // nothing here ever writes a file.
 
+#include <filesystem>
+#include <fstream>
+#include <functional>
 #include <string>
 
 #if defined(_WIN32)
@@ -19,7 +22,9 @@
 #endif
 #include <windows.h>
 #include <winhttp.h>
+#include <bcrypt.h>
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace vclient::http {
@@ -129,6 +134,118 @@ inline bool https_get(const wchar_t* host, const wchar_t* path, size_t max_bytes
                       unsigned long& status_out, std::string& body_out) {
     return http_get(host, INTERNET_DEFAULT_HTTPS_PORT, true, path, max_bytes,
                     status_out, body_out);
+}
+
+// Streamed GET to a file with incremental SHA-256, for payloads far too
+// large to buffer (the Admin package). Same posture as http_get: the hard
+// cap comes from a trusted expectation (the manifest's declared size), and
+// running past it FAILS rather than truncates. The target file is written
+// fresh and removed on any failure. `on_progress` (may be empty) is invoked
+// per chunk so a long download can keep the process's activity clock alive.
+inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
+                              unsigned long long max_bytes,
+                              const std::filesystem::path& target,
+                              unsigned long& status_out,
+                              unsigned long long& size_out,
+                              std::string& sha256_out,
+                              const std::function<void()>& on_progress) {
+    status_out = 0;
+    size_out = 0;
+    sha256_out.clear();
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+        return false;
+    }
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return false;
+    }
+
+    bool ok = false;
+    bool failed = false;
+    {
+        std::ofstream out(target, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            failed = true;
+        } else {
+            HINTERNET hsession = WinHttpOpen(L"ViruleClient/1.0",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS, 0);
+            if (hsession) {
+                // A large download over a slow link needs a patient receive
+                // timeout per read, not per transfer.
+                WinHttpSetTimeouts(hsession, 10000, 10000, 30000, 60000);
+                HINTERNET hconnect = WinHttpConnect(hsession, host,
+                    INTERNET_DEFAULT_HTTPS_PORT, 0);
+                if (hconnect) {
+                    HINTERNET hrequest = WinHttpOpenRequest(hconnect, L"GET", path,
+                        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                        WINHTTP_FLAG_SECURE);
+                    if (hrequest) {
+                        if (WinHttpSendRequest(hrequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                            WinHttpReceiveResponse(hrequest, nullptr)) {
+                            DWORD status = 0;
+                            DWORD sz = sizeof(status);
+                            if (WinHttpQueryHeaders(hrequest,
+                                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                                    WINHTTP_NO_HEADER_INDEX)) {
+                                status_out = status;
+                                ok = (status == 200);
+                            }
+                            if (ok) {
+                                std::string chunk;
+                                DWORD avail = 0;
+                                while (WinHttpQueryDataAvailable(hrequest, &avail) && avail > 0) {
+                                    if (size_out + avail > max_bytes) { failed = true; break; }
+                                    chunk.resize(avail);
+                                    DWORD read = 0;
+                                    if (!WinHttpReadData(hrequest, chunk.data(), avail, &read) ||
+                                        read == 0) {
+                                        break;
+                                    }
+                                    if (!out.write(chunk.data(), (std::streamsize)read).good()) {
+                                        failed = true;
+                                        break;
+                                    }
+                                    if (BCryptHashData(hash, (PUCHAR)chunk.data(), read, 0) != 0) {
+                                        failed = true;
+                                        break;
+                                    }
+                                    size_out += read;
+                                    if (on_progress) on_progress();
+                                }
+                            }
+                        }
+                        WinHttpCloseHandle(hrequest);
+                    }
+                    WinHttpCloseHandle(hconnect);
+                }
+                WinHttpCloseHandle(hsession);
+            }
+        }
+    }
+
+    unsigned char digest[32];
+    const bool hash_ok = BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+
+    if (!ok || failed || !hash_ok) {
+        std::error_code ec;
+        std::filesystem::remove(target, ec);
+        return false;
+    }
+    static const char* kHex = "0123456789abcdef";
+    sha256_out.resize(64);
+    for (size_t i = 0; i < 32; ++i) {
+        sha256_out[i * 2 + 0] = kHex[(digest[i] >> 4) & 0xF];
+        sha256_out[i * 2 + 1] = kHex[digest[i] & 0xF];
+    }
+    return true;
 }
 
 } // namespace vclient::http

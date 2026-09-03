@@ -13,7 +13,14 @@
 //   4. security\ and %LOCALAPPDATA%\VIRULE\ removed only if left empty
 //   5. HKCU\Software\Classes\virule ONLY while it points at this client
 //   6. the HKCU uninstall entry
-//   7. %LOCALAPPDATA%\Programs\VIRULE\          (the installed program)
+//   7. the desktop VIRULE.lnk ONLY when the client created it
+//      (state.json provenance; a shortcut the user made stays)
+//   8. %LOCALAPPDATA%\Programs\VIRULE\          (the installed program,
+//      including the managed Admin\ installation under it - Phase 2)
+//
+// Development trees (the VIRULE repository, its virule\publish\Virule
+// folder) are outside every inventory root and can never be touched: every
+// deletion above is an explicit VIRULE-owned path under %LOCALAPPDATA%.
 //
 // SELF-REMOVAL: a running executable cannot delete itself, so the client
 // copies itself to %TEMP% and runs that copy with --finish-uninstall
@@ -119,6 +126,12 @@ inline void remove_owned_state(const std::wstring& installed_exe) {
         remove_file_quiet(sec / "qa_tester.cred.tmp");
         remove_file_quiet(sec / "qa_tester_test.cred");
         remove_file_quiet(sec / "qa_tester_test.cred.tmp");
+    }
+
+    // 7. The desktop shortcut, ONLY when this client created it (consulted
+    // from state.json before the state directory goes).
+    if (s.created_desktop_shortcut) {
+        remove_file_quiet(paths::desktop_shortcut());
     }
 
     // 1. The client state directory (logs, config), strictly ours.

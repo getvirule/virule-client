@@ -260,6 +260,44 @@ async function main() {
     c.end();
   }
 
+  console.log("H. the Admin surface (Phase 2; non-mutating checks only)");
+  {
+    // admin_install from a PAGE is deliberately not exercised here: it runs
+    // the real verified install pipeline and mutates the machine. The
+    // end-to-end acceptance run covers it.
+    const c = await connect();
+    await c.next(); // hello
+    c.sendText('{"type":"status"}');
+    const status = await c.next();
+    const adminMatch = /"admin":\{("[^}]*)?\}/.exec(status ?? "");
+    check("status carries the admin block",
+      !!status && status.includes('"admin":{') &&
+      status.includes('"installed":') && status.includes('"running":'),
+      status ?? "none");
+    const installed = !!adminMatch && adminMatch[0].includes('"installed":true');
+    if (!installed) {
+      c.sendText('{"type":"admin_open"}');
+      const r = await c.next();
+      check("admin_open with no managed Admin answers error",
+        r === '{"type":"error"}', r ?? "none");
+    } else {
+      console.log("  skip  admin_open (a managed Admin is installed; the harness never launches it)");
+    }
+    c.end();
+
+    const local = await connect({ origin: null });
+    await local.next(); // hello
+    local.sendText('{"type":"admin_install","shortcut":false}');
+    const r1 = await local.next();
+    check("admin_install from a local no-origin connection is refused",
+      r1 === '{"type":"error"}', r1 ?? "none");
+    local.sendText('{"type":"admin_open"}');
+    const r2 = await local.next();
+    check("admin_open from a local no-origin connection is refused",
+      r2 === '{"type":"error"}', r2 ?? "none");
+    local.end();
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }
