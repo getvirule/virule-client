@@ -66,6 +66,30 @@ struct Outcome {
     std::string secondary;
 };
 
+// The last redemption outcome, by token. Exists for the Setup takeover's
+// "Finishing up…" continuation card: when the page and the takeover race
+// the same ACCEPT, the debounce lets exactly one flow redeem, and the
+// other side (holding the visible card) adopts the recorded outcome
+// instead of redeeming twice or stranding the card.
+inline std::mutex g_last_mutex;
+inline std::string g_last_token;
+inline Outcome g_last_outcome;
+inline bool g_last_valid = false;
+
+inline void record_outcome(const std::string& token, const Outcome& out) {
+    std::lock_guard<std::mutex> lock(g_last_mutex);
+    g_last_token = token;
+    g_last_outcome = out;
+    g_last_valid = true;
+}
+
+inline bool try_last_outcome(const std::string& token, Outcome& out) {
+    std::lock_guard<std::mutex> lock(g_last_mutex);
+    if (!g_last_valid || g_last_token != token) return false;
+    out = g_last_outcome;
+    return true;
+}
+
 // Redeem and write. Pure worker: no UI, no sockets.
 inline Outcome redeem_and_store(const std::string& token) {
     Outcome out;
@@ -155,6 +179,7 @@ inline void run(const std::string& token, unsigned wait_grace_ms = 3000) {
     bridge::touch_qa_activity();
     if (!debounce(token)) return;
     const Outcome out = redeem_and_store(token);
+    record_outcome(token, out);
 
     bool page_open = false;
     const ULONGLONG deadline = GetTickCount64() + wait_grace_ms;
@@ -165,6 +190,14 @@ inline void run(const std::string& token, unsigned wait_grace_ms = 3000) {
         }
         if (GetTickCount64() >= deadline) break;
         Sleep(150);
+    }
+    // The Setup takeover's lifecycle continuation card ("Finishing up…")
+    // is already on screen: the outcome lands THERE (lifecycle continuity),
+    // and the page push above still reached any open page simultaneously.
+    if (result_card::is_working_visible()) {
+        result_card::update(out.primary,
+                            out.success ? std::string() : out.secondary);
+        return;
     }
     if (!page_open) {
         page_open = report_via_admin_bridge(token, out.wire_state);

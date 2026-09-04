@@ -62,6 +62,7 @@
 #include <string>
 
 #include "client/bridge.hpp"
+#include "client/result_card.hpp"
 #include "shared/client_state.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
@@ -725,45 +726,12 @@ inline bool rename_with_retries(const std::filesystem::path& from,
     return false;
 }
 
-// The whole verified staged pipeline. Runs on a worker thread; pushes its
-// result to every connected page and finishes even when none is left.
-// Returns the wire state ("installed" / "updated" / "admin_running" /
-// "failed", or "busy" when another operation already runs) so a native
-// caller (the Setup takeover) can voice the outcome too.
-inline std::string run(bool shortcut) {
-    if (g_busy.exchange(true)) {
-        // An operation is already in flight; its own result push covers
-        // every connected page.
-        return "busy";
-    }
-    struct BusyGuard {
-        ~BusyGuard() { g_busy.store(false); }
-    } busy_guard;
-
-    const bool was_installed = admin_installed();
-    log::client(std::string("admin: ") + (was_installed ? "update" : "install") +
-                " requested" + (shortcut ? " (desktop shortcut)" : ""));
-
-    // THE CLIENT OWNS THE SHUTDOWN (owner spec 2026-09-03). A running
-    // Admin is closed GRACEFULLY for the update: the initiating surface
-    // (Admin Settings, virule.app) has already shown the approved
-    // "Shutting down VIRULE" messaging, so a short grace lets it be seen,
-    // then WM_CLOSE and a bounded wait. A refusal changes nothing and
-    // still answers admin_running (the safe fallback, no longer the
-    // normal path). An already-closed Admin skips all of this.
-    bool closed_admin_for_update = false;
-    if (was_installed && admin_running()) {
-        log::client("admin: update requested while running; closing the Admin gracefully");
-        Sleep(4000); // the approved shutdown-message grace
-        if (!close_running_admin(25000)) {
-            log::client("admin: the Admin did not close; nothing changed");
-            broadcast_result("admin_running", "");
-            return "admin_running";
-        }
-        closed_admin_for_update = true;
-        log::client("admin: the Admin closed; continuing the update");
-    }
-
+// The verified staged pipeline body (manifest through placement). Runs on
+// a worker thread; pushes its result to every connected page and finishes
+// even when none is left. Returns the wire state ("installed" / "updated" /
+// "admin_running" / "failed"). Callers own launching the Admin and any
+// native lifecycle card (see run()).
+inline std::string run_pipeline(bool shortcut, bool was_installed) {
     // 1-2. The approved manifest.
     Manifest manifest;
     std::string why;
@@ -929,19 +897,149 @@ inline std::string run(bool shortcut) {
         }
     }
 
-    // 10. A FRESH install opens the Admin automatically, and the client
-    // RELAUNCHES an Admin it closed for this update (the user never
-    // reopens VIRULE by hand). An update of an Admin that was already
-    // closed leaves the user where they are.
-    if (!was_installed || closed_admin_for_update) {
-        (void)open_installed_admin();
-    }
-
     log::client("admin: " + std::string(was_installed ? "updated" : "installed") +
                 " version " + manifest.version);
     const std::string result = was_installed ? "updated" : "installed";
     broadcast_result(result, manifest.version);
     return result;
+}
+
+// The whole install/update operation, with the lifecycle rules around the
+// pipeline. Returns the wire state (or "busy" when another operation
+// already runs).
+//
+// `native_feedback` = the client owns the visible feedback for this
+// operation (a LOCAL caller: the Admin's Settings Update, the launch
+// handoff). THE DEAD-AIR FIX (owner spec 2026-09-03): the moment the
+// Admin has closed for an update, the client immediately shows the
+// branded native "Updating…" card, keeps it up through download / verify /
+// stage / replace, relaunches the updated Admin, and closes the card -
+// the user never stares at nothing and never reopens VIRULE by hand.
+// Page-driven operations (native_feedback = false) leave the visible flow
+// to the page, exactly as before.
+inline std::string run(bool shortcut, bool native_feedback = false) {
+    if (g_busy.exchange(true)) {
+        // An operation is already in flight; its own result push covers
+        // every connected page.
+        return "busy";
+    }
+    struct BusyGuard {
+        ~BusyGuard() { g_busy.store(false); }
+    } busy_guard;
+
+    const bool was_installed = admin_installed();
+    log::client(std::string("admin: ") + (was_installed ? "update" : "install") +
+                " requested" + (shortcut ? " (desktop shortcut)" : ""));
+
+    // THE CLIENT OWNS THE SHUTDOWN (owner spec 2026-09-03). A running
+    // Admin is closed GRACEFULLY for the update: the initiating surface
+    // (Admin Settings, virule.app) has already shown the approved
+    // "Shutting down VIRULE" messaging, so a short grace lets it be seen,
+    // then WM_CLOSE and a bounded wait. A refusal changes nothing and
+    // still answers admin_running (the safe fallback, no longer the
+    // normal path). An already-closed Admin skips all of this.
+    bool closed_admin_for_update = false;
+    if (was_installed && admin_running()) {
+        log::client("admin: update requested while running; closing the Admin gracefully");
+        Sleep(4000); // the approved shutdown-message grace
+        if (!close_running_admin(25000)) {
+            log::client("admin: the Admin did not close; nothing changed");
+            broadcast_result("admin_running", "");
+            return "admin_running";
+        }
+        closed_admin_for_update = true;
+        log::client("admin: the Admin closed; continuing the update");
+    }
+
+    // The Admin surface is gone; the client's own surface takes over NOW
+    // (never a dead-air download). Idempotent when the launch handoff
+    // already put the card up.
+    if (native_feedback && closed_admin_for_update &&
+        !result_card::is_working_visible()) {
+        result_card::show_working("Updating\xE2\x80\xA6", "");
+    }
+
+    const std::string state = run_pipeline(shortcut, was_installed);
+
+    if (state == "installed") {
+        // A fresh install opens the Admin automatically; the Admin window
+        // is the next feedback surface.
+        (void)open_installed_admin();
+        if (native_feedback) result_card::close();
+    } else if (state == "updated") {
+        if (closed_admin_for_update) {
+            // Relaunch the Admin the client closed (the user never reopens
+            // VIRULE by hand), then retire the card: next owner first.
+            (void)open_installed_admin();
+            if (native_feedback) result_card::close();
+        }
+        // An update of an Admin that was already closed leaves the user
+        // where they are (the caller may still choose to launch: the
+        // launch handoff does).
+    } else if (closed_admin_for_update) {
+        // The update failed AFTER the Admin was closed for it. The
+        // known-good install is untouched (atomic placement), so bring
+        // VIRULE back rather than leaving the user with nothing; Settings
+        // will still offer the update.
+        log::client("admin: update failed after shutdown; relaunching the previous Admin");
+        if (native_feedback) result_card::update("Something went wrong.", "");
+        (void)open_installed_admin();
+    }
+    return state;
+}
+
+// UPDATE ON VIRULE LAUNCH (owner spec 2026-09-03): a user-initiated VIRULE
+// launch comes up CURRENT. The launching virule.exe (or admin_open) asks
+// this client whether an approved update exists; when one does, the launch
+// is handed here: the client shows the branded native "Updating…" card
+// immediately (the launcher's splash may still be closing - a brief
+// overlap beats a gap), waits for the handing-off Admin process to exit,
+// performs the verified staged update, and launches ONLY the new Admin. A
+// failed update never blocks the launch: the current known-good Admin
+// opens instead (Settings still offers the update).
+inline void launch_after_update_handoff() {
+    if (!admin_installed()) return;
+    result_card::show_working("Updating\xE2\x80\xA6", "");
+    // The virule.exe that handed off exits within moments; a bounded wait
+    // covers it. Anything still running past it is a REAL Admin session
+    // (which is never interrupted): focus it and stand down.
+    for (int i = 0; i < 40 && admin_running(); ++i) Sleep(250);
+    if (admin_running()) {
+        result_card::close();
+        focus_running_admin();
+        return;
+    }
+    // Re-verify against the approved manifest (fresh cache after the
+    // handoff's own check, so this is instant; a genuinely stale cache
+    // refetches, bounded by the HTTP timeouts).
+    refresh_update_check(kUpdateCheckFreshMs);
+    std::string approved;
+    {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        approved = g_approved_version;
+    }
+    const std::string installed = authoritative_admin_version();
+    const bool update = !approved.empty() && !installed.empty() &&
+                        approved != installed;
+    if (!update) {
+        result_card::close();
+        (void)open_installed_admin();
+        return;
+    }
+    const std::string state = run(false, /*native_feedback=*/true);
+    if (state == "updated") {
+        // The Admin was not running, so run() left the launch to us.
+        (void)open_installed_admin();
+        result_card::close();
+    } else if (state == "busy") {
+        // Another operation owns the lifecycle; its own feedback covers it.
+        result_card::close();
+    } else if (state != "installed") {
+        // Never block a launch on a failed update: open the current Admin.
+        log::client("admin: launch-time update did not complete; launching current Admin");
+        result_card::close();
+        (void)open_installed_admin();
+    }
 }
 
 } // namespace vclient::admin_install

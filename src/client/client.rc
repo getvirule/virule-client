@@ -1,7 +1,11 @@
-// virule-client.exe resources: VERSIONINFO only (no icon yet; the client
-// is plumbing and has no visible surface of its own).
+// virule-client.exe resources: the VIRULE application icon + VERSIONINFO.
+// The client is plumbing, but it now owns the native lifecycle surface
+// ("Updating…", "Finishing up…", "VIRULE is ready"), so its windows and
+// taskbar entries must present as VIRULE (result_card loads icon id 1).
 #include <winres.h>
 #include "../shared/version.h"
+
+1 ICON "..\\..\\assets\\ViruleAppIcon.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION VIRULE_CLIENT_VERSION_MAJOR,VIRULE_CLIENT_VERSION_MINOR,VIRULE_CLIENT_VERSION_PATCH,0

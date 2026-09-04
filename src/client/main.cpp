@@ -135,22 +135,38 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             arg, 0, nullptr);
         if (h) CloseHandle(h); else delete arg;
     };
-    callbacks.on_admin_install = [](bool shortcut) {
+    callbacks.on_admin_install = [](bool shortcut, bool from_page) {
         // The verified staged pipeline runs off the connection thread. Once
         // accepted it finishes even if every page closes (g_busy keeps the
         // idle-exit policy from ending the process mid-operation), and a
-        // fresh install still launches the Admin at the end.
-        struct Arg { bool shortcut; };
-        auto* arg = new Arg{ shortcut };
+        // fresh install still launches the Admin at the end. A LOCAL
+        // caller is the Admin's own Settings Update: the client owns the
+        // visible feedback there (the native "Updating…" card after the
+        // Admin closes - the dead-air fix); a page-driven operation leaves
+        // the visible flow to the page.
+        struct Arg { bool shortcut; bool native_feedback; };
+        auto* arg = new Arg{ shortcut, !from_page };
         HANDLE h = CreateThread(nullptr, 0,
             [](LPVOID p) -> DWORD {
                 Arg* a = (Arg*)p;
-                vclient::admin_install::run(a->shortcut);
+                vclient::admin_install::run(a->shortcut, a->native_feedback);
                 delete a;
                 return 0;
             },
             arg, 0, nullptr);
         if (h) CloseHandle(h); else delete arg;
+    };
+    callbacks.on_admin_launch = []() {
+        // Update-on-launch: a managed virule.exe handed its user-initiated
+        // launch over because an approved update exists. Native "Updating…"
+        // feedback, verified update, then ONLY the new Admin launches.
+        HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID) -> DWORD {
+                vclient::admin_install::launch_after_update_handoff();
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
     };
     callbacks.on_admin_open = []() {
         return vclient::admin_install::open_installed_admin();

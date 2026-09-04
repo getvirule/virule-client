@@ -1,28 +1,44 @@
 #pragma once
-// The minimal native card, ported from the VIRULE Admin's QA verification
-// result window (browser/native ownership rule): while a virule.app page is
-// open the BROWSER owns every visible part of a flow and this window never
-// exists. Only when no page is there does native VIRULE show this small
-// card. One headline, at most one supporting line. No brand mark.
+// The client's ONE small native surface, in two visual voices:
 //
-// Three modes (the bootstrap/handoff pass, 2026-09-03):
+// BARE RESULT (the original card, unchanged): ported from the VIRULE
+// Admin's QA verification result window (browser/native ownership rule):
+// while a virule.app page is open the BROWSER owns every visible part of a
+// flow and this window never exists. Only when no page is there does native
+// VIRULE show this small card. One headline, at most one supporting line.
+// No brand mark. Used ONLY for the QA verification outcome (qa_flow).
+//
+// LIFECYCLE SURFACE (the lifecycle continuity pass, 2026-09-03): the
+// client is now the persistent machine manager and needs one consistent
+// branded surface for its transitional states - "Updating…",
+// "Finishing up…", "You're all set.", "VIRULE is ready" [Continue]. These
+// wear the Virule-Setup card grammar (yellow V mark, spaced wordmark, the
+// subtle indeterminate bar), so the ownership handoff Setup -> Client ->
+// Admin reads as one continuous VIRULE, never as unrelated windows.
+//
+// Three modes:
 //
 //   Result   the final outcome. Click / Escape / Enter dismiss; it
-//            dismisses itself on a timer. (The original card.)
-//   Working  a continuation surface shown WHILE the client completes an
-//            operation the browser can no longer watch ("Finishing setup
-//            for [Game]", "Installing VIRULE..."): the Setup card's subtle
-//            indeterminate bar, not dismissible, no auto-close; it becomes
-//            a Result via update().
-//   Ready    the standalone completion surface for a Setup run with no
-//            recoverable browser intent: "VIRULE is ready" over "Continue
-//            at virule.app to get started." and ONE explicit
-//            [ Open virule.app ] action. Nothing opens a browser except
-//            that click.
+//            dismisses itself on a timer. Bare when shown directly
+//            (show()); branded when a lifecycle card resolved into it
+//            (update()).
+//   Working  a branded continuation surface shown WHILE the client
+//            completes an operation ("Updating…", "Finishing up…"): the
+//            Setup card's indeterminate bar, not dismissible, no
+//            auto-close; it becomes a Result via update().
+//   Ready    the branded standalone completion surface for a Setup run
+//            with no recoverable browser intent: "VIRULE is ready" and ONE
+//            explicit [ Continue ] action (opens virule.app in the default
+//            browser). Nothing opens a browser except that click.
 //
 // The card is the "next visible feedback surface" the ownership invariant
-// requires before Virule-Setup is allowed to close, so takeover code waits
-// on is_visible() before releasing Setup.
+// requires before Virule-Setup (or a closing Admin) is allowed to
+// disappear, so takeover/update code waits on is_visible() before
+// releasing the previous surface.
+//
+// REUSABLE: the client is a persistent process and shows lifecycle cards
+// repeatedly (an Admin update today, another next month). One card exists
+// at a time; a finished card's thread is reaped so the next can show.
 
 #include <atomic>
 #include <mutex>
@@ -93,10 +109,12 @@ inline Palette resolve_palette() {
 }
 
 inline std::atomic<HWND> g_hwnd{ nullptr };
-inline HANDLE g_thread = nullptr;
+inline std::mutex g_thread_mutex;
+inline HANDLE g_thread = nullptr;    // guarded by g_thread_mutex
 inline UINT g_dpi = 96;          // window thread only
 inline Palette g_pal{};
 inline std::atomic<int> g_mode{ (int)Mode::Result };
+inline std::atomic<bool> g_branded{ false };
 inline std::atomic<int> g_phase{ 0 }; // indeterminate bar position, 0..999
 inline std::mutex g_text_mutex;
 inline std::wstring g_primary;
@@ -116,6 +134,166 @@ inline std::wstring widen_utf8(const std::string& s) {
 
 inline void open_site() {
     ShellExecuteW(nullptr, L"open", kSiteUrl, nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+inline HFONT make_font(int size, int weight) {
+    return CreateFontW(-qsc(size), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+}
+
+// The branded lifecycle layout: V mark + spaced wordmark (the Virule-Setup
+// card grammar, measured TextOut because letter spacing is invisible to
+// DrawText's centering), headline, then the mode's own element (bar /
+// secondary line / action button).
+inline void paint_branded(HDC mem, int w, int h, Mode mode,
+                          const std::wstring& primary,
+                          const std::wstring& secondary) {
+    // Yellow V mark.
+    const int mark = qsc(44);
+    const int mark_x = (w - mark) / 2;
+    const int mark_y = qsc(30);
+    {
+        HBRUSH b = CreateSolidBrush(g_pal.accent);
+        HGDIOBJ old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
+        HGDIOBJ old_br = SelectObject(mem, b);
+        RoundRect(mem, mark_x, mark_y, mark_x + mark, mark_y + mark, qsc(12), qsc(12));
+        SelectObject(mem, old_br);
+        SelectObject(mem, old_pen);
+        DeleteObject(b);
+    }
+    {
+        HFONT f = make_font(24, FW_BOLD);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.accent_ink);
+        RECT mr{ mark_x, mark_y, mark_x + mark, mark_y + mark };
+        DrawTextW(mem, L"V", 1, &mr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
+    // Wordmark.
+    {
+        HFONT f = make_font(15, FW_BOLD);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.word);
+        const int extra = qsc(4);
+        const wchar_t word[] = L"VIRULE";
+        const int word_len = (int)(sizeof(word) / sizeof(word[0])) - 1;
+        SIZE sz{};
+        GetTextExtentPoint32W(mem, word, word_len, &sz);
+        const int total_w = sz.cx + extra * (word_len - 1);
+        SetTextCharacterExtra(mem, extra);
+        TextOutW(mem, (w - total_w) / 2, mark_y + mark + qsc(14), word, word_len);
+        SetTextCharacterExtra(mem, 0);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
+    // Headline: one line, word color, fixed band so every state aligns.
+    {
+        HFONT f = make_font(13, FW_SEMIBOLD);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.word);
+        RECT tr{ qsc(26), qsc(118), w - qsc(26), qsc(142) };
+        DrawTextW(mem, primary.c_str(), (int)primary.size(), &tr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
+    if (mode == Mode::Working) {
+        // The Setup card's subtle indeterminate bar: work is happening; no
+        // invented percentages, ever.
+        const int bar_w = qsc(168);
+        const int bar_h = qsc(3);
+        const int bar_x = (w - bar_w) / 2;
+        const int bar_y = qsc(160);
+        {
+            HBRUSH b = CreateSolidBrush(g_pal.line);
+            RECT track{ bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
+            FillRect(mem, &track, b);
+            DeleteObject(b);
+        }
+        {
+            const int seg_w = bar_w * 2 / 5;
+            const int span = bar_w + seg_w;
+            const int pos = bar_x - seg_w + (int)((long long)span * g_phase.load() / 1000);
+            int left = pos, right = pos + seg_w;
+            if (left < bar_x) left = bar_x;
+            if (right > bar_x + bar_w) right = bar_x + bar_w;
+            if (right > left) {
+                HBRUSH b = CreateSolidBrush(g_pal.accent);
+                RECT seg{ left, bar_y, right, bar_y + bar_h };
+                FillRect(mem, &seg, b);
+                DeleteObject(b);
+            }
+        }
+    } else if (mode == Mode::Result && !secondary.empty()) {
+        HFONT f = make_font(11, FW_NORMAL);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.muted);
+        RECT sr{ qsc(26), qsc(146), w - qsc(26), h - qsc(10) };
+        DrawTextW(mem, secondary.c_str(), (int)secondary.size(), &sr,
+                  DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    } else if (mode == Mode::Ready) {
+        // The ONE explicit action. Accent button, VIRULE's native grammar.
+        HFONT f = make_font(12, FW_SEMIBOLD);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        const wchar_t label[] = L"Continue";
+        const int label_len = (int)(sizeof(label) / sizeof(label[0])) - 1;
+        SIZE sz{};
+        GetTextExtentPoint32W(mem, label, label_len, &sz);
+        const int bw = sz.cx + qsc(56);
+        const int bh = qsc(32);
+        const int bx = (w - bw) / 2;
+        const int by = h - qsc(24) - bh;
+        g_button = RECT{ bx, by, bx + bw, by + bh };
+        {
+            HBRUSH b = CreateSolidBrush(g_pal.accent);
+            HGDIOBJ old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
+            HGDIOBJ old_br = SelectObject(mem, b);
+            RoundRect(mem, bx, by, bx + bw, by + bh, qsc(8), qsc(8));
+            SelectObject(mem, old_br);
+            SelectObject(mem, old_pen);
+            DeleteObject(b);
+        }
+        SetTextColor(mem, g_pal.accent_ink);
+        RECT br{ bx, by, bx + bw, by + bh };
+        DrawTextW(mem, label, label_len, &br,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
+}
+
+// The original bare-result layout (the QA doctrine card): headline, at
+// most one supporting line, NO brand mark.
+inline void paint_bare(HDC mem, int w, int h,
+                       const std::wstring& primary,
+                       const std::wstring& secondary) {
+    const bool tall = !secondary.empty();
+    {
+        HFONT f = make_font(13, FW_SEMIBOLD);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.word);
+        RECT tr = tall
+            ? RECT{ qsc(20), qsc(34), w - qsc(20), qsc(56) }
+            : RECT{ qsc(20), 0, w - qsc(20), h - qsc(10) };
+        DrawTextW(mem, primary.c_str(), (int)primary.size(), &tr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
+    if (!secondary.empty()) {
+        HFONT f = make_font(11, FW_NORMAL);
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.muted);
+        RECT sr{ qsc(24), qsc(62), w - qsc(24), h - qsc(20) };
+        DrawTextW(mem, secondary.c_str(), (int)secondary.size(), &sr,
+                  DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+        SelectObject(mem, old_f);
+        DeleteObject(f);
+    }
 }
 
 inline void paint(HWND hwnd) {
@@ -153,96 +331,10 @@ inline void paint(HWND hwnd) {
 
     SetBkMode(mem, TRANSPARENT);
 
-    // Layout: Result keeps the original geometry; Working and Ready anchor
-    // the headline higher to make room for the bar / the action button.
-    const bool tall = mode != Mode::Result || !secondary.empty();
-    {
-        HFONT f = CreateFontW(-qsc(13), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old_f = SelectObject(mem, f);
-        SetTextColor(mem, g_pal.word);
-        RECT tr = tall
-            ? RECT{ qsc(20), qsc(34), w - qsc(20), qsc(56) }
-            : RECT{ qsc(20), 0, w - qsc(20), h - qsc(10) };
-        DrawTextW(mem, primary.c_str(), (int)primary.size(), &tr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
-    }
-    if (!secondary.empty()) {
-        HFONT f = CreateFontW(-qsc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old_f = SelectObject(mem, f);
-        SetTextColor(mem, g_pal.muted);
-        RECT sr{ qsc(24), qsc(62), w - qsc(24),
-                 mode == Mode::Ready ? qsc(90) : h - qsc(20) };
-        DrawTextW(mem, secondary.c_str(), (int)secondary.size(), &sr,
-                  DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
-    }
-
-    if (mode == Mode::Working) {
-        // The Setup card's subtle indeterminate bar: work is happening; no
-        // invented percentages, ever.
-        const int bar_w = qsc(168);
-        const int bar_h = qsc(3);
-        const int bar_x = (w - bar_w) / 2;
-        const int bar_y = h - qsc(34);
-        {
-            HBRUSH b = CreateSolidBrush(g_pal.line);
-            RECT track{ bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
-            FillRect(mem, &track, b);
-            DeleteObject(b);
-        }
-        {
-            const int seg_w = bar_w * 2 / 5;
-            const int span = bar_w + seg_w;
-            const int pos = bar_x - seg_w + (int)((long long)span * g_phase.load() / 1000);
-            int left = pos, right = pos + seg_w;
-            if (left < bar_x) left = bar_x;
-            if (right > bar_x + bar_w) right = bar_x + bar_w;
-            if (right > left) {
-                HBRUSH b = CreateSolidBrush(g_pal.accent);
-                RECT seg{ left, bar_y, right, bar_y + bar_h };
-                FillRect(mem, &seg, b);
-                DeleteObject(b);
-            }
-        }
-    }
-
-    if (mode == Mode::Ready) {
-        // The ONE explicit action. Accent button, VIRULE's native grammar.
-        HFONT f = CreateFontW(-qsc(12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old_f = SelectObject(mem, f);
-        const wchar_t label[] = L"Open virule.app";
-        const int label_len = (int)(sizeof(label) / sizeof(label[0])) - 1;
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, label, label_len, &sz);
-        const int bw = sz.cx + qsc(44);
-        const int bh = qsc(32);
-        const int bx = (w - bw) / 2;
-        const int by = h - qsc(24) - bh;
-        g_button = RECT{ bx, by, bx + bw, by + bh };
-        {
-            HBRUSH b = CreateSolidBrush(g_pal.accent);
-            HGDIOBJ old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
-            HGDIOBJ old_br = SelectObject(mem, b);
-            RoundRect(mem, bx, by, bx + bw, by + bh, qsc(8), qsc(8));
-            SelectObject(mem, old_br);
-            SelectObject(mem, old_pen);
-            DeleteObject(b);
-        }
-        SetTextColor(mem, g_pal.accent_ink);
-        RECT br{ bx, by, bx + bw, by + bh };
-        DrawTextW(mem, label, label_len, &br,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
+    if (g_branded.load()) {
+        paint_branded(mem, w, h, mode, primary, secondary);
+    } else {
+        paint_bare(mem, w, h, primary, secondary);
     }
 
     BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -342,13 +434,17 @@ inline DWORD WINAPI thread_main(LPVOID) {
     wc.lpszClassName = kClassName;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-    if (!RegisterClassW(&wc)) return 0;
+    // The persistent client shows lifecycle cards repeatedly; a class
+    // registered by an earlier card is fine.
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return 0;
+    }
 
     const Mode mode = (Mode)g_mode.load();
-    const int w = qsc(320);
-    const int h = mode == Mode::Ready ? qsc(176)
-                : mode == Mode::Working ? qsc(150)
-                : qsc(150);
+    const bool branded = g_branded.load();
+    const int w = branded ? qsc(340) : qsc(320);
+    const int h = branded ? (mode == Mode::Ready ? qsc(216) : qsc(200))
+                          : qsc(150);
     RECT work{ 0, 0, 0, 0 };
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int x = work.left + ((work.right - work.left) - w) / 2;
@@ -359,11 +455,10 @@ inline DWORD WINAPI thread_main(LPVOID) {
     if (!hwnd) return 0;
     SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, qsc(14), qsc(14)), TRUE);
     g_hwnd.store(hwnd);
-    // This card only exists when no page is left to show the outcome, so
-    // it must reach the FOREGROUND even though this process was spawned
-    // from the background: attach to the foreground thread for the
-    // switch, then a topmost pulse so the card surfaces without staying
-    // topmost.
+    // This card is the handoff's next feedback surface, so it must reach
+    // the FOREGROUND even though this process was spawned from the
+    // background: attach to the foreground thread for the switch, then a
+    // topmost pulse so the card surfaces without staying topmost.
     ShowWindow(hwnd, SW_SHOW);
     if (HWND fg = GetForegroundWindow()) {
         const DWORD fg_tid = GetWindowThreadProcessId(fg, nullptr);
@@ -393,39 +488,57 @@ inline DWORD WINAPI thread_main(LPVOID) {
     return 0;
 }
 
-inline void start_thread(Mode mode, const std::string& primary_utf8,
+// ONE card at a time; a finished card's thread is reaped so the next
+// lifecycle state (possibly much later in this persistent process) can
+// show. A card still on screen keeps ownership: later show calls no-op and
+// the state moves through update()/close() instead.
+inline void start_thread(Mode mode, bool branded,
+                         const std::string& primary_utf8,
                          const std::string& secondary_utf8) {
-    if (g_thread) return;
+    std::lock_guard<std::mutex> lock(g_thread_mutex);
+    if (g_thread) {
+        if (WaitForSingleObject(g_thread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(g_thread);
+            g_thread = nullptr;
+        } else {
+            return; // a live card owns the surface
+        }
+    }
     {
-        std::lock_guard<std::mutex> lock(g_text_mutex);
+        std::lock_guard<std::mutex> text_lock(g_text_mutex);
         g_primary = widen_utf8(primary_utf8);
         g_secondary = widen_utf8(secondary_utf8);
     }
     g_mode.store((int)mode);
+    g_branded.store(branded);
+    g_phase.store(0);
     g_thread = CreateThread(nullptr, 0, thread_main, nullptr, 0, nullptr);
 }
 
-// Show the final outcome. Only called when no page is open to show it.
+// Show the final outcome (the bare QA doctrine card). Only called when no
+// page is open to show it.
 inline void show(const std::string& primary_utf8, const std::string& secondary_utf8) {
-    start_thread(Mode::Result, primary_utf8, secondary_utf8);
+    start_thread(Mode::Result, /*branded=*/false, primary_utf8, secondary_utf8);
 }
 
-// Show a continuation surface while the client completes an operation the
-// browser can no longer watch. Becomes a Result via update().
+// Show a branded lifecycle continuation surface while the client completes
+// an operation ("Updating…", "Finishing up…"). Becomes a Result via
+// update().
 inline void show_working(const std::string& primary_utf8,
                          const std::string& secondary_utf8) {
-    start_thread(Mode::Working, primary_utf8, secondary_utf8);
+    start_thread(Mode::Working, /*branded=*/true, primary_utf8, secondary_utf8);
 }
 
 // The standalone Setup completion surface: no recoverable intent, one
-// explicit way onward.
+// explicit way onward (owner copy 2026-09-03: the branded window already
+// says VIRULE; the single action is Continue).
 inline void show_ready() {
-    start_thread(Mode::Ready, "VIRULE is ready",
-                 "Continue at virule.app to get started.");
+    start_thread(Mode::Ready, /*branded=*/true, "VIRULE is ready", "");
 }
 
 // Turn the visible card into a Result with new copy (a Working card's
-// outcome landing). Safe from any thread.
+// outcome landing). Keeps the card's visual voice (a branded lifecycle
+// card resolves branded). Safe from any thread.
 inline void update(const std::string& primary_utf8,
                    const std::string& secondary_utf8) {
     {
@@ -438,8 +551,14 @@ inline void update(const std::string& primary_utf8,
 }
 
 // True once the window actually exists on screen (the ownership invariant
-// waits on this before releasing Setup).
+// waits on this before releasing the previous surface).
 inline bool is_visible() { return g_hwnd.load() != nullptr; }
+
+// A lifecycle Working card is on screen and still unresolved (its outcome
+// should land on it rather than on a second surface).
+inline bool is_working_visible() {
+    return g_hwnd.load() != nullptr && (Mode)g_mode.load() == Mode::Working;
+}
 
 // Dismiss the card programmatically (an operation's feedback moved to a
 // better surface, or a standalone card was superseded by a real intent).
@@ -449,10 +568,18 @@ inline void close() {
 
 // Blocks until the window closes itself (timer, click or key).
 inline void wait_closed(DWORD timeout_ms = 30000) {
-    if (!g_thread) return;
-    WaitForSingleObject(g_thread, timeout_ms);
-    CloseHandle(g_thread);
-    g_thread = nullptr;
+    HANDLE h = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_thread_mutex);
+        h = g_thread;
+    }
+    if (!h) return;
+    WaitForSingleObject(h, timeout_ms);
+    std::lock_guard<std::mutex> lock(g_thread_mutex);
+    if (g_thread == h && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+        CloseHandle(h);
+        g_thread = nullptr;
+    }
 }
 
 } // namespace vclient::result_card

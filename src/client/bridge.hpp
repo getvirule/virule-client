@@ -49,6 +49,7 @@
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
 //                    {"type":"admin_install"}          (Admin Settings Update)
+//                    {"type":"admin_launch"}           (managed launch handoff)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
 //                    {"type":"setup_takeover",...}     (Setup envelope transfer)
 //                    {"type":"setup_wait"}             (Setup release poll)
@@ -125,9 +126,17 @@ struct Callbacks {
     // ACCEPT arrived from a page (or a second instance forwarded a
     // virule:// URL). Runs the redemption asynchronously.
     std::function<void(const std::string& token)> on_qa_accept;
-    // A page asked for the Admin install/update pipeline. Runs
-    // asynchronously; the result is pushed as admin_result.
-    std::function<void(bool shortcut)> on_admin_install;
+    // The Admin install/update pipeline was requested. `from_page` = a
+    // virule.app page drove it (the page owns the visible flow); a LOCAL
+    // caller (the Admin's Settings Update) hands the client the visible
+    // feedback too (the native "Updating…" card). Runs asynchronously;
+    // the result is pushed as admin_result.
+    std::function<void(bool shortcut, bool from_page)> on_admin_install;
+    // A local launcher (the managed virule.exe cooperating at startup)
+    // handed the client a user-initiated VIRULE launch that needs an
+    // update first: update with native feedback, then launch the new
+    // Admin. Runs asynchronously.
+    std::function<void()> on_admin_launch;
     // A page asked to open the managed Admin installation. Synchronous;
     // false = not installed / could not launch.
     std::function<bool()> on_admin_open;
@@ -516,8 +525,20 @@ inline void handle_client(SOCKET client) {
                 const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
                 if (is_page) g_page_drove.store(true);
-                g_callbacks.on_admin_install(shortcut);
+                g_callbacks.on_admin_install(shortcut, is_page);
                 if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
+            } else {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            }
+        } else if (type == "admin_launch" && !is_page) {
+            // A managed virule.exe launch handing itself over because an
+            // approved update exists (update-on-launch): the client shows
+            // the native "Updating…" card, updates, and launches only the
+            // new Admin. Local trust model: a local process could run the
+            // update itself; nothing here is authorization.
+            if (g_callbacks.on_admin_launch) {
+                g_callbacks.on_admin_launch();
+                if (!reply(0x1, "{\"type\":\"admin_launch_started\"}")) return;
             } else {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             }

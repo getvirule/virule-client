@@ -16,14 +16,16 @@
 //   - a client-owned native card is visible (the QA continuation card, the
 //     Admin install card, or the standalone "VIRULE is ready" card).
 //
-// THE THREE TAKEOVER SHAPES:
+// THE THREE TAKEOVER SHAPES (lifecycle continuity pass, 2026-09-03):
 //
-//   QA_ACCEPT       browser alive -> the page owns all visible UX (its
-//                   "Finishing setup" waiting view); the client redeems
-//                   silently and pushes the result. Browser gone -> the
-//                   native continuation card ("Finishing setup for
-//                   [Game]") shows BEFORE Setup may close, then becomes
-//                   "You're all set." / "You can close this window."
+//   QA_ACCEPT       the native continuation card "Finishing up…" ALWAYS
+//                   shows BEFORE Setup may close (owner spec: the user
+//                   watching Setup must never have to hunt for the
+//                   browser to learn whether VIRULE finished), then
+//                   becomes "You're all set." and closes itself. A live
+//                   page still receives the same result push and reaches
+//                   its own success state simultaneously; the card never
+//                   waits on the browser.
 //   INSTALL_ADMIN   browser alive -> the page drives admin_install and
 //                   shows its own progress. Browser gone -> the client
 //                   owns the install with a native progress card, and
@@ -31,8 +33,8 @@
 //   (no envelope)   a standalone / stale Setup run: there IS no
 //                   recoverable intent, and none is invented. The client
 //                   shows "VIRULE is ready" with the one explicit
-//                   [ Open virule.app ] action. Setup never opens a
-//                   browser; only that click does.
+//                   [ Continue ] action (opens virule.app). Setup never
+//                   opens a browser; only that click does.
 //
 // INTENT, NEVER AUTHORIZATION: the envelope grants nothing. A QA token
 // still has to survive service redemption with this machine's proof; an
@@ -109,40 +111,49 @@ inline void release_when_card_visible() {
     release();
 }
 
+// Show a Working card, retrying briefly: a superseded standalone card
+// closes asynchronously, and the one-card-at-a-time rule makes show a
+// no-op until its thread is reaped. Idempotent when a card is already up.
+inline void show_working_retry(const char* primary) {
+    for (int i = 0; i < 12; ++i) {
+        result_card::show_working(primary, "");
+        if (result_card::is_visible()) return;
+        Sleep(100);
+    }
+}
+
 // ---- QA_ACCEPT ----
 
-inline void run_qa(const std::string& token, const std::string& game) {
+inline void run_qa(const std::string& token) {
     bridge::touch_qa_activity();
-    if (wait_for_page(kPageGraceMs)) {
-        // The page owns all visible UX. Release Setup, then make sure the
-        // redemption actually runs: the page normally sends qa_accept
-        // itself the moment it reconnects (the debounce collapses the
-        // duplicate), but a page that acked without re-sending must not
-        // strand the token.
-        release();
-        qa_flow::run(token);
-        return;
-    }
-    // Browser gone after handoff: the intent is NOT lost. Native
-    // continuation surface first, then the work, then the result.
-    const std::string primary =
-        game.empty() ? std::string("Finishing setup")
-                     : "Finishing setup for " + game;
-    result_card::show_working(primary, "");
+    // The native continuation ALWAYS appears for a Setup QA handoff (owner
+    // spec 2026-09-03): "Finishing up…" the moment Setup may close, then
+    // "You're all set." - so the user watching the native flow never has
+    // to find the browser to learn whether VIRULE finished. A live page
+    // still gets the result push and completes its own view in parallel.
+    show_working_retry("Finishing up\xE2\x80\xA6");
     release_when_card_visible();
-    if (!qa_flow::debounce(token)) {
-        // Another flow (a late page, a virule:// forward) is redeeming and
-        // owns delivery; the card will sit briefly and self-resolve when
-        // that flow broadcasts. Nothing more to do here.
-        return;
+    qa_flow::run(token);
+    // qa_flow::run resolves the visible card itself. If the redemption was
+    // already being driven by another flow (the page's own qa_accept won
+    // the debounce), adopt its recorded outcome onto the card instead of
+    // stranding it in the working state.
+    if (result_card::is_working_visible()) {
+        const ULONGLONG deadline = GetTickCount64() + 90000;
+        qa_flow::Outcome out;
+        for (;;) {
+            if (qa_flow::try_last_outcome(token, out)) {
+                result_card::update(out.primary,
+                                    out.success ? std::string() : out.secondary);
+                break;
+            }
+            if (GetTickCount64() >= deadline) {
+                result_card::update("Something went wrong.", "Try again.");
+                break;
+            }
+            Sleep(300);
+        }
     }
-    const auto out = qa_flow::redeem_and_store(token);
-    // A page that appeared meanwhile gets the push too; the card shows the
-    // same outcome either way.
-    (void)bridge::broadcast_qa_result(token, out.wire_state);
-    result_card::update(out.primary,
-                        out.success ? std::string("You can close this window.")
-                                    : out.secondary);
     result_card::wait_closed();
     release();
 }
@@ -160,9 +171,9 @@ inline void run_admin(bool shortcut) {
     // Browser gone after handoff: the client owns the Admin installation
     // with immediate native feedback, and the Admin itself is the final
     // surface.
+    // The card is branded; the copy never repeats VIRULE (owner copy rule).
     const bool updating = admin_install::admin_installed();
-    result_card::show_working(
-        updating ? "Updating VIRULE..." : "Installing VIRULE...", "");
+    show_working_retry(updating ? "Updating\xE2\x80\xA6" : "Installing\xE2\x80\xA6");
     release_when_card_visible();
     const std::string state = admin_install::run(shortcut);
     if (state == "installed") {
@@ -228,7 +239,7 @@ struct ThreadArg {
 
 inline DWORD WINAPI thread_entry(LPVOID p) {
     ThreadArg* a = (ThreadArg*)p;
-    if (a->op == "QA_ACCEPT") run_qa(a->token, a->game);
+    if (a->op == "QA_ACCEPT") run_qa(a->token);
     else if (a->op == "INSTALL_ADMIN") run_admin(a->shortcut);
     else run_standalone();
     delete a;

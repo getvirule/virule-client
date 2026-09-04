@@ -1,9 +1,15 @@
-// Virule-Setup.exe resources: VERSIONINFO only. Setup embeds NO client
-// payload: it downloads the approved client release from the
-// getvirule/virule-client GitHub Release and verifies it (manifest
+// Virule-Setup.exe resources: the VIRULE application icon + VERSIONINFO.
+// Setup embeds NO client payload: it downloads the approved client release
+// from the getvirule/virule-client GitHub Release and verifies it (manifest
 // SHA-256 + Authenticode + the VIRULE signing identity) before installing.
 #include <winres.h>
 #include "../shared/version.h"
+
+// The official VIRULE application icon (the yellow rounded square, dark V;
+// the exact asset virule.exe ships), so a downloaded installer presents as
+// VIRULE in Explorer/downloads instead of a generic executable. Icon id 1
+// mirrors the product's own resource convention.
+1 ICON "..\\..\\assets\\ViruleAppIcon.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION VIRULE_CLIENT_VERSION_MAJOR,VIRULE_CLIENT_VERSION_MINOR,VIRULE_CLIENT_VERSION_PATCH,0

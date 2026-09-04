@@ -161,24 +161,32 @@ async function main() {
       return m ? Number(m[1]) : null;
     };
 
+    // DELTA-BASED on purpose: a development machine may have a real
+    // virule.app tab open whose continuous detection connects to this
+    // client, so the baseline is read first and every assertion is
+    // relative to it. The semantics under test are unchanged: local
+    // connections never count, and pages count exactly while open.
     const local = await connect({ origin: null });
     await local.next(); // hello
     local.sendText('{"type":"status"}');
     const idle = await local.next();
-    check("no pages connected reads 0", pagesFrom(idle) === 0, idle ?? "none");
+    const baseline = pagesFrom(idle);
+    check("local control connection never counts as a page",
+      baseline !== null, idle ?? "none");
 
     const page = await connect();
     await page.next(); // hello
     local.sendText('{"type":"status"}');
     const withPage = await local.next();
-    check("one open page reads 1 (local connections never count)",
-      pagesFrom(withPage) === 1, withPage ?? "none");
+    check("an open page counts (baseline+1; local connections never count)",
+      pagesFrom(withPage) === baseline + 1, withPage ?? "none");
 
     page.end();
     await new Promise((r) => setTimeout(r, 400));
     local.sendText('{"type":"status"}');
     const after = await local.next();
-    check("a closed page stops counting", pagesFrom(after) === 0, after ?? "none");
+    check("a closed page stops counting (back to baseline)",
+      pagesFrom(after) === baseline, after ?? "none");
     local.end();
   }
 
@@ -322,6 +330,12 @@ async function main() {
     const r3 = await page.next();
     check("admin_update_check from a page is refused",
       r3 === '{"type":"error"}', r3 ?? "none");
+    // admin_launch (update-on-launch handoff) is local-only too: a web
+    // page must never be able to drive the launch/update lifecycle.
+    page.sendText('{"type":"admin_launch"}');
+    const r4 = await page.next();
+    check("admin_launch from a page is refused",
+      r4 === '{"type":"error"}', r4 ?? "none");
     page.end();
   }
 

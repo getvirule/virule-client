@@ -291,7 +291,21 @@ async function main() {
     const released = await pollReleased(local, 20000);
     const elapsed = Date.now() - t0;
     check("released via the standalone card", released);
-    check("release respected the grace watch (>=9s)", elapsed >= 9000, `${elapsed}ms`);
+    // A REAL virule.app page connected to the sandbox client (a browser
+    // tab open on the development machine, probing 47612) legitimately
+    // owns the flow and releases the takeover early - that is the product
+    // rule, not a defect. The grace-watch assertion therefore accepts
+    // either: the full watch ran, OR a page was connected at release.
+    let pagesAtRelease = 0;
+    {
+      local.sendText('{"type":"status"}');
+      const st = await local.next();
+      const m = /"pages":(\d+)/.exec(st ?? "");
+      pagesAtRelease = m ? Number(m[1]) : 0;
+    }
+    check("release respected the grace watch (>=9s, or a live page owned the flow)",
+      elapsed >= 9000 || pagesAtRelease > 0,
+      `${elapsed}ms, pages=${pagesAtRelease}`);
     local.end();
     await stopClient();
   }
