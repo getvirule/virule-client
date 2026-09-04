@@ -261,25 +261,44 @@ the client, Setup:
    answering, an overall timeout) exist so a wedged client can never hold
    a window open forever; they are failure handling, never the path.
 
-The client releases Setup (`src/client/takeover.hpp`) only once one of
-these is demonstrably in place:
+The client releases Setup (`src/client/takeover.hpp`) only once the next
+feedback surface is demonstrably in place (lifecycle continuity pass,
+2026-09-03, v0.6.0):
 
-- a live virule.app page acknowledged its next state (`surface_ack`) or
-  drove the operation itself (`qa_accept` / `admin_install`) - the
-  browser owns all visible UX and Setup opens nothing;
-- a client-owned native card is visible: the QA continuation card
-  ("Finishing setup for [Game]" -> "You're all set." / "You can close
-  this window."), the Admin install card ("Installing VIRULE..." ->
-  the Admin launches when it completes), or the standalone completion
-  card.
+- QA_ACCEPT: the branded native continuation card "Finishing up…" ALWAYS
+  shows before Setup may close (the user watching the native flow never
+  has to hunt for the browser), then resolves to "You're all set." and
+  closes itself; a live page still receives the result push and reaches
+  its own success state in parallel.
+- INSTALL_ADMIN: a live page owns the install UX (Setup releases on its
+  acknowledgement); with the browser gone the client runs the install
+  behind a branded "Installing…"/"Updating…" card and launches the Admin
+  at completion.
+- no envelope: the standalone completion card.
 
 A Setup run with NO envelope (standalone / stale download) has no
 recoverable intent and none is invented: after a short watch for a live
-page or native QA progress, the client shows "VIRULE is ready" over
-"Continue at virule.app to get started." with the ONE explicit
-`[ Open virule.app ]` action. Only that click opens a browser, in the
-Windows default. The homepage's continuous detection then resolves the
-machine's real state.
+page or native QA progress, the client shows the branded "VIRULE is
+ready" card with the ONE explicit `[ Continue ]` action. Only that click
+opens a browser (virule.app, in the Windows default). The homepage's
+continuous detection then resolves the machine's real state.
+
+`result_card.hpp` is the ONE client lifecycle surface: the bare Result
+mode is the unchanged QA-doctrine card (no brand mark), while Working /
+Ready / resolved lifecycle Results wear the Setup card's branded grammar
+(V mark, spaced wordmark, indeterminate bar or action button). It is
+reusable across the persistent client process, and both executables embed
+the official VIRULE application icon (`assets/ViruleAppIcon.ico`).
+
+The same lifecycle grammar carries the Admin update: a Settings-initiated
+update shows the Admin's "Shutting down VIRULE" overlay, the client closes
+it gracefully and IMMEDIATELY owns the feedback with the native "Updating…"
+card through download / verify / stage / replace, then relaunches the new
+Admin (a failed update relaunches the untouched known-good Admin). A
+user-initiated launch of an out-of-date managed Admin is handed over by
+virule.exe as the local-only `admin_launch` bridge message: the client
+updates first (same card) and launches only the new Admin; a failed update
+never blocks the launch.
 
 ## Browser-owned pending intent
 
