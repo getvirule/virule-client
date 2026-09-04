@@ -41,6 +41,7 @@
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
+#include "client/takeover.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
 #include "shared/logging.hpp"
@@ -167,9 +168,21 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         vclient::log::client("shutdown requested (local)");
         g_exit_requested.store(true);
     };
+    callbacks.on_setup_takeover = [](const std::string& payload) {
+        vclient::takeover::on_setup_takeover(payload);
+    };
+    callbacks.setup_released = []() {
+        return vclient::takeover::released();
+    };
     vclient::bridge::start(callbacks);
     g_state.store(RunState::Serving);
     vclient::log::client(std::string("serving, version ") + VIRULE_CLIENT_VERSION_STRING);
+
+    // Version recovery (the false-"up to date" fix): if a managed Admin
+    // exists, its ACTUAL installed version is reconciled from the
+    // authoritative in-install metadata immediately, so a reinstalled or
+    // reset client never serves stale/empty version knowledge.
+    vclient::admin_install::reconcile_installed_version();
 
     // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
     // INSTALLING): one check at startup, then a quiet periodic recheck

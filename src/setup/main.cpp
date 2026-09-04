@@ -1,32 +1,34 @@
-// Virule-Setup.exe - the disposable one-shot installer.
+// Virule-Setup.exe - the visible bootstrapper and temporary courier.
 //
-// ONE JOB: install, register and start virule-client.exe. Setup does not
-// decide what the user came for. It does not know or care whether the flow
-// began at "Get VIRULE" on the homepage, at a QA invitation, or anywhere
-// else: THE BROWSER OWNS THAT INTENT, and Setup's whole responsibility is to
-// make the local client exist and then get the browser back in front of the
-// user. There is no wizard, no destination picker, no component list, no
-// license page and no user choice of any kind.
+// ONE JOB: install, register and start virule-client.exe, carry the
+// browser's pending operation to it, and stay visible until the client has
+// demonstrably taken over. Setup does not decide what the user came for and
+// does not understand the operation semantically: THE BROWSER OWNS THAT
+// INTENT, and Setup carries it as an opaque validated envelope. There is no
+// wizard, no destination picker, no component list, no license page and no
+// user choice of any kind.
 //
 // Per-user throughout: %LOCALAPPDATA%\Programs\VIRULE, HKCU registration.
 // No elevation, no machine-wide state, no service, no login task.
 //
 // VISIBLE SURFACE (setup_window.hpp): one small native card, "Setting up
-// VIRULE..." then "VIRULE is ready" / "Return to your browser to finish.",
-// then it closes itself. Running and vanishing with no window at all was
-// technically correct and read as untrustworthy; finishing without saying
-// what to do next read as a dead end (owner spec 2026-09-03).
+// VIRULE..." until the client acknowledges ownership, then a brief
+// "Setup is complete.", then it closes itself. A VIRULE surface must never
+// disappear until the next VIRULE surface is ready (owner invariant): Setup
+// closes ONLY after the client reports that the next feedback surface (a
+// live virule.app page, or a client-owned native card) is already visible.
 //
-// BROWSER HANDOFF (the normal path, then the recovery):
-//   1. Setup starts the client.
-//   2. It waits a short grace period for a virule.app page to reach the
-//      client's bridge. That is the NORMAL first-install outcome: the page
-//      that sent the user here is still open and picks the flow back up.
-//      When it happens Setup opens NOTHING; a duplicate tab would be a bug.
-//   3. If no page connects, the browser (or just that tab) is gone, so
-//      Setup reopens the resume URL: the ORIGINATING browser when it can be
-//      identified (see origin_browser.hpp), the Windows default only as a
-//      last resort. The page then resumes the intent the browser persisted.
+// THE HANDOFF MODEL (superseding the retired originating-browser guessing;
+// PID ancestry, browser families and default-browser fallback are GONE):
+//   1. Setup opens the temporary loopback handoff listener FIRST
+//      (handoff_listener.hpp). A still-open virule.app page hands its one
+//      pending operation over directly while Setup runs.
+//   2. Setup installs and starts the client.
+//   3. Setup transfers the envelope (or the explicit absence of one) to the
+//      client over a local bridge connection (setup_takeover).
+//   4. Setup polls setup_wait until the client reports the takeover is
+//      complete and the next surface is ready. Only then does the card
+//      complete and the process leave. Setup NEVER opens a browser.
 //
 // CLIENT ACQUISITION (Setup and the client are INDEPENDENT signed
 // artifacts; Setup embeds nothing):
@@ -52,7 +54,7 @@
 #include <string>
 
 #include "client/bridge.hpp"     // loopback client half (talk to the client)
-#include "setup/origin_browser.hpp"
+#include "setup/handoff_listener.hpp"
 #include "setup/setup_window.hpp"
 #include "shared/client_state.hpp"
 #include "shared/http_client.hpp"
@@ -103,34 +105,26 @@ constexpr wchar_t kExpectedSigner[] = L"CN=Heath Michaels";
 constexpr size_t kMaxManifestBytes = 16 * 1024;
 constexpr size_t kMaxClientBytes = 64 * 1024 * 1024;
 
-// Where a lost browser is sent back to. Same-origin resume STATE, not a
-// second surface: virule.app reads the intent the browser persisted before
-// the download and continues it (a QA invitation resumes at its own page).
-// Setup deliberately knows nothing about which intent that is.
-constexpr wchar_t kResumeUrl[] = L"https://virule.app/?resume=setup";
+// How long Setup gives the freshly started client to answer the takeover
+// transfer. A just-started client binds its bridge within a couple of
+// seconds; this is many attempts.
+constexpr DWORD kTransferTimeoutMs = 20000;
 
-// How long an already-open virule.app page gets to find the freshly
-// installed client before Setup's card completes. The page's own reconnect
-// loop runs every 1.5 s, so this is several attempts plus room for the
-// browser's local-network-access permission ask.
-constexpr DWORD kPageGraceMs = 12000;
+// The overall backstop on the release wait. The client releases Setup the
+// moment the next surface is confirmed (typically a few seconds); this
+// bound exists only so a wedged client can never hold a window open
+// forever. The Admin install the client may be performing does NOT hold
+// Setup: the client releases as soon as its feedback surface exists, long
+// before that work finishes.
+constexpr DWORD kReleaseTimeoutMs = 240000;
 
-// The QUIET extension after the card has closed, before Setup concludes no
-// page exists. A live page can be much slower than kPageGraceMs: browsers
-// throttle timers in background tabs (the user is watching Setup's card,
-// not the tab), Brave gates or blocks loopback WebSockets entirely, and a
-// permission ask may sit unanswered. Observed in production 2026-09-03: a
-// live Brave page finished the QA flow 21 s after the client started, 9 s
-// after the old 12 s decision had already opened a wrong browser. During
-// this window Setup also accepts NATIVE progress (status qa_last_s) as
-// proof the page is alive, since a bridge-blocked page drives the flow
-// through virule:// without ever appearing in the pages count.
-constexpr DWORD kExtendedGraceMs = 48000;
+// A client that stops answering the release poll for this long is gone
+// (crashed, killed); Setup leaves rather than lingering uselessly.
+constexpr DWORD kReleasePollDeadMs = 15000;
 
-// The completion state now carries an instruction ("VIRULE is ready" /
-// "Return to your browser to finish."), so it stays long enough to read,
-// still brief, then gone.
-constexpr DWORD kCompleteVisibleMs = 2600;
+// The brief completion state ("Setup is complete."). The next surface is
+// already visible by the time this shows, so it only needs a beat.
+constexpr DWORD kCompleteVisibleMs = 1400;
 
 std::string narrow(const std::wstring& w) {
     if (w.empty()) return "";
@@ -289,57 +283,61 @@ bool parse_manifest(const std::string& body, bool pin_host, Manifest& out,
     return true;
 }
 
-// Ask a running client (old version) to exit so its exe can be replaced.
+// Ask a running client (old version) to exit so its exe can be replaced
+// and so the NEW client (which understands the takeover protocol) is the
+// one that serves. Waits for the file lock only when something answered.
 void stop_running_client() {
     std::string response;
-    (void)vclient::bridge::loopback_roundtrip(
+    const bool answered = vclient::bridge::loopback_roundtrip(
         vclient::bridge::kPort, nullptr, "\"virule_client\"",
         "{\"type\":\"shutdown\"}", response);
-    // Give it a moment to release the file whether or not it answered.
+    if (!answered) return;
     for (int i = 0; i < 20; ++i) {
         Sleep(100);
     }
 }
 
-// One status probe against the freshly installed client, over Setup's own
-// local (no-Origin, never-counted) connection. `pages` is how many
-// virule.app pages are connected (-1 = no client answered); `qa_last_s` is
-// how many seconds ago the client last handled a QA verification (-1 =
-// never, or an older client without the field).
-bool probe_client(long long& pages, long long& qa_last_s) {
-    pages = -1;
-    qa_last_s = -1;
+// Build the setup_takeover message for the current envelope snapshot. An
+// absent envelope is transferred EXPLICITLY: "no pending handoff" is a
+// real state the client acts on (the standalone completion surface).
+std::string takeover_message(const vclient::setup_handoff::Envelope& env) {
+    namespace js = vclient::json_scan;
+    std::string msg = "{\"type\":\"setup_takeover\"";
+    if (env.present) {
+        msg += ",\"op\":\"" + env.op + "\"";
+        if (env.op == "QA_ACCEPT") {
+            msg += ",\"token\":\"" + env.token + "\"";
+            if (!env.game.empty()) {
+                msg += ",\"game\":\"" + js::json_escape(env.game) + "\"";
+            }
+        } else if (env.op == "INSTALL_ADMIN") {
+            msg += std::string(",\"shortcut\":") + (env.shortcut ? "true" : "false");
+        }
+    }
+    msg += "}";
+    return msg;
+}
+
+// One takeover transfer attempt. True when the client acknowledged.
+bool transfer_takeover(const vclient::setup_handoff::Envelope& env) {
     std::string response;
     if (!vclient::bridge::loopback_roundtrip(
             vclient::bridge::kPort, nullptr, "\"virule_client\"",
-            "{\"type\":\"status\"}", response)) {
+            takeover_message(env), response)) {
         return false;
     }
-    (void)vclient::json_scan::find_number_in(response, 0, response.size(),
-                                             "pages", pages);
-    (void)vclient::json_scan::find_number_in(response, 0, response.size(),
-                                             "qa_last_s", qa_last_s);
-    return true;
+    return response.find("\"takeover\"") != std::string::npos;
 }
 
-// THE HANDOFF DECISION. True when the browser is demonstrably still driving
-// the flow, in either of two ways: a virule.app page reached the client's
-// bridge, OR the client handled a QA verification since it started (a page
-// in a bridge-blocked browser progresses through virule:// and never shows
-// up in the pages count). Either way Setup must not open anything.
-bool wait_for_browser_signal(DWORD grace_ms) {
-    const ULONGLONG deadline = GetTickCount64() + grace_ms;
-    for (;;) {
-        long long pages = -1, qa_last_s = -1;
-        if (probe_client(pages, qa_last_s)) {
-            if (pages > 0) return true;
-            // The client just got installed, so ANY QA activity it reports
-            // belongs to the flow that ran this Setup.
-            if (qa_last_s >= 0) return true;
-        }
-        if (GetTickCount64() >= deadline) return false;
-        Sleep(400);
-    }
+// One release poll. `answered` = the client responded at all;
+// returns whether the client has released Setup.
+bool poll_release(bool& answered) {
+    std::string response;
+    answered = vclient::bridge::loopback_roundtrip(
+        vclient::bridge::kPort, nullptr, "\"virule_client\"",
+        "{\"type\":\"setup_wait\"}", response);
+    if (!answered) return false;
+    return response.find("\"released\":true") != std::string::npos;
 }
 
 } // namespace
@@ -348,17 +346,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool allow_unsigned = false; // development only; the hash gate always holds
-    std::wstring resume_url = kResumeUrl;
     std::wstring manifest_url; // development seam; empty = production
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--dev-unsigned") {
             allow_unsigned = true;
-        } else if (arg.rfind(L"--resume-url=", 0) == 0) {
-            // Development seam (like --dev-unsigned and the client's
-            // --no-register): point the recovery at a local site build.
-            // Not a privilege: a local process can open any URL already.
-            resume_url = arg.substr(13);
         } else if (arg.rfind(L"--manifest-url=", 0) == 0) {
             // Development seam: fetch the release manifest from a local
             // server instead of the GitHub release. Relaxes only the
@@ -371,21 +363,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     vclient::log::setup(std::string("setup start, version ") + VIRULE_CLIENT_VERSION_STRING);
 
-    // FIRST, before any work that takes time: who launched us. The browser
-    // may be closed by the time the install finishes, and this is the only
-    // moment its process is certain to still exist.
-    auto origin = vclient::origin_browser::capture();
-    {
-        std::string line = "ancestry: " + narrow(origin.chain);
-        if (origin.found) {
-            line += "; originating browser=" + narrow(origin.exe_name) +
-                " pid=" + std::to_string(origin.pid) +
-                (origin.exe_path.empty() ? " (no path)" : " path known");
-        } else {
-            line += "; no recognized browser ancestor";
-        }
-        vclient::log::setup(line);
-    }
+    // FIRST, before any work that takes time: the handoff listener. A
+    // still-open virule.app page hands its pending operation over while
+    // the install runs; a browser that closed before Setup ever ran simply
+    // never connects, and that absence is itself the signal (standalone).
+    vclient::setup_handoff::start();
 
     vclient::setup_window::show();
 
@@ -499,11 +481,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // A running older client would both hold the exe and, worse, keep
+    // serving a bridge that predates the takeover protocol; ask it to exit
+    // before the replacement so the freshly installed client is the one
+    // that answers. Costs nothing when no client is running.
+    stop_running_client();
     ec.clear();
     std::filesystem::rename(staged, target, ec);
     if (ec) {
-        // An older client may be running with the file mapped: ask it to
-        // exit, then replace.
+        // Still locked: one more explicit stop, then replace.
         stop_running_client();
         ec.clear();
         std::filesystem::remove(target, ec);
@@ -549,48 +535,84 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
     }
 
-    // 9. THE BROWSER. An existing virule.app page is always the first
-    // choice; recovery happens only when Setup is genuinely convinced no
-    // page is left. The card completes after the short grace; the extended
-    // wait is quiet (card already gone) so a truly-gone browser costs the
-    // user nothing visible, only a delayed resume tab.
-    bool browser_owns_flow = wait_for_browser_signal(kPageGraceMs);
+    // 9. THE TAKEOVER TRANSFER. Hand the client whatever the browser
+    // handed us: the one pending-operation envelope, or its explicit
+    // absence. A page that is a beat slow delivering its envelope gets a
+    // short extra window; after that, an absence transfers as absence and
+    // a late envelope is forwarded as an upgrade while Setup waits.
+    bool transferred = false;
+    bool envelope_sent = false;
+    {
+        // Give a slow page a moment to land its envelope before deciding
+        // "none": the page retries the handoff channel every ~2 s.
+        const ULONGLONG env_grace = GetTickCount64() + 4000;
+        while (!vclient::setup_handoff::snapshot().present &&
+               GetTickCount64() < env_grace) {
+            Sleep(200);
+        }
+        const ULONGLONG deadline = GetTickCount64() + kTransferTimeoutMs;
+        for (;;) {
+            const auto env = vclient::setup_handoff::snapshot();
+            if (transfer_takeover(env)) {
+                transferred = true;
+                envelope_sent = env.present;
+                vclient::log::setup(std::string("takeover transferred (") +
+                                    (env.present ? env.op : "no envelope") + ")");
+                break;
+            }
+            if (GetTickCount64() >= deadline) break;
+            Sleep(400);
+        }
+    }
+    if (!transferred) {
+        vclient::setup_handoff::stop();
+        return fail(L"VIRULE was installed but couldn't start. Run Virule-Setup again.",
+                    "takeover transfer failed; client never acknowledged");
+    }
+
+    // 10. THE RELEASE WAIT. The card stays visible until the client says
+    // the next feedback surface is ready. This is a real ownership
+    // transition, not a timer: no dead air between Setup and whatever
+    // comes next. A late-arriving envelope (slow page) is forwarded as an
+    // upgrade so the intent is never lost.
+    bool released = false;
+    {
+        const ULONGLONG deadline = GetTickCount64() + kReleaseTimeoutMs;
+        ULONGLONG last_answer = GetTickCount64();
+        for (;;) {
+            if (!envelope_sent) {
+                const auto env = vclient::setup_handoff::snapshot();
+                if (env.present && transfer_takeover(env)) {
+                    envelope_sent = true;
+                    vclient::log::setup("takeover upgraded with late envelope (" + env.op + ")");
+                }
+            }
+            bool answered = false;
+            if (poll_release(answered)) {
+                released = true;
+                break;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (answered) {
+                last_answer = now;
+            } else if (now - last_answer > kReleasePollDeadMs) {
+                vclient::log::setup("release wait: client stopped answering");
+                break;
+            }
+            if (now >= deadline) {
+                vclient::log::setup("release wait: backstop timeout");
+                break;
+            }
+            Sleep(500);
+        }
+    }
+    vclient::setup_handoff::stop();
+
     vclient::setup_window::set_complete();
     Sleep(kCompleteVisibleMs);
     vclient::setup_window::close();
 
-    if (!browser_owns_flow) {
-        // A live page may just be slow (throttled background tab, a
-        // pending permission ask, a bridge-blocked browser working through
-        // virule://). Only an originating browser KNOWN to have exited
-        // proves the page cannot exist; everything else earns the quiet
-        // extended wait before any browser is opened.
-        const bool origin_gone =
-            origin.found && !vclient::origin_browser::still_alive(origin);
-        if (!origin_gone) {
-            browser_owns_flow = wait_for_browser_signal(kExtendedGraceMs);
-        }
-    }
-
-    if (browser_owns_flow) {
-        vclient::log::setup("a virule.app page (or native QA progress) owns the flow; opening nothing");
-    } else {
-        const bool alive = vclient::origin_browser::still_alive(origin);
-        const auto opened =
-            vclient::origin_browser::open_resume_url(origin, resume_url);
-        std::string how = "recovery: no page connected; ";
-        how += origin.found ? (alive ? "originating browser alive"
-                                     : "originating browser exited")
-                            : "originating browser unknown";
-        how += opened == vclient::origin_browser::Opened::SameBrowser
-                   ? "; opened resume URL in it"
-               : opened == vclient::origin_browser::Opened::DefaultBrowser
-                   ? "; opened resume URL in the default browser"
-                   : "; could not open a browser";
-        vclient::log::setup(how);
-    }
-    vclient::origin_browser::release(origin);
-
-    vclient::log::setup("setup complete");
+    vclient::log::setup(std::string("setup complete (") +
+                        (released ? "client released" : "left on backstop") + ")");
     return 0;
 }

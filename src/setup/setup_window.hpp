@@ -13,19 +13,17 @@
 // kind. Three states:
 //
 //   Working    "Setting up VIRULE..."   + a subtle indeterminate bar
-//   Complete   "VIRULE is ready" over "Return to your browser to finish."
-//              briefly, then the window closes itself (owner spec
-//              2026-09-03: Setup must clearly say what to do next)
+//   Complete   "Setup is complete." briefly, then the window closes itself
 //   Failed     one short human sentence; the technical reason goes to the
 //              log, never here
 //
-// The completion copy CAN say "return to your browser" because Setup makes
-// it true either way: an already-open virule.app page continues the flow
-// on its own (Setup opens nothing), and when none is left, Setup itself
-// reopens the resume URL in the originating browser, so a browser to
-// return to always exists. Layout is fixed: the status line sits at the
-// same coordinates in every state, so moving between them never shifts
-// anything.
+// The completion state deliberately carries NO instruction: by the time it
+// shows, the client has already confirmed the next feedback surface (a
+// live virule.app page, or a client-owned native card) is visible, so
+// there is nothing to tell the user to do, and "return to your browser"
+// would be wrong when no browser was involved at all. Layout is fixed: the
+// status line sits at the same coordinates in every state, so moving
+// between them never shifts anything.
 
 #include <atomic>
 #include <mutex>
@@ -365,11 +363,10 @@ inline void set_state(Stage stage, const std::wstring& line) {
     if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
 }
 
-// The approved completion state (owner spec 2026-09-03): what happened,
-// then exactly what to do next. Shown briefly; the window closes itself.
+// The completion state: shown briefly once the client has taken over (the
+// next surface is already visible), then the window closes itself.
 inline void set_complete() {
-    set_state(Stage::Complete,
-              L"VIRULE is ready\nReturn to your browser to finish.");
+    set_state(Stage::Complete, L"Setup is complete.");
 }
 
 // One short, human, non-technical sentence. The reason belongs in the log.

@@ -49,24 +49,26 @@ in both components).
 | page | `{"type":"qa_accept","token":"<invite token>"}` | asynchronous QA redemption (below) |
 | page/local | `{"type":"admin_install","shortcut":true\|false}` | the verified staged Admin install/update (below); a LOCAL sender is the Admin's own Settings Update through its host, shortcut always false there |
 | page | `{"type":"admin_open"}` | launch the managed Admin installation, and nothing else |
+| page | `{"type":"surface_ack"}` | the page states its next feedback view is rendered and active (the Setup takeover's browser acknowledgement) |
 | page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
 | local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale |
+| local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
+| local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
 
 Client pushes: `{"type":"qa_result","token","state"}` and
 `{"type":"admin_result","state","version"}` to every connected page.
 The status answer's `"admin"` block is
 `{"installed":bool,"version":"...","running":bool}` - the managed
-installation only (below); a development tree is never reported.
+installation only (below); a development tree is never reported, and an
+EMPTY version with installed:true means genuinely unknown (never to be
+rendered as a currency claim).
 Everything else answers `{"type":"error"}`. Frames over 4 KB, unmasked
 client frames, and malformed handshakes drop the connection.
 
 `status` carries `"pages"`, the number of connected virule.app PAGES.
-Local control connections are never counted, which is what makes it
-usable by Setup: Setup asks over its own local connection whether a
-browser page reached the freshly installed client, and so whether the
-browser is still driving the flow (see "Setup's browser handoff").
+Local control connections are never counted.
 
 ## Security model
 
@@ -191,10 +193,11 @@ with one short human line; the technical reason goes to the log.
 It then installs to `%LOCALAPPDATA%\Programs\VIRULE\virule-client.exe`,
 registers `virule://` + the `ViruleClient` HKCU uninstall entry
 (DisplayName "VIRULE", `--uninstall`), records the INSTALLED CLIENT's
-version (the manifest's) in state.json, starts the client, hands the
-browser back, exits. Development seams: `--dev-unsigned` waives only the
-signature gates; `--manifest-url=` fetches the manifest elsewhere and
-relaxes only the repository pin.
+version (the manifest's) in state.json, starts the client, transfers the
+takeover, and waits for the client's release (see "The Setup takeover").
+Development seams: `--dev-unsigned` waives only the signature gates;
+`--manifest-url=` fetches the manifest elsewhere and relaxes only the
+repository pin.
 
 ### Setup's one native surface
 
@@ -203,63 +206,80 @@ browser owns the flow) and, in practice, untrustworthy. It now shows ONE
 small card in VIRULE's native visual language (the Admin splash grammar:
 rounded card, yellow V mark, spaced wordmark, one muted line), and nothing
 more. NOT A WIZARD: no pages, no Next/Back, no destination picker, no
-component list, no license page, no user choice of any kind.
+component list, no license page and no user choice of any kind.
 
 | State | Copy |
 |---|---|
-| Working | `Setting up VIRULE...` + a subtle indeterminate bar |
-| Complete | `VIRULE is ready` over `Return to your browser to finish.` briefly, then it closes itself |
+| Working | `Setting up VIRULE...` + a subtle indeterminate bar, held until the client releases Setup |
+| Complete | `Setup is complete.` briefly, then it closes itself |
 | Failed | one short human sentence; the technical reason goes to the log only |
 
-The status line sits at the same coordinates in every state. The completion
-copy CAN say "return to your browser" (owner spec 2026-09-03: Setup must
-say what to do next) because Setup makes it true either way: an open
-virule.app page continues the flow itself, and when none is left Setup
-reopens the resume URL in the originating browser. Setup never sits open
-indefinitely (a failure surface is dismissible and leaves on its own after
-60 s).
+The status line sits at the same coordinates in every state. The
+completion state carries no instruction on purpose: by the time it shows,
+the client has confirmed the next feedback surface is already visible, and
+"return to your browser" would be wrong when no browser was involved.
+Setup never sits open indefinitely (the release wait is bounded, and a
+failure surface is dismissible and leaves on its own after 60 s).
 
-### Setup's browser handoff
+### The browser -> Setup handoff channel (2026-09-03)
 
-Setup has ONE job: install, register and start the client. It does not
-decide whether the user wanted Admin, QA or anything else. THE BROWSER OWNS
-THAT INTENT (see "Browser-owned pending intent").
+The retired design guessed the originating browser (process ancestry,
+browser families, default-browser fallback) to reopen a resume URL. ALL OF
+THAT IS GONE: Setup never opens a browser, and intent is handed over
+explicitly or it does not exist.
 
-After starting the client, Setup allows a short grace period (12 s) for a
-virule.app page to reach the client's bridge, asking over its own local
-connection (`status` -> `pages`). That is the NORMAL first-install outcome:
-the page that sent the user here is still open and picks the flow back up.
-When it happens Setup opens NOTHING; a duplicate tab would be a bug.
+While Setup runs, it listens on ONE small temporary loopback channel,
+`ws://127.0.0.1:47613`, path `/handoff` (`src/setup/handoff_listener.hpp`),
+opened FIRST at startup so a still-open virule.app page can hand its
+pending operation over while the install runs. CLOSED and versioned:
 
-Only when no page appears does Setup reopen the resume URL
-(`https://virule.app/?resume=setup`; `--resume-url=` is the development
-seam). The browser choice is a hierarchy, so a flow begun in Brave comes
-back in Brave even when Edge is the machine default:
+- browser pages ONLY (an allowed Origin is REQUIRED; local no-Origin
+  connections are dropped);
+- hello `{"virule_setup":1,"v":1}`;
+- exactly one envelope is kept (first valid wins):
+  `{"type":"handoff","v":1,"op":"QA_ACCEPT","token","game"}` or
+  `{"type":"handoff","v":1,"op":"INSTALL_ADMIN","shortcut"}`; anything
+  else answers `{"type":"error"}`;
+- no URL, no path, no executable, no filesystem capability of any kind;
+- Setup treats it as opaque and the client revalidates all authorization
+  (a QA token still has to survive service redemption; an Admin install
+  still runs the verified manifest/signature pipeline);
+- tokens are never logged.
 
-1. the ORIGINATING browser process is still alive -> open the URL through
-   that browser's executable, so it lands in that same running instance;
-2. that process is gone but its executable was captured -> launch that same
-   browser application with the URL;
-3. the originating browser cannot be determined -> the Windows default
-   browser, and only then.
+### The Setup takeover (ownership transition)
 
-### Originating-browser capture
+The hard UX invariant: a VIRULE surface must never disappear until the
+next VIRULE surface is ready to give immediate feedback. After starting
+the client, Setup:
 
-`src/setup/origin_browser.hpp`, run FIRST at Setup startup, before any
-install work, because that is the only moment the browser is certain to
-still exist. It walks the process ANCESTRY upward (up to 8 levels): a
-downloaded-file launch may arrive through a shell hop or Explorer, so the
-immediate parent is never assumed to be the browser. Recognized names:
-Brave, Edge, Chrome, Firefox, Opera, Opera GX, Vivaldi. It records the
-image name, the full executable path, the PID, and a LIVE HANDLE, so
-liveness can never be fooled by PID reuse (a parent whose creation time is
-later than its child's is rejected as a recycled PID). The whole ancestry
-chain goes to the Setup log.
+1. transfers the envelope - or its explicit absence - over a local bridge
+   connection (`setup_takeover`), retrying until the fresh client
+   acknowledges (a late envelope is forwarded as an upgrade);
+2. polls `setup_wait` until the client answers `released:true`, keeping
+   its card visible the whole time;
+3. only then completes and closes. Bounded backstops (a client that stops
+   answering, an overall timeout) exist so a wedged client can never hold
+   a window open forever; they are failure handling, never the path.
 
-NOT A SECURITY INPUT. Browser identity authorizes nothing, is never sent
-anywhere and is never written into installed state; it only decides which
-application shows a URL that is a compile-time constant. A wrong guess
-costs the user one tab.
+The client releases Setup (`src/client/takeover.hpp`) only once one of
+these is demonstrably in place:
+
+- a live virule.app page acknowledged its next state (`surface_ack`) or
+  drove the operation itself (`qa_accept` / `admin_install`) - the
+  browser owns all visible UX and Setup opens nothing;
+- a client-owned native card is visible: the QA continuation card
+  ("Finishing setup for [Game]" -> "You're all set." / "You can close
+  this window."), the Admin install card ("Installing VIRULE..." ->
+  the Admin launches when it completes), or the standalone completion
+  card.
+
+A Setup run with NO envelope (standalone / stale download) has no
+recoverable intent and none is invented: after a short watch for a live
+page or native QA progress, the client shows "VIRULE is ready" over
+"Continue at virule.app to get started." with the ONE explicit
+`[ Open virule.app ]` action. Only that click opens a browser, in the
+Windows default. The homepage's continuous detection then resolves the
+machine's real state.
 
 ## Browser-owned pending intent
 
@@ -335,9 +355,19 @@ VIRULE signer identity (`CN=Heath Michaels`) on every VIRULE-owned binary
 SidecarKHost.exe) -> atomic placement. A fresh install is ONE directory
 rename; an update renames live -> `Admin.previous`, staging -> `Admin`,
 and a failed swap renames the previous install straight back, so a
-known-good install always survives. The manifest's version is recorded in
-state.json (`admin_version`); the Admin binaries are never probed for a
-version.
+known-good install always survives.
+
+THE INSTALLED VERSION IS AUTHORITATIVE IN-INSTALL METADATA (the
+false-"up to date" fix, 2026-09-03): the pipeline writes
+`Admin\installed-release.json` (`{"version":...}`) into the STAGING tree
+before the atomic placement, so version and binaries can never disagree.
+`state.json` (`admin_version`) is only a mirror; at every startup the
+client reconciles the two (metadata wins; a pre-metadata install with
+surviving state gets the file written). A managed Admin whose version is
+genuinely unknown reports an EMPTY version, and nothing anywhere turns
+unknown into "up to date" or "update available": both claims require a
+real comparison of two known versions. The Admin binaries are never
+probed for a version.
 
 THE CLIENT OWNS THE UPDATE LIFECYCLE (owner spec 2026-09-03). An update
 that finds the Admin running no longer refuses: after a ~4 s grace (the

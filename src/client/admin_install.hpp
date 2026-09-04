@@ -131,6 +131,84 @@ inline bool admin_installed() {
     return std::filesystem::exists(paths::installed_admin_exe(), ec) && !ec;
 }
 
+// ---- the authoritative installed-version record ----
+// THE FALSE "UP TO DATE" FIX (2026-09-03): the installed Admin's version
+// used to live ONLY in client state.json, which a client reinstall/reset
+// removes and recreates while the managed Admin survives, so the browser
+// could compare the approved manifest against stale or empty knowledge.
+// The version now travels WITH the payload: the staged pipeline writes
+// `installed-release.json` into the staging tree BEFORE the atomic
+// placement, so the file and the binaries can never disagree, and it is
+// recovered from there whenever client state was lost. state.json keeps a
+// mirror (it also covers pre-metadata installs).
+
+inline std::filesystem::path installed_release_file() {
+    const auto d = paths::admin_install_dir();
+    return d.empty() ? d : d / L"installed-release.json";
+}
+
+inline bool is_version_grammar(const std::string& s); // defined below
+
+// The version recorded inside the managed install itself; "" when the
+// file is missing (a pre-metadata install) or malformed.
+inline std::string installed_release_version() {
+    const auto file = installed_release_file();
+    if (file.empty()) return "";
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return "";
+    std::string text((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+    if (text.size() > 4096) return "";
+    std::string version;
+    if (!json_scan::find_string_in(text, 0, text.size(), "version", version) ||
+        !is_version_grammar(version)) {
+        return "";
+    }
+    return version;
+}
+
+// The one answer everything reports: in-install metadata first, the
+// state.json mirror second. "" = genuinely unknown (a pre-metadata install
+// whose client state was lost); callers must never turn unknown into a
+// currency claim.
+inline std::string authoritative_admin_version() {
+    if (!admin_installed()) return "";
+    const std::string from_install = installed_release_version();
+    if (!from_install.empty()) return from_install;
+    return state::load().admin_version;
+}
+
+// Startup reconciliation: heal whichever record is missing or stale. The
+// in-install metadata is the authority when present; a pre-metadata
+// install with surviving state gets the metadata file written so the
+// version becomes recoverable from then on.
+inline void reconcile_installed_version() {
+    if (!admin_installed()) return;
+    const std::string from_install = installed_release_version();
+    auto s = state::load();
+    if (!from_install.empty()) {
+        if (s.admin_version != from_install) {
+            log::client("admin: recovered installed version " + from_install +
+                        " from install metadata (state said '" +
+                        s.admin_version + "')");
+            s.admin_version = from_install;
+            (void)state::save(s);
+        }
+        return;
+    }
+    if (!s.admin_version.empty()) {
+        std::ofstream out(installed_release_file(),
+                          std::ios::binary | std::ios::trunc);
+        if (out) {
+            const std::string body = "{\"version\":\"" +
+                json_scan::json_escape(s.admin_version) + "\"}";
+            out.write(body.data(), (std::streamsize)body.size());
+            log::client("admin: wrote install metadata from state (" +
+                        s.admin_version + ")");
+        }
+    }
+}
+
 // Is any process running out of the managed Admin directory (virule.exe,
 // ViruleAdminHost.exe, the CEF subprocesses)? Image-path prefix match, so a
 // development copy or a D:\Virule deployment never reads as "running".
@@ -167,11 +245,14 @@ inline bool admin_running() {
 }
 
 // The status block the bridge's status answer embeds. Version comes from
-// client-owned state and is reported only while the install actually exists.
+// the authoritative install metadata (state.json is only its mirror) and
+// is reported only while the install actually exists. An empty version
+// with installed:true means GENUINELY UNKNOWN, and the browser renders it
+// as installed-with-no-currency-claim, never as "up to date".
 inline std::string status_json() {
     const bool installed = admin_installed();
     std::string version;
-    if (installed) version = state::load().admin_version;
+    if (installed) version = authoritative_admin_version();
     std::string out = "{\"installed\":";
     out += installed ? "true" : "false";
     out += ",\"version\":\"" + json_scan::json_escape(version) + "\"";
@@ -451,15 +532,18 @@ inline void refresh_update_check(unsigned long long fresh_ms) {
 inline std::string update_status_json() {
     const bool installed = admin_installed();
     std::string admin_version;
-    if (installed) admin_version = state::load().admin_version;
+    if (installed) admin_version = authoritative_admin_version();
     if (installed) refresh_update_check(kUpdateCheckFreshMs);
     std::string approved;
     {
         std::lock_guard<std::mutex> lock(g_update_mutex);
         approved = g_approved_version;
     }
+    // "update" is a CLAIM and requires a real comparison: both the
+    // installed version and the approved version must be known. Unknown
+    // installed version = no claim in either direction.
     const bool update = installed && !approved.empty() &&
-                        approved != admin_version;
+                        !admin_version.empty() && approved != admin_version;
     std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
     out += installed ? "true" : "false";
     out += ",\"admin_version\":\"" + json_scan::json_escape(admin_version) + "\"";
@@ -643,11 +727,14 @@ inline bool rename_with_retries(const std::filesystem::path& from,
 
 // The whole verified staged pipeline. Runs on a worker thread; pushes its
 // result to every connected page and finishes even when none is left.
-inline void run(bool shortcut) {
+// Returns the wire state ("installed" / "updated" / "admin_running" /
+// "failed", or "busy" when another operation already runs) so a native
+// caller (the Setup takeover) can voice the outcome too.
+inline std::string run(bool shortcut) {
     if (g_busy.exchange(true)) {
         // An operation is already in flight; its own result push covers
         // every connected page.
-        return;
+        return "busy";
     }
     struct BusyGuard {
         ~BusyGuard() { g_busy.store(false); }
@@ -671,7 +758,7 @@ inline void run(bool shortcut) {
         if (!close_running_admin(25000)) {
             log::client("admin: the Admin did not close; nothing changed");
             broadcast_result("admin_running", "");
-            return;
+            return "admin_running";
         }
         closed_admin_for_update = true;
         log::client("admin: the Admin closed; continuing the update");
@@ -683,7 +770,7 @@ inline void run(bool shortcut) {
     if (!fetch_manifest(manifest, why)) {
         log::client("admin: manifest rejected: " + why);
         broadcast_result("failed", "");
-        return;
+        return "failed";
     }
     log::client("admin: manifest version=" + manifest.version +
                 " size=" + std::to_string(manifest.size) +
@@ -699,7 +786,7 @@ inline void run(bool shortcut) {
         if (slash == std::string::npos) {
             log::client("admin: manifest url unparseable");
             broadcast_result("failed", "");
-            return;
+            return "failed";
         }
         const std::string host = rest.substr(0, slash);
         const std::string path = rest.substr(slash);
@@ -727,7 +814,7 @@ inline void run(bool shortcut) {
         log::client("admin: package download failed, status=" + std::to_string(status));
         cleanup_staging();
         broadcast_result("failed", "");
-        return;
+        return "failed";
     }
 
     // 4. Exact size, then exact SHA-256. Never waived.
@@ -735,13 +822,13 @@ inline void run(bool shortcut) {
         log::client("admin: package size mismatch: got " + std::to_string(got_size));
         cleanup_staging();
         broadcast_result("failed", "");
-        return;
+        return "failed";
     }
     if (got_sha != manifest.sha256) {
         log::client("admin: package sha256 mismatch: " + got_sha);
         cleanup_staging();
         broadcast_result("failed", "");
-        return;
+        return "failed";
     }
     log::client("admin: package verified (" + std::to_string(got_size) + " bytes)");
 
@@ -751,7 +838,7 @@ inline void run(bool shortcut) {
         log::client("admin: " + why);
         cleanup_staging();
         broadcast_result("failed", "");
-        return;
+        return "failed";
     }
 
     // 6. The staged tree must carry every required VIRULE-signed component,
@@ -763,7 +850,7 @@ inline void run(bool shortcut) {
             log::client("admin: required signed file missing in package");
             cleanup_staging();
             broadcast_result("failed", "");
-            return;
+            return "failed";
         }
         if (!verify_binary::authenticode_valid(p) ||
             !verify_binary::signed_by(p, kExpectedSigner)) {
@@ -771,10 +858,26 @@ inline void run(bool shortcut) {
                         p.filename().string());
             cleanup_staging();
             broadcast_result("failed", "");
-            return;
+            return "failed";
         }
     }
     log::client("admin: staged tree verified (Authenticode + signer identity)");
+
+    // 6b. The installed-version metadata rides the staging tree, so the
+    // atomic placement below makes version and binaries inseparable (the
+    // authoritative record the false-"up to date" fix reads back).
+    {
+        std::ofstream meta(staging / L"installed-release.json",
+                           std::ios::binary | std::ios::trunc);
+        const std::string body = "{\"version\":\"" +
+            json_scan::json_escape(manifest.version) + "\"}";
+        if (!meta || !meta.write(body.data(), (std::streamsize)body.size()).good()) {
+            log::client("admin: could not write install metadata");
+            cleanup_staging();
+            broadcast_result("failed", "");
+            return "failed";
+        }
+    }
 
     // 7. Atomic placement. The previous install survives any failed swap.
     ec.clear();
@@ -785,7 +888,7 @@ inline void run(bool shortcut) {
             log::client("admin: live install is locked; not updated");
             cleanup_staging();
             broadcast_result("admin_running", "");
-            return;
+            return "admin_running";
         }
         if (!rename_with_retries(staging, admin_dir)) {
             // Put the known-good install straight back.
@@ -793,7 +896,7 @@ inline void run(bool shortcut) {
             log::client("admin: staging swap failed; previous install restored");
             cleanup_staging();
             broadcast_result("failed", "");
-            return;
+            return "failed";
         }
         ec.clear();
         std::filesystem::remove_all(previous, ec);
@@ -802,7 +905,7 @@ inline void run(bool shortcut) {
             log::client("admin: install placement failed");
             cleanup_staging();
             broadcast_result("failed", "");
-            return;
+            return "failed";
         }
     }
     ec.clear();
@@ -836,7 +939,9 @@ inline void run(bool shortcut) {
 
     log::client("admin: " + std::string(was_installed ? "updated" : "installed") +
                 " version " + manifest.version);
-    broadcast_result(was_installed ? "updated" : "installed", manifest.version);
+    const std::string result = was_installed ? "updated" : "installed";
+    broadcast_result(result, manifest.version);
+    return result;
 }
 
 } // namespace vclient::admin_install

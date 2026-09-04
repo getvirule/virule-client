@@ -44,11 +44,14 @@
 //                    {"type":"uninstall","nonce":"<32 hex>",
 //                     "timestamp":"<UTC>","signature":"<128 hex>",
 //                     "delete_data":true|false}
+//                    {"type":"surface_ack"}      (page: next view is rendered)
 //   local -> client  {"type":"qa_verify_url","token":"<invite token>"} (2nd instance)
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
 //                    {"type":"admin_install"}          (Admin Settings Update)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
+//                    {"type":"setup_takeover",...}     (Setup envelope transfer)
+//                    {"type":"setup_wait"}             (Setup release poll)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin"}
 //                    {"type":"accepted"}
@@ -142,6 +145,13 @@ struct Callbacks {
     std::function<void(bool delete_data)> on_uninstall;
     // A local process asked this instance to exit (Setup replacing us).
     std::function<void()> on_shutdown;
+    // Virule-Setup transferred the pending-operation envelope (or its
+    // explicit absence). The raw payload is handed over; the takeover
+    // module validates it.
+    std::function<void(const std::string& payload)> on_setup_takeover;
+    // Setup's release poll: true once the takeover is complete and the
+    // next feedback surface (page or native card) is ready/visible.
+    std::function<bool()> setup_released;
 };
 
 // Listener ownership: 0 unresolved, 1 this process listens, 2 the port is
@@ -166,6 +176,13 @@ inline void touch_activity() { g_last_activity_tick.store(GetTickCount64()); }
 inline std::atomic<unsigned long long> g_last_qa_tick{ 0 };
 
 inline void touch_qa_activity() { g_last_qa_tick.store(GetTickCount64()); }
+
+// Takeover surface signals (read by the takeover module): a PAGE explicitly
+// acknowledged that its next state is active (surface_ack), or a PAGE drove
+// an operation itself (qa_accept / admin_install), which proves the same
+// thing - the browser owns the visible flow.
+inline std::atomic<bool> g_page_acked{ false };
+inline std::atomic<bool> g_page_drove{ false };
 
 // ---- page-connection registry (broadcast + liveness) ----
 struct PageConn {
@@ -498,6 +515,7 @@ inline void handle_client(SOCKET client) {
             if (g_callbacks.on_admin_install) {
                 const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
+                if (is_page) g_page_drove.store(true);
                 g_callbacks.on_admin_install(shortcut);
                 if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
             } else {
@@ -521,8 +539,33 @@ inline void handle_client(SOCKET client) {
                 return;
             }
         } else if (type == "qa_accept" && token_ok && is_page) {
+            g_page_drove.store(true);
             if (g_callbacks.on_qa_accept) g_callbacks.on_qa_accept(token);
             if (!reply(0x1, "{\"type\":\"accepted\"}")) return;
+        } else if (type == "surface_ack" && is_page) {
+            // The page states that its next feedback view is rendered and
+            // active (the browser-owns-the-flow acknowledgement the Setup
+            // takeover waits on).
+            g_page_acked.store(true);
+            if (!reply(0x1, "{\"type\":\"ok\"}")) return;
+        } else if (type == "setup_takeover" && !is_page) {
+            // Virule-Setup transferring the pending-operation envelope (or
+            // its explicit absence). Local-only; the takeover module
+            // validates the fields and nothing here is authorization.
+            if (g_callbacks.on_setup_takeover) {
+                g_callbacks.on_setup_takeover(payload);
+                if (!reply(0x1, "{\"type\":\"takeover\"}")) return;
+            } else {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            }
+        } else if (type == "setup_wait" && !is_page) {
+            const bool released = g_callbacks.setup_released &&
+                                  g_callbacks.setup_released();
+            if (!reply(0x1, released
+                    ? "{\"type\":\"setup_wait\",\"released\":true}"
+                    : "{\"type\":\"setup_wait\",\"released\":false}")) {
+                return;
+            }
         } else if (type == "qa_verify_url" && token_ok && !is_page) {
             // A second instance forwarding a virule:// launch. Local
             // trust model: a local process could launch virule:// itself,
