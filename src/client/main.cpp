@@ -169,6 +169,14 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         if (h) CloseHandle(h);
     };
     callbacks.on_admin_open = []() {
+        // ONE update transaction: an open that arrives while the
+        // install/update operation runs JOINS it (the operation relaunches
+        // the Admin itself at completion) rather than launching a binary
+        // out of a directory that is mid-swap.
+        if (vclient::admin_install::g_busy.load()) {
+            vclient::log::client("admin: open requested during an active update; joining it");
+            return true;
+        }
         return vclient::admin_install::open_installed_admin();
     };
     callbacks.admin_status_json = []() {
@@ -252,6 +260,29 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // OWN THE WORKING DIRECTORY (the 2026-09-04 update-loop root cause).
+    // A client started by another process INHERITS that process's current
+    // directory; the managed virule.exe runs with the Admin install dir as
+    // its CWD (desktop shortcut and admin_open both set it), so a client it
+    // started on demand held an open handle on that very directory, and the
+    // update's atomic rename of the live install could never succeed. The
+    // client's CWD is its own exe directory, always, no matter who launched
+    // it: nothing this process later renames or removes may ever be its own
+    // current directory.
+    {
+        wchar_t self[MAX_PATH * 2] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, self,
+                                           (DWORD)(sizeof(self) / sizeof(self[0])));
+        if (n > 0 && n < sizeof(self) / sizeof(self[0])) {
+            std::wstring dir(self, n);
+            const size_t slash = dir.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                dir.resize(slash);
+                SetCurrentDirectoryW(dir.c_str());
+            }
+        }
+    }
+
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 

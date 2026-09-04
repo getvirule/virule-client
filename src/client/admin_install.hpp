@@ -259,6 +259,12 @@ inline std::string status_json() {
     out += ",\"version\":\"" + json_scan::json_escape(version) + "\"";
     out += ",\"running\":";
     out += (installed && admin_running()) ? "true" : "false";
+    // The ONE install/update operation is in flight (page-driven, Settings,
+    // or the launch handoff alike). virule.app reads this to show its
+    // "Updating…" state instead of contradicting a live update; it also
+    // covers the swap instant where installed/version read transitional.
+    out += ",\"updating\":";
+    out += g_busy.load() ? "true" : "false";
     out += "}";
     return out;
 }
@@ -528,6 +534,46 @@ inline void refresh_update_check(unsigned long long fresh_ms) {
     g_approved_version = manifest.version;
 }
 
+// THE LAUNCH-TIME LOOP BREAKER (2026-09-04). A failed launch-time update
+// falls open into launching the current Admin; that Admin sees the same
+// approved update at startup and hands the launch straight back, so
+// without memory the pair loops forever (observed live: alpha.15 ->
+// alpha.16, one 322MB download every ~30 seconds; suppressing only the
+// handoff still relaunch-loops, because every relaunched Admin re-checks
+// and re-hands-off). The terminator therefore sits at the CLAIM: while
+// the hold lasts, admin_update_check answers update:false, so a
+// relaunched Admin simply launches normally. The virule.app Update
+// button stays live (the page compares versions itself), a genuinely
+// later launch retries once after the hold expires, and a successful
+// update clears it.
+// The hold only has to outlive the fallback relaunch's own startup check
+// (seconds). Kept SHORT on purpose: it must not hide the Settings Update
+// answer for long, and a genuinely new user launch after it expires earns
+// exactly one fresh attempt - one transaction per launch, never an
+// automatic retry loop.
+inline std::string g_launch_update_failed_version;      // under g_update_mutex
+inline unsigned long long g_launch_update_failed_tick = 0;
+constexpr unsigned long long kLaunchUpdateHoldMs = 90ull * 1000ull;
+
+inline bool launch_update_on_hold(const std::string& approved) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    return !approved.empty() && g_launch_update_failed_version == approved &&
+           g_launch_update_failed_tick != 0 &&
+           GetTickCount64() - g_launch_update_failed_tick < kLaunchUpdateHoldMs;
+}
+
+inline void set_launch_update_hold(const std::string& approved) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_launch_update_failed_version = approved;
+    g_launch_update_failed_tick = GetTickCount64();
+}
+
+inline void clear_launch_update_hold() {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_launch_update_failed_version.clear();
+    g_launch_update_failed_tick = 0;
+}
+
 // The admin_update_status answer for the bridge's local
 // admin_update_check message.
 inline std::string update_status_json() {
@@ -542,9 +588,12 @@ inline std::string update_status_json() {
     }
     // "update" is a CLAIM and requires a real comparison: both the
     // installed version and the approved version must be known. Unknown
-    // installed version = no claim in either direction.
-    const bool update = installed && !approved.empty() &&
-                        !admin_version.empty() && approved != admin_version;
+    // installed version = no claim in either direction. A version whose
+    // launch-time transaction just failed is NOT claimed while the hold
+    // lasts (the loop breaker above).
+    bool update = installed && !approved.empty() &&
+                  !admin_version.empty() && approved != admin_version;
+    if (update && launch_update_on_hold(approved)) update = false;
     std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
     out += installed ? "true" : "false";
     out += ",\"admin_version\":\"" + json_scan::json_escape(admin_version) + "\"";
@@ -852,11 +901,21 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     std::filesystem::remove_all(previous, ec);
     if (was_installed) {
         if (!rename_with_retries(admin_dir, previous)) {
-            // Locked files: the Admin (or something in it) is running.
-            log::client("admin: live install is locked; not updated");
+            // The live install could not be moved. "admin_running" is a
+            // CLAIM and requires the Admin to actually be running; a lock
+            // held by anything else (the 2026-09-04 loop: a process whose
+            // CWD sat inside the Admin dir) is a plain failure, or the
+            // page would tell the user to close a VIRULE that is not open.
+            if (admin_running()) {
+                log::client("admin: live install is locked; the Admin is running; not updated");
+                cleanup_staging();
+                broadcast_result("admin_running", "");
+                return "admin_running";
+            }
+            log::client("admin: live install is locked with no Admin running; update failed");
             cleanup_staging();
-            broadcast_result("admin_running", "");
-            return "admin_running";
+            broadcast_result("failed", "");
+            return "failed";
         }
         if (!rename_with_retries(staging, admin_dir)) {
             // Put the known-good install straight back.
@@ -999,6 +1058,14 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
 // opens instead (Settings still offers the update).
 inline void launch_after_update_handoff() {
     if (!admin_installed()) return;
+    // ONE update transaction: a handoff that arrives while the operation
+    // already runs JOINS it. The active operation owns the card and the
+    // relaunch; a second thread waiting alongside it could only close the
+    // live card early or launch a second Admin.
+    if (g_busy.load()) {
+        log::client("admin: launch handoff during an active update; joining it");
+        return;
+    }
     result_card::show_working("Updating\xE2\x80\xA6", "");
     // The virule.exe that handed off exits within moments; a bounded wait
     // covers it. Anything still running past it is a REAL Admin session
@@ -1026,8 +1093,26 @@ inline void launch_after_update_handoff() {
         (void)open_installed_admin();
         return;
     }
+    if (launch_update_on_hold(approved)) {
+        // This exact update already failed at launch moments ago; the
+        // relaunched Admin handing the launch straight back is the loop,
+        // not a new user decision (the claim gate in update_status_json
+        // normally prevents this handoff; this is the racing-message
+        // backstop). Open the Admin and stand down. The handing-off
+        // process has provably exited (the wait above), so the
+        // launch-in-flight debounce from the fallback relaunch moments
+        // ago must not swallow this one: the user's launch ends with a
+        // visible Admin, always.
+        log::client("admin: launch-time update for " + approved +
+                    " recently failed; launching current Admin without retrying");
+        result_card::close();
+        g_last_admin_launch_tick.store(0);
+        (void)open_installed_admin();
+        return;
+    }
     const std::string state = run(false, /*native_feedback=*/true);
     if (state == "updated") {
+        clear_launch_update_hold();
         // The Admin was not running, so run() left the launch to us.
         (void)open_installed_admin();
         result_card::close();
@@ -1035,7 +1120,10 @@ inline void launch_after_update_handoff() {
         // Another operation owns the lifecycle; its own feedback covers it.
         result_card::close();
     } else if (state != "installed") {
-        // Never block a launch on a failed update: open the current Admin.
+        // Never block a launch on a failed update, but remember the failed
+        // transaction so the relaunched Admin's immediate re-handoff cannot
+        // start it again (the loop breaker above).
+        set_launch_update_hold(approved);
         log::client("admin: launch-time update did not complete; launching current Admin");
         result_card::close();
         (void)open_installed_admin();
