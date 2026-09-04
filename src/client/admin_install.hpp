@@ -437,6 +437,9 @@ inline bool open_installed_admin() {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     log::client("admin: launched installed virule.exe");
+    // Running just flipped: tell every open page now (the 1s watcher is
+    // the backstop). "Open" becomes "Currently open" without a 15s wait.
+    bridge::push_lifecycle_status();
     return true;
 }
 
@@ -1146,8 +1149,18 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
         return "busy";
     }
     struct BusyGuard {
-        ~BusyGuard() { g_busy.store(false); }
+        ~BusyGuard() {
+            g_busy.store(false);
+            // The operation ended (success or failure): push the fresh
+            // lifecycle truth so every open tab drops its "Updating…"
+            // immediately (admin_result already reaches the pages; this
+            // covers tabs that only read status).
+            bridge::push_lifecycle_status();
+        }
     } busy_guard;
+    // The operation began (updating:true): every open tab freezes its CTA
+    // into "Updating…" now instead of on its next 15s poll.
+    bridge::push_lifecycle_status();
 
     const bool was_installed = admin_installed();
     log::client(std::string("admin: ") + (was_installed ? "update" : "install") +

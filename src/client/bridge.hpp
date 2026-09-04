@@ -55,6 +55,12 @@
 //                    {"type":"setup_wait"}             (Setup release poll)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin"}
+//                      (answered on request, and ALSO PUSHED unsolicited to
+//                       every page when the lifecycle state changes: the
+//                       admin block's installed/version/running/updating or
+//                       the uninstalling flag - the P1 status push,
+//                       2026-09-04. Pages treat any status frame as the
+//                       current truth; polling remains the backstop.)
 //                    {"type":"accepted"}
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
 //                    {"type":"admin_update_status","installed",...,"update"}
@@ -290,6 +296,57 @@ inline bool broadcast_qa_result(const std::string& token, const std::string& sta
                               "\",\"state\":\"" + state + "\"}");
 }
 
+// ---- the lifecycle status push (P1, 2026-09-04) ----
+// Meaningful state changes (Admin running flips, an update starting or
+// ending, the uninstall teardown beginning) used to reach an idle page only
+// on its 15s status poll, leaving stale CTAs offered against a live
+// transaction. The client now PUSHES one ordinary status frame to every
+// connected page whenever the lifecycle-relevant core of the status answer
+// changes. No new message type, no event framework: pages already treat any
+// status frame as current truth, and polling remains the convergence
+// backstop.
+
+// The full status message, exactly what the "status" request answers.
+inline std::string build_status_message(const std::string& admin_json) {
+    const unsigned long long qa_tick = g_last_qa_tick.load();
+    const long long qa_last_s = qa_tick == 0
+        ? -1
+        : (long long)((GetTickCount64() - qa_tick) / 1000ull);
+    return std::string("{\"type\":\"status\",\"v\":1,\"version\":\"") +
+        VIRULE_CLIENT_VERSION_STRING +
+        "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
+        std::to_string(open_page_count()) +
+        ",\"qa_last_s\":" + std::to_string(qa_last_s) +
+        ",\"uninstalling\":" + (g_uninstalling.load() ? "true" : "false") +
+        ",\"admin\":" + admin_json + "}";
+}
+
+// The last lifecycle core (admin block + uninstalling flag) broadcast to
+// pages. Only these fields gate a push: pages/qa_last_s change constantly
+// and are per-request detail, not lifecycle state.
+inline std::mutex g_push_mutex;
+inline std::string g_last_push_key;
+
+// Push a status frame to every page when the lifecycle core changed since
+// the last push (or unconditionally with force). Called by the serving
+// process's 1s status watcher and directly at operation boundaries (update
+// start/end, Admin launched), so every open virule.app tab converges in
+// about a second instead of waiting out the 15s poll. Skips all work while
+// no page is connected: a connecting page always asks for status itself.
+inline void push_lifecycle_status(bool force = false) {
+    if (open_page_count() == 0) return;
+    const std::string admin = g_callbacks.admin_status_json
+        ? g_callbacks.admin_status_json() : std::string("null");
+    const std::string key = admin +
+        (g_uninstalling.load() ? "|u1" : "|u0");
+    {
+        std::lock_guard<std::mutex> lock(g_push_mutex);
+        if (!force && key == g_last_push_key) return;
+        g_last_push_key = key;
+    }
+    broadcast_to_pages(build_status_message(admin));
+}
+
 // Push one uninstall lifecycle transition to every connected page:
 // "removing" when the ordered teardown begins, "failed" when it stops
 // before any destruction (the Admin refused to close). Success has no
@@ -514,23 +571,13 @@ inline void handle_client(SOCKET client) {
             // included when a page asks). Setup asks over a local control
             // connection, which is not counted, so a non-zero answer there
             // means a browser page found the client and still owns the flow.
+            // qa_last_s inside: seconds since this instance last handled a
+            // QA verification, -1 = never (see g_last_qa_tick above for why
+            // Setup needs it). The same message shape is also PUSHED on
+            // lifecycle changes (push_lifecycle_status above).
             const std::string admin = g_callbacks.admin_status_json
                 ? g_callbacks.admin_status_json() : std::string("null");
-            // qa_last_s: seconds since this instance last handled a QA
-            // verification, -1 = never. Additive status field; see
-            // g_last_qa_tick above for why Setup needs it.
-            const unsigned long long qa_tick = g_last_qa_tick.load();
-            const long long qa_last_s = qa_tick == 0
-                ? -1
-                : (long long)((GetTickCount64() - qa_tick) / 1000ull);
-            if (!reply(0x1, std::string("{\"type\":\"status\",\"v\":1,\"version\":\"")
-                            + VIRULE_CLIENT_VERSION_STRING +
-                            "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
-                            std::to_string(open_page_count()) +
-                            ",\"qa_last_s\":" + std::to_string(qa_last_s) +
-                            ",\"uninstalling\":" +
-                            (g_uninstalling.load() ? "true" : "false") +
-                            ",\"admin\":" + admin + "}")) {
+            if (!reply(0x1, build_status_message(admin))) {
                 return;
             }
         } else if (g_uninstalling.load() &&

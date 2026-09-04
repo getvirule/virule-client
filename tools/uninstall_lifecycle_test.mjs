@@ -476,9 +476,14 @@ async function main() {
       const failed = await waitPush(page, '"failed"', 45000);
       check("failure push after the Admin refused to close",
         !!failed, failed ?? "none");
-      const st2 = await askStatus(page2);
+      // The P1 status push delivers the return to normal service itself
+      // (uninstalling flips false moments after the failure push); stale
+      // queued pushes from during the teardown are skipped, so this waits
+      // for CONVERGENCE rather than racing the flag.
+      page2.sendText('{"type":"status"}');
+      const st2 = await waitPush(page2, '"uninstalling":false', 8000);
       check("client back to normal service (uninstalling:false)",
-        !!st2 && st2.includes('"uninstalling":false'), st2 ?? "none");
+        !!st2, st2 ?? "none");
       check("NOTHING was destroyed (Admin dir intact)",
         fs.existsSync(path.join(programs, "Admin", "virule.exe")));
       check("user data intact", fs.existsSync(path.join(data, "virule.db")));

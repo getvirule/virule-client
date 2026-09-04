@@ -398,6 +398,25 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         CloseHandle(h);
     }
 
+    // THE LIFECYCLE STATUS WATCHER (P1 status push, 2026-09-04): while any
+    // virule.app page is connected, re-read the lifecycle core (the admin
+    // block + the uninstalling flag) once a second and push a status frame
+    // to every page when it changed, so open tabs learn about Admin
+    // launches/exits, update start/end and teardown starts in about a
+    // second instead of their 15s poll. push_lifecycle_status does nothing
+    // at all with no pages connected, so an idle client stays idle. The
+    // thread is detached and dies with the process.
+    if (HANDLE h = CreateThread(nullptr, 0,
+            [](LPVOID) -> DWORD {
+                for (;;) {
+                    Sleep(1000);
+                    vclient::bridge::push_lifecycle_status();
+                }
+            },
+            nullptr, 0, nullptr)) {
+        CloseHandle(h);
+    }
+
     // A virule:// launch that made this process the instance carries its
     // work in. The grace window lets the invitation page reconnect to
     // this fresh listener before the ownership decision.
