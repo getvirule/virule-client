@@ -59,6 +59,7 @@
 #include "shared/client_state.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
+#include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
@@ -509,6 +510,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     vclient::protocol_reg::register_protocol(target.wstring());
     vclient::uninstall::register_uninstall_entry(
         target.wstring(), widen(manifest.version));
+
+    // An EXPLICIT install supersedes any standing uninstall intent (the
+    // durable latch a failed or interrupted uninstall leaves behind so
+    // self-heal stands down). The user just asked for VIRULE again; clear
+    // it, or the freshly started client would refuse to serve.
+    vclient::lifecycle::clear_uninstall_intent();
 
     // 7. Record the installed version (the manifest's, i.e. the client
     // release that was actually installed; Setup has its own version).

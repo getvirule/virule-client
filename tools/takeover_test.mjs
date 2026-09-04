@@ -317,7 +317,7 @@ async function main() {
     fs.mkdirSync(adminDir, { recursive: true });
     fs.writeFileSync(path.join(adminDir, "virule.exe"), "stub");
     fs.writeFileSync(path.join(adminDir, "installed-release.json"),
-      '{"version":"9.9.9-test.1"}');
+      '{"version":"0.0.1-test.1"}');
     check("client starts (sandbox d)", await startClient(root));
     const local = await connect({ origin: null });
     await local.next();
@@ -325,15 +325,24 @@ async function main() {
     const status = await local.next();
     check("installed version recovered from metadata (no state.json)",
       !!status && status.includes('"installed":true') &&
-      status.includes('"version":"9.9.9-test.1"'), status ?? "none");
+      status.includes('"version":"0.0.1-test.1"'), status ?? "none");
     local.sendText('{"type":"admin_update_check"}');
     const upd = await local.next(25000);
-    check("known-version comparison claims the update",
+    check("known-version comparison claims the genuine upgrade",
       !!upd && upd.includes('"update":true') &&
-      upd.includes('"admin_version":"9.9.9-test.1"'), upd ?? "none");
-    // state.json must have been healed from the metadata.
+      upd.includes('"admin_version":"0.0.1-test.1"'), upd ?? "none");
+    // SEMVER ORDERING (2026-09-04): an installed Admin NEWER than the
+    // approved manifest is never offered an automatic downgrade.
+    fs.writeFileSync(path.join(adminDir, "installed-release.json"),
+      '{"version":"9.9.9-test.1"}');
+    local.sendText('{"type":"admin_update_check"}');
+    const down = await local.next(25000);
+    check("newer-than-approved install claims NO update (no downgrade)",
+      !!down && down.includes('"update":false') &&
+      down.includes('"admin_version":"9.9.9-test.1"'), down ?? "none");
+    // state.json must have been healed from the startup metadata.
     const state = fs.readFileSync(path.join(root, "VIRULE", "client", "state.json"), "utf8");
-    check("state.json mirror healed", state.includes("9.9.9-test.1"), state);
+    check("state.json mirror healed", state.includes("0.0.1-test.1"), state);
     local.end();
     await stopClient();
 

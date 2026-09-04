@@ -3,27 +3,46 @@
 // driven by an EXPLICIT ownership inventory. Nothing here recurses outside
 // VIRULE-owned paths.
 //
+// THE ORDER IS THE CONTRACT (owner corrective spec 2026-09-04):
+//
+//   1.  the durable uninstall-intent latch is written BEFORE any teardown
+//       (lifecycle_intent.hpp; every automatic resurrection path honors it);
+//   2.  new lifecycle operations stop being accepted;
+//   3.  an active Admin update is cancelled back to a known-good
+//       filesystem state (never finished merely because it started first);
+//   4.  the Admin is closed GRACEFULLY and every managed Admin-directory
+//       process must be gone;
+//   5.  the client exits and the visible %TEMP% helper takes over
+//       ("Removing VIRULE…" - a destructive operation never runs silent);
+//   6.  software-owned FILES are removed;
+//   7.  software-owned REGISTRATIONS (virule://, the Apps & Features
+//       entry) are removed LAST, only after file removal succeeded, so a
+//       partial failure always leaves a Windows-recoverable retry path;
+//   8.  terminal state is verified, the intent latch is cleared LAST, and
+//       the user sees the outcome.
+//
+//   A failure at any point keeps the latch, keeps the registrations that
+//   still had work to do, and surfaces a retry. It never half-removes
+//   silently and never lets self-heal "fix" an explicit removal.
+//
 // DEFAULT UNINSTALL (delete_data = false) removes the SOFTWARE and its
 // integration and PRESERVES every piece of user-owned VIRULE data:
-//   1. %LOCALAPPDATA%\VIRULE\client\            (recursive; client-only
-//      software state: state.json, client logs)
-//   2. HKCU\Software\Classes\virule ONLY while it points at this client
-//   3. the HKCU uninstall entry
-//   4. the desktop VIRULE.lnk ONLY when the client created it
-//      (state.json provenance; a shortcut the user made stays)
-//   5. %LOCALAPPDATA%\Programs\VIRULE\          (the installed program,
-//      including the managed Admin\ installation under it - Phase 2)
-//   6. %LOCALAPPDATA%\VIRULE\ itself only if left empty
+//   - %LOCALAPPDATA%\VIRULE\client\           (client software state)
+//   - %LOCALAPPDATA%\Programs\VIRULE\         (client + managed Admin\)
+//   - the desktop VIRULE.lnk ONLY when the client created it
+//   - virule:// ONLY while it points into the removed tree
+//   - the HKCU uninstall entry
+//   - %LOCALAPPDATA%\VIRULE\ itself only if left empty
 //   PRESERVED: virule.db, workspace\, logs\, backup.json, security\
 //   (dev_machine.cred AND the QA tester credentials), and anything else
 //   under the user-data root. A reinstall finds all of it in place.
 //
 // UNINSTALL & DELETE DATA (delete_data = true; the explicit destructive
 // option behind the "Delete local data" toggle and its "cannot be undone"
-// warning) removes everything above PLUS the whole VIRULE user-data root,
-// %LOCALAPPDATA%\VIRULE\ (virule.db, workspace\, logs\, backup.json,
-// security\ with every credential, the qa_test_mode flag). That root is
-// VIRULE-owned by definition (paths.hpp); nothing outside it is touched.
+// warning) removes everything above PLUS the whole VIRULE user-data root.
+// That root is VIRULE-owned by definition (paths.hpp); nothing outside it
+// is touched. The Admin is closed FIRST in both modes, so virule.db is
+// never deleted under a live Admin.
 //
 // Development trees (the VIRULE repository, its virule\publish\Virule
 // folder) and the user's chosen build root are outside every inventory
@@ -32,9 +51,14 @@
 //
 // SELF-REMOVAL: a running executable cannot delete itself, so the client
 // copies itself to %TEMP% and runs that copy with --finish-uninstall
-// <parent pid>. The copy waits for the parent to exit, performs the whole
-// inventory (idempotent), removes the install directory, and schedules its
-// own deletion. No broken half-installed executable is left behind.
+// <parent pid>. The copy waits for every managed process to exit, OWNS THE
+// VISIBLE REMOVAL SURFACE (the branded "Removing VIRULE…" card and its
+// terminal outcome - main.cpp orchestrates it over these primitives),
+// performs the inventory (idempotent), and schedules its own deletion.
+//
+// LOGGING: the client's own log directory is part of what gets removed, so
+// the helper appends to %TEMP%\virule-uninstall.log instead - small,
+// capped, and it survives the removal for inspection.
 //
 // FUTURE RULE (recorded here on purpose): a full VIRULE uninstall and
 // removing an individual installed game are SEPARATE actions. When managed
@@ -43,6 +67,7 @@
 // a game-library directory.
 
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "shared/client_state.hpp"
@@ -58,12 +83,37 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 namespace vclient::uninstall {
 
 inline constexpr const wchar_t* kUninstallKey =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ViruleClient";
+
+// ---- helper-side logging (%TEMP%; survives the removal) ----
+
+inline void temp_log(const std::string& what) {
+    wchar_t temp_dir[MAX_PATH] = {};
+    const DWORD n = GetTempPathW(MAX_PATH, temp_dir);
+    if (n == 0 || n >= MAX_PATH) return;
+    const std::filesystem::path file =
+        std::filesystem::path(temp_dir) / L"virule-uninstall.log";
+    std::error_code ec;
+    if (std::filesystem::exists(file, ec) &&
+        std::filesystem::file_size(file, ec) > 256 * 1024) {
+        std::filesystem::remove(file, ec);
+    }
+    std::ofstream out(file, std::ios::app);
+    if (!out) return;
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    char stamp[40] = {};
+    std::snprintf(stamp, sizeof(stamp), "%04u-%02u-%02uT%02u:%02u:%02uZ ",
+                  st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                  st.wSecond);
+    out << stamp << what << "\n";
+}
 
 // ---- uninstall registration (Apps & Features) ----
 
@@ -98,7 +148,81 @@ inline void remove_uninstall_entry() {
     RegDeleteTreeW(HKEY_CURRENT_USER, kUninstallKey);
 }
 
-// ---- the inventory removal (idempotent; called by the %TEMP% helper) ----
+// ---- process accounting ----
+
+// Any process (other than this one) whose image path sits under the
+// installed program directory: the serving client, the managed Admin's
+// virule.exe, ViruleAdminHost.exe and its CEF children. These must all be
+// gone before file removal can succeed.
+inline bool any_install_dir_process_running() {
+    const auto dir = paths::install_dir();
+    if (dir.empty()) return false;
+    std::wstring prefix = dir.wstring();
+    if (prefix.empty()) return false;
+    if (prefix.back() != L'\\') prefix += L'\\';
+    for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
+
+    const DWORD self = GetCurrentProcessId();
+    bool found = false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snap, &entry)) {
+        do {
+            if (entry.th32ProcessID == self) continue;
+            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                      entry.th32ProcessID);
+            if (!proc) continue;
+            wchar_t image[MAX_PATH * 2] = {};
+            DWORD n = (DWORD)(sizeof(image) / sizeof(image[0]));
+            if (QueryFullProcessImageNameW(proc, 0, image, &n)) {
+                std::wstring path(image, n);
+                for (wchar_t& c : path) c = (wchar_t)towlower(c);
+                if (path.rfind(prefix, 0) == 0) found = true;
+            }
+            CloseHandle(proc);
+        } while (!found && Process32NextW(snap, &entry));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// Wait until every managed-directory process is gone (bounded). True =
+// clear to remove files.
+inline bool wait_install_dir_processes_gone(unsigned long long wait_ms) {
+    const ULONGLONG deadline = GetTickCount64() + wait_ms;
+    for (;;) {
+        if (!any_install_dir_process_running()) return true;
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(250);
+    }
+}
+
+// ---- update-residue reconciliation ----
+// An uninstall may intersect an interrupted or cancelled Admin update.
+// Before removal (and before any failure leaves the machine waiting for a
+// retry), bring the managed tree back to ONE unambiguous known-good state:
+// a stranded Admin.previous with no live Admin\ is the known-good install
+// and is restored; staging and the download are debris.
+inline void reconcile_admin_update_residue() {
+    std::error_code ec;
+    const auto admin_dir = paths::admin_install_dir();
+    const auto previous = paths::admin_previous_dir();
+    if (!admin_dir.empty() && !previous.empty() &&
+        !std::filesystem::exists(admin_dir, ec) &&
+        std::filesystem::exists(previous, ec)) {
+        ec.clear();
+        std::filesystem::rename(previous, admin_dir, ec);
+        if (!ec) temp_log("reconciled: Admin.previous restored as Admin");
+    }
+    ec.clear();
+    std::filesystem::remove_all(paths::admin_staging_dir(), ec);
+    ec.clear();
+    std::filesystem::remove(paths::admin_download_zip(), ec);
+}
+
+// ---- the inventory removal (idempotent) ----
 
 inline void remove_file_quiet(const std::filesystem::path& p) {
     if (p.empty()) return;
@@ -116,11 +240,28 @@ inline void remove_dir_if_empty(const std::filesystem::path& p) {
     }
 }
 
-// Everything except the install directory (which only the %TEMP% helper may
-// remove, after the installed process has exited). `delete_data` is the
-// explicit destructive mode; the default PRESERVES user-owned data.
-inline void remove_owned_state(const std::wstring& installed_exe,
-                               bool delete_data) {
+// Bounded-retry recursive removal: a single remove_all loses races with
+// antivirus scanners, indexers and sync clients holding transient handles
+// on freshly written files. True = the tree is gone.
+inline bool remove_tree_with_retries(const std::filesystem::path& p,
+                                     int attempts = 20) {
+    if (p.empty()) return true;
+    for (int i = 0; i < attempts; ++i) {
+        std::error_code ec;
+        std::filesystem::remove_all(p, ec);
+        ec.clear();
+        if (!std::filesystem::exists(p, ec)) return true;
+        Sleep(250);
+    }
+    std::error_code ec;
+    return !std::filesystem::exists(p, ec);
+}
+
+// FILES ONLY: the software-owned files and directories. Registrations are
+// deliberately NOT touched here; they go last, through
+// remove_registrations(), and only after this reports success. True = the
+// installed program directory and the client state directory are gone.
+inline bool remove_files(bool delete_data) {
     // Provenance first, while state.json still exists to consult.
     const state::State s = state::load();
     std::error_code ec;
@@ -134,22 +275,17 @@ inline void remove_owned_state(const std::wstring& installed_exe,
     // The client state directory (state.json, client logs): software
     // state, strictly ours, removed in both modes.
     const auto client_dir = paths::client_state_dir();
-    if (!client_dir.empty()) {
-        ec.clear();
-        std::filesystem::remove_all(client_dir, ec);
-    }
+    (void)remove_tree_with_retries(client_dir);
 
     if (delete_data) {
         // The explicit Uninstall & Delete Data mode: the whole VIRULE
         // user-data root goes (virule.db, workspace\, logs\, backup.json,
         // security\ with every credential, the qa_test_mode flag). The
         // root is VIRULE-owned by definition; nothing outside it is
-        // touched, so unrelated files and development trees stay.
-        const auto root = paths::virule_data_root();
-        if (!root.empty()) {
-            ec.clear();
-            std::filesystem::remove_all(root, ec);
-        }
+        // touched, so unrelated files and development trees stay. The
+        // Admin was closed before this runs (the order contract), so the
+        // database is never deleted under a live Admin.
+        (void)remove_tree_with_retries(paths::virule_data_root());
     } else {
         // Default: PRESERVE user data. Every credential (dev_machine.cred
         // AND qa_tester*.cred), virule.db, workspace\, logs\ and
@@ -159,62 +295,74 @@ inline void remove_owned_state(const std::wstring& installed_exe,
         remove_dir_if_empty(paths::virule_data_root());
     }
 
-    // virule:// only while it is OURS. A registration the Admin has
-    // taken over stays.
-    if (protocol_reg::registered_to(installed_exe)) {
-        protocol_reg::unregister_protocol();
+    // The installed program directory (client + the managed Admin\ under
+    // it). Bounded retries cover the small window where the last exiting
+    // process's handles are still closing.
+    const bool program_gone = remove_tree_with_retries(paths::install_dir());
+
+    ec.clear();
+    const bool state_gone = client_dir.empty() ||
+                            !std::filesystem::exists(client_dir, ec);
+    bool data_gone = true;
+    if (delete_data) {
+        ec.clear();
+        data_gone = !std::filesystem::exists(paths::virule_data_root(), ec);
+    }
+    return program_gone && state_gone && data_gone;
+}
+
+// REGISTRATIONS LAST (the audit's H1 fix): virule:// and the Apps &
+// Features entry are removed only after remove_files() succeeded, so a
+// locked or failing removal always keeps a Windows-visible retry path.
+inline void remove_registrations(const std::wstring& installed_exe) {
+    // virule:// while it points anywhere into the removed tree: the
+    // installed client (the canonical handler) or the managed Admin's
+    // virule.exe (which held the scheme on client-less machines). A
+    // registration pointing outside the tree (a dev tree, a foreign app)
+    // stays.
+    const std::wstring command = protocol_reg::registered_command();
+    if (!command.empty()) {
+        std::wstring lower_cmd = command;
+        for (wchar_t& c : lower_cmd) c = (wchar_t)towlower(c);
+        std::wstring lower_root = paths::install_dir().wstring();
+        for (wchar_t& c : lower_root) c = (wchar_t)towlower(c);
+        if (!lower_root.empty() &&
+            lower_cmd.find(lower_root) != std::wstring::npos) {
+            protocol_reg::unregister_protocol();
+        } else if (protocol_reg::registered_to(installed_exe)) {
+            protocol_reg::unregister_protocol();
+        }
     }
 
     // The Apps & Features entry.
     remove_uninstall_entry();
 }
 
-// The %TEMP% helper's whole job: wait out the parent, remove everything,
-// remove the installed program, then schedule this copy's own deletion.
-inline int finish_uninstall(unsigned long parent_pid, bool delete_data) {
-    if (parent_pid != 0) {
-        if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, parent_pid)) {
-            WaitForSingleObject(h, 30000);
-            CloseHandle(h);
-        }
-    }
-    const std::wstring installed_exe = paths::installed_client_exe().wstring();
-    remove_owned_state(installed_exe, delete_data);
-
-    // 7. The installed program directory. Bounded retries cover the small
-    // window where the parent's handles are still closing.
-    const auto dir = paths::install_dir();
-    for (int i = 0; i < 20; ++i) {
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
-        if (!std::filesystem::exists(dir, ec)) break;
-        Sleep(250);
-    }
-
-    // Remove this %TEMP% copy after exit (cmd waits, then deletes).
+// Remove this %TEMP% helper copy after exit (cmd waits, then deletes).
+inline void schedule_self_delete() {
     wchar_t self[MAX_PATH] = {};
-    if (GetModuleFileNameW(nullptr, self, MAX_PATH)) {
-        std::wstring cmd = L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /f /q \"";
-        cmd += self;
-        cmd += L"\"";
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi{};
-        std::wstring mutable_cmd = cmd;
-        if (CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
-                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        }
+    if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
+    std::wstring cmd = L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /f /q \"";
+    cmd += self;
+    cmd += L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::wstring mutable_cmd = cmd;
+    if (CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
     }
-    return 0;
 }
 
-// Start the uninstall from the running (installed) client: copy self to
-// %TEMP%, launch the copy, and let the caller exit promptly. Returns false
-// when the helper could not be started (nothing was removed yet).
+// Start the uninstall helper from the running (installed) client: copy self
+// to %TEMP%, launch the copy, and let the caller exit promptly. Returns
+// false when the helper could not be started (nothing was removed yet).
+// The helper owns the visible removal surface from the moment the parent
+// exits (main.cpp run_finish_uninstall).
 inline bool spawn_uninstall_helper(bool delete_data) {
     wchar_t self[MAX_PATH] = {};
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return false;
@@ -231,8 +379,11 @@ inline bool spawn_uninstall_helper(bool delete_data) {
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     std::wstring mutable_cmd = cmd;
+    // No CREATE_NO_WINDOW mystery: the helper is a windowed process that
+    // shows the branded "Removing VIRULE…" card (the zero-dead-air rule);
+    // it owns no console either way.
     if (!CreateProcessW(helper.c_str(), mutable_cmd.data(), nullptr, nullptr,
-                        FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                        FALSE, 0, nullptr, nullptr, &si, &pi)) {
         DeleteFileW(helper.c_str());
         return false;
     }

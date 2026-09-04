@@ -125,6 +125,25 @@ inline const wchar_t* kRequiredSigned[] = {
 // from ending the process mid-operation after the browser closes.
 inline std::atomic<bool> g_busy{ false };
 
+// UNINSTALL WINS (owner decision 2026-09-04): an explicit uninstall that
+// finds an update in flight cancels it back to a known-good filesystem
+// state instead of waiting out a 300MB transfer. The pipeline checks this
+// at every stage boundary (and inside the download loop); a cancelled
+// operation cleans its staging and reports "failed". The flag is only ever
+// set by the uninstall sequence.
+inline std::atomic<bool> g_cancel{ false };
+
+// Ask an in-flight operation to stop and wait (bounded) until it has
+// unwound to a known-good state. True = no operation is running any more.
+inline bool cancel_active_operation_and_wait(unsigned long long wait_ms) {
+    if (!g_busy.load()) return true;
+    g_cancel.store(true);
+    const ULONGLONG deadline = GetTickCount64() + wait_ms;
+    while (g_busy.load() && GetTickCount64() < deadline) Sleep(250);
+    g_cancel.store(false);
+    return !g_busy.load();
+}
+
 // ---- status ----
 
 inline bool admin_installed() {
@@ -207,6 +226,41 @@ inline void reconcile_installed_version() {
             log::client("admin: wrote install metadata from state (" +
                         s.admin_version + ")");
         }
+    }
+}
+
+// STARTUP RESIDUE RECONCILIATION (the minimum the uninstall corrective
+// pass requires, 2026-09-04): an interrupted update (crash, power loss,
+// an uninstall cancelling mid-pipeline whose helper then failed) must not
+// strand the managed tree in an ambiguous state. If the live Admin\ is
+// missing but the known-good Admin.previous survives, restore it; stale
+// staging and a stale download are debris. Runs once at client startup,
+// before any operation can be in flight.
+inline void reconcile_startup_residue() {
+    if (g_busy.load()) return;
+    std::error_code ec;
+    const auto admin_dir = paths::admin_install_dir();
+    const auto previous = paths::admin_previous_dir();
+    if (!admin_dir.empty() && !previous.empty() &&
+        !std::filesystem::exists(admin_dir, ec) &&
+        std::filesystem::exists(previous, ec)) {
+        ec.clear();
+        std::filesystem::rename(previous, admin_dir, ec);
+        if (!ec) {
+            log::client("admin: recovered known-good install from Admin.previous");
+        }
+    }
+    ec.clear();
+    if (std::filesystem::exists(paths::admin_staging_dir(), ec)) {
+        ec.clear();
+        std::filesystem::remove_all(paths::admin_staging_dir(), ec);
+        log::client("admin: removed stale Admin.staging");
+    }
+    ec.clear();
+    if (std::filesystem::exists(paths::admin_download_zip(), ec)) {
+        ec.clear();
+        std::filesystem::remove(paths::admin_download_zip(), ec);
+        log::client("admin: removed stale admin-download.zip");
     }
 }
 
@@ -414,6 +468,54 @@ inline bool is_version_grammar(const std::string& s) {
     return true;
 }
 
+// SEMANTIC VERSION ORDERING (owner correction 2026-09-04, mirroring the
+// site's fix): an update is offered/performed only when the approved
+// version is a genuine UPGRADE over the installed one. An installed Admin
+// NEWER than the approved manifest is never auto-downgraded; a rollback
+// is an explicit controlled operation, not normal update UX.
+// Grammar: MAJOR.MINOR.PATCH with an optional pre-release suffix
+// ("0.1.1-alpha.17"). Standard SemVer precedence: the numeric triple,
+// then no-pre-release outranks pre-release, then pre-release identifiers
+// field by field (numeric identifiers numerically, and lower than
+// alphanumeric ones).
+inline int compare_prerelease(const std::string& a, const std::string& b) {
+    if (a.empty() && b.empty()) return 0;
+    if (a.empty()) return 1;  // a release outranks any pre-release
+    if (b.empty()) return -1;
+    size_t pa = 0, pb = 0;
+    for (;;) {
+        const bool more_a = pa < a.size();
+        const bool more_b = pb < b.size();
+        if (!more_a && !more_b) return 0;
+        if (!more_a) return -1; // fewer identifiers ranks lower
+        if (!more_b) return 1;
+        const size_t ea = a.find('.', pa);
+        const size_t eb = b.find('.', pb);
+        const std::string ia = a.substr(pa, (ea == std::string::npos ? a.size() : ea) - pa);
+        const std::string ib = b.substr(pb, (eb == std::string::npos ? b.size() : eb) - pb);
+        const bool na = !ia.empty() &&
+            ia.find_first_not_of("0123456789") == std::string::npos;
+        const bool nb = !ib.empty() &&
+            ib.find_first_not_of("0123456789") == std::string::npos;
+        if (na && nb) {
+            const long long va = std::stoll(ia);
+            const long long vb = std::stoll(ib);
+            if (va != vb) return va < vb ? -1 : 1;
+        } else if (na != nb) {
+            return na ? -1 : 1; // numeric identifiers rank lower
+        } else if (ia != ib) {
+            return ia < ib ? -1 : 1;
+        }
+        pa = (ea == std::string::npos) ? a.size() : ea + 1;
+        pb = (eb == std::string::npos) ? b.size() : eb + 1;
+    }
+}
+
+// True only when `approved` is a genuine upgrade over `installed`. An
+// unparseable version never wins a comparison (no claim either way).
+inline bool version_is_upgrade(const std::string& approved,
+                               const std::string& installed);
+
 // "x.y.z..." -> the leading numeric triple (pre-release suffixes ignored).
 inline bool parse_version_triple(const std::string& s, long long out[3]) {
     size_t p = 0;
@@ -433,6 +535,32 @@ inline bool parse_version_triple(const std::string& s, long long out[3]) {
         }
     }
     return true;
+}
+
+inline bool version_is_upgrade(const std::string& approved,
+                               const std::string& installed) {
+    long long ta[3] = {};
+    long long tb[3] = {};
+    if (!parse_version_triple(approved, ta)) return false;
+    if (!parse_version_triple(installed, tb)) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (ta[i] != tb[i]) return ta[i] > tb[i];
+    }
+    auto prerelease_of = [](const std::string& v) -> std::string {
+        // The suffix after the numeric triple's '-', up to any '+' build
+        // metadata; "" = a plain release.
+        size_t p = 0;
+        for (int i = 0; i < 3; ++i) {
+            while (p < v.size() && v[p] >= '0' && v[p] <= '9') ++p;
+            if (i < 2) { if (p >= v.size() || v[p] != '.') return ""; ++p; }
+        }
+        if (p >= v.size() || v[p] != '-') return "";
+        std::string rest = v.substr(p + 1);
+        const size_t plus = rest.find('+');
+        if (plus != std::string::npos) rest.resize(plus);
+        return rest;
+    };
+    return compare_prerelease(prerelease_of(approved), prerelease_of(installed)) > 0;
 }
 
 inline bool fetch_manifest(Manifest& out, std::string& why) {
@@ -587,12 +715,14 @@ inline std::string update_status_json() {
         approved = g_approved_version;
     }
     // "update" is a CLAIM and requires a real comparison: both the
-    // installed version and the approved version must be known. Unknown
-    // installed version = no claim in either direction. A version whose
-    // launch-time transaction just failed is NOT claimed while the hold
-    // lasts (the loop breaker above).
+    // installed version and the approved version must be known, and the
+    // approved version must be a genuine UPGRADE (SemVer ordering; never
+    // an automatic downgrade). Unknown installed version = no claim in
+    // either direction. A version whose launch-time transaction just
+    // failed is NOT claimed while the hold lasts (the loop breaker above).
     bool update = installed && !approved.empty() &&
-                  !admin_version.empty() && approved != admin_version;
+                  !admin_version.empty() &&
+                  version_is_upgrade(approved, admin_version);
     if (update && launch_update_on_hold(approved)) update = false;
     std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
     out += installed ? "true" : "false";
@@ -781,6 +911,16 @@ inline bool rename_with_retries(const std::filesystem::path& from,
 // "admin_running" / "failed"). Callers own launching the Admin and any
 // native lifecycle card (see run()).
 inline std::string run_pipeline(bool shortcut, bool was_installed) {
+    // UNINSTALL WINS: an explicit uninstall cancels this operation at the
+    // next stage boundary; everything unwinds to the known-good install.
+    auto cancelled = [&]() -> bool {
+        if (!g_cancel.load()) return false;
+        log::client("admin: operation cancelled (uninstall in progress)");
+        cleanup_staging();
+        broadcast_result("failed", "");
+        return true;
+    };
+
     // 1-2. The approved manifest.
     Manifest manifest;
     std::string why;
@@ -819,16 +959,26 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     std::error_code ec;
     std::filesystem::create_directories(paths::install_dir(), ec);
 
+    if (cancelled()) return "failed";
+
     // 3. Streamed download, hashed on the way through, capped at the
-    // manifest's declared size.
+    // manifest's declared size. The progress callback doubles as the
+    // cancellation point: an uninstall aborts the transfer mid-stream.
     unsigned long status = 0;
     unsigned long long got_size = 0;
     std::string got_sha;
     if (!http::https_get_to_file(whost.c_str(), wpath.c_str(),
                                  (unsigned long long)manifest.size, zip_path,
                                  status, got_size, got_sha,
-                                 []() { bridge::touch_activity(); })) {
-        log::client("admin: package download failed, status=" + std::to_string(status));
+                                 []() {
+                                     bridge::touch_activity();
+                                     return !g_cancel.load();
+                                 })) {
+        if (g_cancel.load()) {
+            log::client("admin: package download aborted (uninstall in progress)");
+        } else {
+            log::client("admin: package download failed, status=" + std::to_string(status));
+        }
         cleanup_staging();
         broadcast_result("failed", "");
         return "failed";
@@ -848,6 +998,8 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
         return "failed";
     }
     log::client("admin: package verified (" + std::to_string(got_size) + " bytes)");
+
+    if (cancelled()) return "failed";
 
     // 5. Safe extraction into staging.
     std::filesystem::create_directories(staging, ec);
@@ -897,6 +1049,10 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     }
 
     // 7. Atomic placement. The previous install survives any failed swap.
+    // The LAST cancellation point sits before the first rename: once the
+    // swap begins it either completes or rolls straight back (never a
+    // cancel between the two renames).
+    if (cancelled()) return "failed";
     ec.clear();
     std::filesystem::remove_all(previous, ec);
     if (was_installed) {
@@ -977,6 +1133,13 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
 // Page-driven operations (native_feedback = false) leave the visible flow
 // to the page, exactly as before.
 inline std::string run(bool shortcut, bool native_feedback = false) {
+    // EXPLICIT UNINSTALL WINS: once removal has begun, no install/update
+    // may start (the bridge already refuses page/local requests; this is
+    // the backstop for every internal caller).
+    if (bridge::g_uninstalling.load()) {
+        log::client("admin: install/update refused (uninstall in progress)");
+        return "failed";
+    }
     if (g_busy.exchange(true)) {
         // An operation is already in flight; its own result push covers
         // every connected page.
@@ -1058,6 +1221,10 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
 // opens instead (Settings still offers the update).
 inline void launch_after_update_handoff() {
     if (!admin_installed()) return;
+    if (bridge::g_uninstalling.load()) {
+        log::client("admin: launch handoff refused (uninstall in progress)");
+        return;
+    }
     // ONE update transaction: a handoff that arrives while the operation
     // already runs JOINS it. The active operation owns the card and the
     // relaunch; a second thread waiting alongside it could only close the
@@ -1087,7 +1254,7 @@ inline void launch_after_update_handoff() {
     }
     const std::string installed = authoritative_admin_version();
     const bool update = !approved.empty() && !installed.empty() &&
-                        approved != installed;
+                        version_is_upgrade(approved, installed);
     if (!update) {
         result_card::close();
         (void)open_installed_admin();

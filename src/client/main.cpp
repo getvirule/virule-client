@@ -44,6 +44,7 @@
 #include "client/takeover.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
+#include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
@@ -94,21 +95,185 @@ bool forward_to_running_instance(const std::string& message) {
         vclient::bridge::kPort, nullptr, "\"virule_client\"", message, response);
 }
 
-// A verified uninstall: leave Serving, free the port, hand the removal to
-// the %TEMP% helper and exit. Never deletes anything in-process.
-// `delete_data` is the explicit destructive option; the default preserves
-// every piece of user-owned VIRULE data.
-void begin_uninstall_and_exit(bool delete_data) {
+// THE ORDERED UNINSTALL (owner corrective spec 2026-09-04). Explicit user
+// uninstall outranks every automatic recovery behavior, and the order is
+// the contract:
+//
+//   1. record the durable uninstall intent (registry latch) FIRST;
+//   2. stop accepting new lifecycle operations (bridge refusals) and show
+//      the immediate "Removing VIRULE…" surface (zero dead air);
+//   3. cancel any active Admin update back to a known-good state;
+//   4. gracefully close the Admin and wait until every managed
+//      Admin-directory process is gone (never partially uninstall under a
+//      live Admin; a refusal aborts with visible feedback and changes
+//      nothing);
+//   5. exit and hand the removal to the visible %TEMP% helper, which
+//      removes files, removes registrations LAST, verifies, clears the
+//      intent latch LAST and shows the terminal outcome.
+//
+// Never deletes anything in-process. `delete_data` is the explicit
+// destructive option; the default preserves every piece of user-owned
+// VIRULE data.
+void run_uninstall_sequence(bool delete_data) {
+    namespace ai = vclient::admin_install;
+    namespace rc = vclient::result_card;
+
+    if (vclient::bridge::g_uninstalling.exchange(true)) return; // one teardown
     g_state.store(RunState::Uninstalling);
-    vclient::log::client(std::string("uninstall: starting (helper handoff, ") +
+
+    // 1. Durable intent, before anything else. A machine that cannot even
+    // record the intent does not get a destructive teardown.
+    if (!vclient::lifecycle::set_uninstall_intent()) {
+        vclient::log::client("uninstall: intent latch could not be written; aborted");
+        vclient::bridge::broadcast_uninstall_state("failed");
+        vclient::bridge::g_uninstalling.store(false);
+        g_state.store(RunState::Serving);
+        return;
+    }
+    vclient::log::client(std::string("uninstall: intent recorded; teardown starting (") +
                          (delete_data ? "delete local data)" : "keep local data)"));
+
+    // 2. Immediate visible feedback + the site's Removing state.
+    vclient::bridge::broadcast_uninstall_state("removing");
+    rc::show_working("Removing VIRULE\xE2\x80\xA6", "");
+
+    // 3. UNINSTALL WINS: an in-flight update is cancelled to a known-good
+    // filesystem state, never finished merely because it started first.
+    if (!ai::cancel_active_operation_and_wait(120000)) {
+        vclient::log::client("uninstall: active update did not unwind; aborted");
+        vclient::bridge::broadcast_uninstall_state("failed");
+        rc::update("Something went wrong.", "Try again in a moment.");
+        vclient::bridge::g_uninstalling.store(false);
+        g_state.store(RunState::Serving);
+        return;
+    }
+    vclient::uninstall::reconcile_admin_update_residue();
+
+    // 4. Admin first, gracefully (the update path's own machinery). A
+    // refusal aborts the whole uninstall with nothing destroyed: the
+    // intent latch stays (self-heal keeps standing down) and the user
+    // gets clear feedback with a retry path.
+    if (ai::admin_running()) {
+        vclient::log::client("uninstall: closing the running Admin gracefully");
+        if (!ai::close_running_admin(30000)) {
+            vclient::log::client("uninstall: the Admin did not close; nothing removed");
+            vclient::bridge::broadcast_uninstall_state("failed");
+            rc::update("Something went wrong.", "Close VIRULE and try again.");
+            vclient::bridge::g_uninstalling.store(false);
+            g_state.store(RunState::Serving);
+            return;
+        }
+        vclient::log::client("uninstall: the Admin closed");
+    }
+
+    // 5. Helper handoff. The listener closes so the freed port and the
+    // dying socket read as removal in progress; the helper (a %TEMP% copy
+    // of this exe) owns the visible surface from here.
     vclient::bridge::stop_listening();
     if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) {
         vclient::log::client("uninstall: helper could not be started; nothing removed");
+        vclient::bridge::restart_listening();
+        vclient::bridge::broadcast_uninstall_state("failed");
+        rc::update("Something went wrong.", "Try again in a moment.");
+        vclient::bridge::g_uninstalling.store(false);
         g_state.store(RunState::Serving);
         return;
     }
     ExitProcess(0);
+}
+
+// Run the ordered teardown off the bridge connection thread (it waits on
+// update cancellation and the Admin's graceful close).
+void begin_uninstall_async(bool delete_data) {
+    struct Arg { bool delete_data; };
+    auto* arg = new Arg{ delete_data };
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID p) -> DWORD {
+            Arg* a = (Arg*)p;
+            run_uninstall_sequence(a->delete_data);
+            delete a;
+            return 0;
+        },
+        arg, 0, nullptr);
+    if (h) CloseHandle(h); else delete arg;
+}
+
+// ---- the %TEMP% helper's whole job (run under --finish-uninstall) ----
+// Waits out every managed process, owns the visible removal surface,
+// removes FILES, then REGISTRATIONS LAST, verifies the terminal state,
+// clears the intent latch LAST, and reports the outcome. A failure keeps
+// the latch and the registrations (the Windows-recoverable retry path)
+// and offers Try again right on the card.
+int run_finish_uninstall(unsigned long parent_pid, bool delete_data) {
+    namespace un = vclient::uninstall;
+    namespace rc = vclient::result_card;
+
+    un::temp_log(std::string("helper: starting (") +
+                 (delete_data ? "delete local data)" : "keep local data)"));
+    if (parent_pid != 0) {
+        if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, parent_pid)) {
+            WaitForSingleObject(h, 30000);
+            CloseHandle(h);
+        }
+    }
+
+    // Zero dead air: the removal surface is up before anything happens.
+    rc::show_working("Removing VIRULE\xE2\x80\xA6", "");
+    for (int i = 0; i < 20 && !rc::is_visible(); ++i) Sleep(100);
+    un::temp_log(std::string("helper: removal card ") +
+                 (rc::is_visible() ? "visible" : "NOT visible"));
+
+    const std::wstring installed_exe = vclient::paths::installed_client_exe().wstring();
+
+    for (;;) {
+        // Every managed process must be gone before files can go. The
+        // parent client just exited; the Admin was closed before the
+        // handoff; this is the verification, not the mechanism.
+        if (!un::wait_install_dir_processes_gone(30000)) {
+            un::temp_log("helper: managed processes still running; removal blocked");
+            rc::update_to_action("Something went wrong.", "Try again");
+        } else {
+            un::reconcile_admin_update_residue();
+            if (un::remove_files(delete_data)) {
+                // 6-7. Files are gone; registrations go LAST, then the
+                // terminal state is verified and the latch cleared LAST.
+                un::remove_registrations(installed_exe);
+                std::error_code ec;
+                const bool clean =
+                    !std::filesystem::exists(vclient::paths::install_dir(), ec);
+                if (clean) {
+                    vclient::lifecycle::clear_uninstall_intent();
+                    un::temp_log("helper: uninstall complete; intent cleared");
+                    rc::update("VIRULE has been uninstalled.",
+                               delete_data ? "" : "Your local data was kept.");
+                    rc::wait_closed(12000);
+                    un::schedule_self_delete();
+                    return 0;
+                }
+            }
+            un::temp_log("helper: file removal did not complete; latch and registrations kept");
+            rc::update_to_action("Something went wrong.", "Try again");
+            un::temp_log(std::string("helper: failure card ") +
+                         (rc::is_visible() ? "visible" : "NOT visible"));
+        }
+
+        // Recoverable failure: intent latch kept, Apps & Features entry
+        // kept (registrations are only ever removed after success), user
+        // offered an explicit retry. Dismissing the card leaves the
+        // machine recoverable through Apps & Features or a fresh Setup.
+        for (;;) {
+            if (rc::take_action_clicked()) break;
+            if (!rc::is_visible()) {
+                un::temp_log("helper: failure card dismissed; leaving (retry via Apps & Features)");
+                un::schedule_self_delete();
+                return 1;
+            }
+            Sleep(250);
+        }
+        un::temp_log("helper: retry requested");
+        rc::wait_closed(3000); // reap the clicked card's thread
+        rc::show_working("Removing VIRULE\xE2\x80\xA6", "");
+    }
 }
 
 void serve(const std::string& initial_qa_token, bool register_protocol) {
@@ -186,7 +351,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         return vclient::admin_install::update_status_json();
     };
     callbacks.on_uninstall = [](bool delete_data) {
-        begin_uninstall_and_exit(delete_data);
+        begin_uninstall_async(delete_data);
     };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
@@ -201,6 +366,12 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     vclient::bridge::start(callbacks);
     g_state.store(RunState::Serving);
     vclient::log::client(std::string("serving, version ") + VIRULE_CLIENT_VERSION_STRING);
+
+    // Update-residue reconciliation: an interrupted update (crash, power
+    // loss, a cancelled uninstall) must not strand Admin.previous /
+    // Admin.staging / admin-download.zip in an ambiguous state. A stranded
+    // known-good Admin.previous with no live Admin\ is restored.
+    vclient::admin_install::reconcile_startup_residue();
 
     // Version recovery (the false-"up to date" fix): if a managed Admin
     // exists, its ACTUAL installed version is reconciled from the
@@ -301,7 +472,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (arg1 == L"--finish-uninstall") {
         unsigned long pid = 0;
         try { pid = std::stoul(arg2); } catch (...) {}
-        return vclient::uninstall::finish_uninstall(pid, delete_data_arg);
+        return run_finish_uninstall(pid, delete_data_arg);
     }
 
     // ---- Windows-initiated uninstall (Apps & Features / command line) ----
@@ -312,11 +483,36 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         // the removal destructive.
         bool delete_data = false;
         if (!vclient::uninstall_dialog::run(delete_data)) return 0;
-        // May be the installed exe itself: single instance must not block
-        // the removal. Ask a running instance to leave first.
-        (void)forward_to_running_instance("{\"type\":\"shutdown\"}");
-        Sleep(300);
-        if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) return 1;
+        // ONE ordered teardown owns the flow: a serving instance runs the
+        // whole sequence itself (intent latch, update cancellation,
+        // Admin-close-first, helper). This short-lived launcher only
+        // forwards the confirmed decision.
+        const std::string msg = std::string("{\"type\":\"uninstall_local\",") +
+            "\"delete_data\":" + (delete_data ? "true" : "false") + "}";
+        if (forward_to_running_instance(msg)) return 0;
+        // No serving instance: this process runs the pre-teardown steps
+        // itself. Intent FIRST, then Admin-close-first, then the helper.
+        if (!vclient::lifecycle::set_uninstall_intent()) return 1;
+        vclient::result_card::show_working("Removing VIRULE\xE2\x80\xA6", "");
+        vclient::uninstall::reconcile_admin_update_residue();
+        if (vclient::admin_install::admin_running()) {
+            if (!vclient::admin_install::close_running_admin(30000)) {
+                // Nothing was destroyed; the latch stays (self-heal keeps
+                // standing down) and Apps & Features remains the retry.
+                vclient::uninstall::temp_log(
+                    "uninstall: the Admin did not close; nothing removed");
+                vclient::result_card::update("Something went wrong.",
+                                             "Close VIRULE and try again.");
+                vclient::result_card::wait_closed(12000);
+                return 1;
+            }
+        }
+        if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) {
+            vclient::result_card::update("Something went wrong.",
+                                         "Try again in a moment.");
+            vclient::result_card::wait_closed(12000);
+            return 1;
+        }
         return 0;
     }
 
@@ -328,6 +524,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), line.data(),
                       (DWORD)line.size(), &written, nullptr);
         }
+        return 0;
+    }
+
+    // ---- the uninstall-intent gate ----
+    // EXPLICIT UNINSTALL WINS: while the durable intent latch is set, a
+    // freshly started client refuses to serve, register virule:// or do
+    // anything else that would fight the removal (a client started during
+    // the teardown would hold the very files the helper is removing). The
+    // helper mode and the --uninstall retry path were dispatched above;
+    // recovery from a stranded latch is an explicit gesture: retrying the
+    // uninstall, or a fresh Virule-Setup install (which clears the latch).
+    if (vclient::lifecycle::uninstall_intent_active()) {
+        vclient::uninstall::temp_log(
+            "client: uninstall intent active; refusing to start");
         return 0;
     }
 

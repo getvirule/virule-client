@@ -141,14 +141,17 @@ inline bool https_get(const wchar_t* host, const wchar_t* path, size_t max_bytes
 // cap comes from a trusted expectation (the manifest's declared size), and
 // running past it FAILS rather than truncates. The target file is written
 // fresh and removed on any failure. `on_progress` (may be empty) is invoked
-// per chunk so a long download can keep the process's activity clock alive.
+// per chunk so a long download can keep the process's activity clock alive;
+// returning false ABORTS the download (an explicit uninstall cancelling an
+// in-flight update must never wait out a 300MB transfer), which counts as
+// failure and removes the partial file.
 inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
                               unsigned long long max_bytes,
                               const std::filesystem::path& target,
                               unsigned long& status_out,
                               unsigned long long& size_out,
                               std::string& sha256_out,
-                              const std::function<void()>& on_progress) {
+                              const std::function<bool()>& on_progress) {
     status_out = 0;
     size_out = 0;
     sha256_out.clear();
@@ -216,7 +219,10 @@ inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
                                         break;
                                     }
                                     size_out += read;
-                                    if (on_progress) on_progress();
+                                    if (on_progress && !on_progress()) {
+                                        failed = true; // cancelled
+                                        break;
+                                    }
                                 }
                             }
                         }

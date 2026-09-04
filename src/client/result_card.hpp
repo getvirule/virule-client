@@ -69,7 +69,7 @@ constexpr UINT kMsgClose = WM_APP + 2;
 // constant; the card never opens anything else.
 constexpr wchar_t kSiteUrl[] = L"https://virule.app/";
 
-enum class Mode { Result, Working, Ready };
+enum class Mode { Result, Working, Ready, Action };
 
 // The Admin splash's two palettes (dark Graphite / light Fog), resolved
 // from the OS AppsUseLightTheme value the same way (missing = dark).
@@ -119,7 +119,9 @@ inline std::atomic<int> g_phase{ 0 }; // indeterminate bar position, 0..999
 inline std::mutex g_text_mutex;
 inline std::wstring g_primary;
 inline std::wstring g_secondary;
-inline RECT g_button{};          // Ready mode; window thread only
+inline std::wstring g_action_label;  // Action mode; under g_text_mutex
+inline std::atomic<bool> g_action_clicked{ false };
+inline RECT g_button{};          // Ready/Action modes; window thread only
 
 inline int qsc(int v) { return MulDiv(v, (int)g_dpi, 96); }
 
@@ -235,12 +237,19 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
                   DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
         SelectObject(mem, old_f);
         DeleteObject(f);
-    } else if (mode == Mode::Ready) {
+    } else if (mode == Mode::Ready || mode == Mode::Action) {
         // The ONE explicit action. Accent button, VIRULE's native grammar.
+        // Ready = the standalone Setup completion ("Continue"); Action = a
+        // recoverable lifecycle failure with its retry label.
         HFONT f = make_font(12, FW_SEMIBOLD);
         HGDIOBJ old_f = SelectObject(mem, f);
-        const wchar_t label[] = L"Continue";
-        const int label_len = (int)(sizeof(label) / sizeof(label[0])) - 1;
+        std::wstring label_str = L"Continue";
+        if (mode == Mode::Action) {
+            std::lock_guard<std::mutex> lock(g_text_mutex);
+            label_str = g_action_label;
+        }
+        const wchar_t* label = label_str.c_str();
+        const int label_len = (int)label_str.size();
         SIZE sz{};
         GetTextExtentPoint32W(mem, label, label_len, &sz);
         const int bw = sz.cx + qsc(56);
@@ -354,7 +363,8 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // outcome lands.
         if ((Mode)g_mode.load() == Mode::Result) {
             SetTimer(hwnd, kTimerClose, 10000, nullptr);
-        } else if ((Mode)g_mode.load() == Mode::Ready) {
+        } else if ((Mode)g_mode.load() == Mode::Ready ||
+                   (Mode)g_mode.load() == Mode::Action) {
             SetTimer(hwnd, kTimerClose, 120000, nullptr);
         }
         return 0;
@@ -373,6 +383,10 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // A Working card just received its outcome: dismissible now,
             // and it dismisses itself like any result.
             SetTimer(hwnd, kTimerClose, 10000, nullptr);
+        } else if ((Mode)g_mode.load() == Mode::Action) {
+            // A Working card resolved into a recoverable failure: the
+            // retry action stays available for a real while, still bounded.
+            SetTimer(hwnd, kTimerClose, 120000, nullptr);
         }
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -387,6 +401,12 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 open_site();
                 DestroyWindow(hwnd);
             }
+        } else if (mode == Mode::Action) {
+            POINT pt{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (PtInRect(&g_button, pt)) {
+                g_action_clicked.store(true);
+                DestroyWindow(hwnd);
+            }
         } else if (mode == Mode::Result) {
             DestroyWindow(hwnd);
         }
@@ -397,6 +417,13 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (mode == Mode::Ready) {
             if (wp == VK_RETURN) {
                 open_site();
+                DestroyWindow(hwnd);
+            } else if (wp == VK_ESCAPE) {
+                DestroyWindow(hwnd);
+            }
+        } else if (mode == Mode::Action) {
+            if (wp == VK_RETURN) {
+                g_action_clicked.store(true);
                 DestroyWindow(hwnd);
             } else if (wp == VK_ESCAPE) {
                 DestroyWindow(hwnd);
@@ -443,8 +470,9 @@ inline DWORD WINAPI thread_main(LPVOID) {
     const Mode mode = (Mode)g_mode.load();
     const bool branded = g_branded.load();
     const int w = branded ? qsc(340) : qsc(320);
-    const int h = branded ? (mode == Mode::Ready ? qsc(216) : qsc(200))
-                          : qsc(150);
+    const int h = branded
+        ? ((mode == Mode::Ready || mode == Mode::Action) ? qsc(216) : qsc(200))
+        : qsc(150);
     RECT work{ 0, 0, 0, 0 };
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int x = work.left + ((work.right - work.left) - w) / 2;
@@ -512,6 +540,7 @@ inline void start_thread(Mode mode, bool branded,
     g_mode.store((int)mode);
     g_branded.store(branded);
     g_phase.store(0);
+    g_action_clicked.store(false);
     g_thread = CreateThread(nullptr, 0, thread_main, nullptr, 0, nullptr);
 }
 
@@ -549,6 +578,37 @@ inline void update(const std::string& primary_utf8,
     g_mode.store((int)Mode::Result);
     if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
 }
+
+// Show a recoverable-failure card with ONE explicit action (the uninstall
+// helper's "Something went wrong." + Try again). The click sets a flag the
+// caller polls (take_action_clicked) instead of opening anything.
+inline void show_action(const std::string& primary_utf8,
+                        const std::string& action_label_utf8) {
+    {
+        std::lock_guard<std::mutex> lock(g_text_mutex);
+        g_action_label = widen_utf8(action_label_utf8);
+    }
+    start_thread(Mode::Action, /*branded=*/true, primary_utf8, "");
+}
+
+// Turn the visible card (a Working card whose operation failed) into the
+// recoverable-failure card in place. Safe from any thread.
+inline void update_to_action(const std::string& primary_utf8,
+                             const std::string& action_label_utf8) {
+    {
+        std::lock_guard<std::mutex> lock(g_text_mutex);
+        g_primary = widen_utf8(primary_utf8);
+        g_secondary.clear();
+        g_action_label = widen_utf8(action_label_utf8);
+    }
+    g_action_clicked.store(false);
+    g_mode.store((int)Mode::Action);
+    if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
+}
+
+// One-shot: the Action card's button was clicked (the card destroyed
+// itself on the click).
+inline bool take_action_clicked() { return g_action_clicked.exchange(false); }
 
 // True once the window actually exists on screen (the ownership invariant
 // waits on this before releasing the previous surface).

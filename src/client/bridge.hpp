@@ -169,6 +169,15 @@ inline std::atomic<int> g_listen_state{ 0 };
 inline std::atomic<SOCKET> g_listener{ INVALID_SOCKET };
 inline Callbacks g_callbacks;
 
+// UNINSTALL IN PROGRESS: the ordered teardown has begun. Every lifecycle
+// operation (admin_install / admin_launch / admin_open / QA / takeover) is
+// refused from here on, the status answer carries "uninstalling":true so
+// virule.app renders its Removing state from ground truth, and nothing may
+// start a new update or launch. Set only by the uninstall sequence;
+// cleared only when a pre-teardown failure (the Admin refused to close)
+// returns the client to normal service.
+inline std::atomic<bool> g_uninstalling{ false };
+
 // Activity clock for the idle-exit policy: any accepted connection or
 // handled message refreshes it.
 inline std::atomic<unsigned long long> g_last_activity_tick{ 0 };
@@ -279,6 +288,16 @@ inline bool broadcast_to_pages(const std::string& payload) {
 inline bool broadcast_qa_result(const std::string& token, const std::string& state) {
     return broadcast_to_pages("{\"type\":\"qa_result\",\"token\":\"" + token +
                               "\",\"state\":\"" + state + "\"}");
+}
+
+// Push one uninstall lifecycle transition to every connected page:
+// "removing" when the ordered teardown begins, "failed" when it stops
+// before any destruction (the Admin refused to close). Success has no
+// push by construction (the client exits and the helper owns the visible
+// outcome); the site reads sustained bridge absence as completion.
+inline bool broadcast_uninstall_state(const std::string& state) {
+    return broadcast_to_pages("{\"type\":\"uninstall_state\",\"state\":\"" +
+                              state + "\"}");
 }
 
 inline std::string b64(const unsigned char* data, size_t n) {
@@ -509,9 +528,19 @@ inline void handle_client(SOCKET client) {
                             "\",\"capabilities\":[\"qa\",\"admin\",\"uninstall\"],\"pages\":" +
                             std::to_string(open_page_count()) +
                             ",\"qa_last_s\":" + std::to_string(qa_last_s) +
+                            ",\"uninstalling\":" +
+                            (g_uninstalling.load() ? "true" : "false") +
                             ",\"admin\":" + admin + "}")) {
                 return;
             }
+        } else if (g_uninstalling.load() &&
+                   (type == "admin_install" || type == "admin_launch" ||
+                    type == "admin_open" || type == "qa_accept" ||
+                    type == "qa_verify_url" || type == "setup_takeover")) {
+            // ORDERED TEARDOWN: once an explicit uninstall has begun, no
+            // lifecycle operation is accepted any more (owner precedence
+            // rule 2026-09-04). The status answer carries the truth.
+            if (!reply(0x1, "{\"type\":\"error\"}")) return;
         } else if (type == "admin_install") {
             // The verified staged Admin install/update. The pipeline itself
             // is the authorization (approved manifest hash + Authenticode +
@@ -594,6 +623,13 @@ inline void handle_client(SOCKET client) {
             if (g_callbacks.on_qa_accept) g_callbacks.on_qa_accept(token);
             if (!reply(0x1, "{\"type\":\"accepted\"}")) return;
         } else if (type == "uninstall" && is_page) {
+            if (g_uninstalling.load()) {
+                // Already removing (a second tab, a double-send): JOIN the
+                // running teardown instead of spawning a second one. The
+                // fresh authorization is not consumed.
+                if (!reply(0x1, "{\"type\":\"uninstall_started\"}")) return;
+                continue;
+            }
             std::string nonce, timestamp, signature;
             (void)js::find_string_in(payload, 0, payload.size(), "nonce", nonce);
             (void)js::find_string_in(payload, 0, payload.size(), "timestamp", timestamp);
@@ -606,11 +642,31 @@ inline void handle_client(SOCKET client) {
                 if (!reply(0x1, "{\"type\":\"uninstall_started\"}")) return;
                 log::client(std::string("bridge: verified uninstall authorization accepted") +
                             (delete_data ? " (delete local data)" : " (keep local data)"));
+                // The ordered teardown runs asynchronously; this page
+                // connection stays open so the uninstall_state pushes
+                // reach it until the client exits.
                 if (g_callbacks.on_uninstall) g_callbacks.on_uninstall(delete_data);
-                return;
+                continue;
             }
             log::client("bridge: uninstall refused (invalid authorization)");
             if (!reply(0x1, "{\"type\":\"error\"}")) return;
+        } else if (type == "uninstall_local" && !is_page) {
+            // The Windows-initiated uninstall (Apps & Features) forwarding
+            // its confirmed removal to the serving instance, so ONE ordered
+            // teardown owns the whole flow. Local trust model: a local
+            // process could run --uninstall itself; the user confirmation
+            // already happened in the forwarding process's native dialog.
+            if (g_uninstalling.load()) {
+                if (!reply(0x1, "{\"type\":\"uninstall_started\"}")) return;
+                continue;
+            }
+            const bool delete_data =
+                payload.find("\"delete_data\":true") != std::string::npos;
+            if (!reply(0x1, "{\"type\":\"uninstall_started\"}")) return;
+            log::client(std::string("bridge: local uninstall accepted") +
+                        (delete_data ? " (delete local data)" : " (keep local data)"));
+            if (g_callbacks.on_uninstall) g_callbacks.on_uninstall(delete_data);
+            continue;
         } else if (type == "wake" && !is_page) {
             if (!reply(0x1, "{\"type\":\"ok\"}")) return;
         } else if (type == "shutdown" && !is_page) {
@@ -700,6 +756,18 @@ inline void start(const Callbacks& callbacks) {
 inline void stop_listening() {
     const SOCKET s = g_listener.exchange(INVALID_SOCKET);
     if (s != INVALID_SOCKET) closesocket(s);
+}
+
+// Recovery path for an uninstall whose %TEMP% helper could not be spawned
+// after the listener was already closed: reopen the listener so the
+// machine is not left with a live client no page can reach.
+inline void restart_listening() {
+    if (g_listener.load() != INVALID_SOCKET) return;
+    g_listen_state.store(0);
+    if (HANDLE h = CreateThread(nullptr, 0, listener_thread_main, nullptr, 0,
+                                nullptr)) {
+        CloseHandle(h);
+    }
 }
 
 // ---- loopback WebSocket client (talk to an already-running listener) ----
