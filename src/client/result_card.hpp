@@ -12,9 +12,10 @@
 // client is now the persistent machine manager and needs one consistent
 // branded surface for its transitional states - "Updating…",
 // "Finishing up…", "You're all set.", "VIRULE is ready" [Continue]. These
-// wear the Virule-Setup card grammar (yellow V mark, spaced wordmark, the
-// subtle indeterminate bar), so the ownership handoff Setup -> Client ->
-// Admin reads as one continuous VIRULE, never as unrelated windows.
+// wear the Virule-Setup card grammar (yellow V mark, the subtle
+// indeterminate bar; NO separate wordmark, owner correction 2026-09-04),
+// so the ownership handoff Setup -> Client -> Admin reads as one
+// continuous VIRULE, never as unrelated windows.
 //
 // Three modes:
 //
@@ -144,10 +145,10 @@ inline HFONT make_font(int size, int weight) {
                        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
 }
 
-// The branded lifecycle layout: V mark + spaced wordmark (the Virule-Setup
-// card grammar, measured TextOut because letter spacing is invisible to
-// DrawText's centering), headline, then the mode's own element (bar /
-// secondary line / action button).
+// The branded lifecycle layout: V mark, headline, then the mode's own
+// element (bar / secondary line / action button). NO separate wordmark
+// (owner correction 2026-09-04: the V mark + copy already say VIRULE;
+// repeating it as a header read as branding noise).
 inline void paint_branded(HDC mem, int w, int h, Mode mode,
                           const std::wstring& primary,
                           const std::wstring& secondary) {
@@ -173,29 +174,12 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
         SelectObject(mem, old_f);
         DeleteObject(f);
     }
-    // Wordmark.
-    {
-        HFONT f = make_font(15, FW_BOLD);
-        HGDIOBJ old_f = SelectObject(mem, f);
-        SetTextColor(mem, g_pal.word);
-        const int extra = qsc(4);
-        const wchar_t word[] = L"VIRULE";
-        const int word_len = (int)(sizeof(word) / sizeof(word[0])) - 1;
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, word, word_len, &sz);
-        const int total_w = sz.cx + extra * (word_len - 1);
-        SetTextCharacterExtra(mem, extra);
-        TextOutW(mem, (w - total_w) / 2, mark_y + mark + qsc(14), word, word_len);
-        SetTextCharacterExtra(mem, 0);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
-    }
     // Headline: one line, word color, fixed band so every state aligns.
     {
         HFONT f = make_font(13, FW_SEMIBOLD);
         HGDIOBJ old_f = SelectObject(mem, f);
         SetTextColor(mem, g_pal.word);
-        RECT tr{ qsc(26), qsc(118), w - qsc(26), qsc(142) };
+        RECT tr{ qsc(26), qsc(94), w - qsc(26), qsc(118) };
         DrawTextW(mem, primary.c_str(), (int)primary.size(), &tr,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         SelectObject(mem, old_f);
@@ -207,7 +191,7 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
         const int bar_w = qsc(168);
         const int bar_h = qsc(3);
         const int bar_x = (w - bar_w) / 2;
-        const int bar_y = qsc(160);
+        const int bar_y = qsc(136);
         {
             HBRUSH b = CreateSolidBrush(g_pal.line);
             RECT track{ bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
@@ -232,7 +216,7 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
         HFONT f = make_font(11, FW_NORMAL);
         HGDIOBJ old_f = SelectObject(mem, f);
         SetTextColor(mem, g_pal.muted);
-        RECT sr{ qsc(26), qsc(146), w - qsc(26), h - qsc(10) };
+        RECT sr{ qsc(26), qsc(122), w - qsc(26), h - qsc(10) };
         DrawTextW(mem, secondary.c_str(), (int)secondary.size(), &sr,
                   DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
         SelectObject(mem, old_f);
@@ -471,7 +455,7 @@ inline DWORD WINAPI thread_main(LPVOID) {
     const bool branded = g_branded.load();
     const int w = branded ? qsc(340) : qsc(320);
     const int h = branded
-        ? ((mode == Mode::Ready || mode == Mode::Action) ? qsc(216) : qsc(200))
+        ? ((mode == Mode::Ready || mode == Mode::Action) ? qsc(192) : qsc(176))
         : qsc(150);
     RECT work{ 0, 0, 0, 0 };
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);

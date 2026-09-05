@@ -207,6 +207,12 @@ inline void touch_qa_activity() { g_last_qa_tick.store(GetTickCount64()); }
 // thing - the browser owns the visible flow.
 inline std::atomic<bool> g_page_acked{ false };
 inline std::atomic<bool> g_page_drove{ false };
+// Which KIND of operation a page drove matters to the takeover's single
+// authoritative decision (P1 handoff correction 2026-09-04): a page-driven
+// admin_install becomes the native "Finishing up…" continuation, while
+// page-driven QA keeps the browser-owns-QA-UX doctrine. Sticky like the
+// flags above.
+inline std::atomic<bool> g_page_drove_admin{ false };
 
 // ---- page-connection registry (broadcast + liveness) ----
 struct PageConn {
@@ -600,7 +606,10 @@ inline void handle_client(SOCKET client) {
             if (g_callbacks.on_admin_install) {
                 const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
-                if (is_page) g_page_drove.store(true);
+                if (is_page) {
+                    g_page_drove.store(true);
+                    g_page_drove_admin.store(true);
+                }
                 g_callbacks.on_admin_install(shortcut, is_page);
                 if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
             } else {

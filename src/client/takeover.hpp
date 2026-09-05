@@ -16,39 +16,41 @@
 //   - a client-owned native card is visible (the QA continuation card, the
 //     Admin install card, or the standalone "VIRULE is ready" card).
 //
-// THE THREE TAKEOVER SHAPES (lifecycle continuity pass, 2026-09-03):
+// THE SINGLE AUTHORITATIVE DECISION (owner handoff rule, P1 final
+// correction 2026-09-04). A Setup takeover terminates in exactly ONE of
+// two native surfaces, and Setup is never released into neither:
 //
-//   QA_ACCEPT       the native continuation card "Finishing up…" ALWAYS
-//                   shows BEFORE Setup may close (owner spec: the user
-//                   watching Setup must never have to hunt for the
-//                   browser to learn whether VIRULE finished), then
-//                   becomes "You're all set." and closes itself. A live
-//                   page still receives the same result push and reaches
-//                   its own success state simultaneously; the card never
-//                   waits on the browser.
-//   INSTALL_ADMIN   browser alive -> the page drives admin_install and
-//                   shows its own progress. Browser gone -> the client
-//                   owns the install with a native progress card, and
-//                   launches the Admin when it completes.
-//   (no envelope)   a standalone / stale Setup run: there IS no
-//                   recoverable intent, and none is invented. The client
-//                   shows "VIRULE is ready" with the one explicit
-//                   [ Continue ] action (opens virule.app). Setup never
-//                   opens a browser; only that click does.
+//   PENDING INTENT EXISTS  ->  the native continuation "Finishing up…"
+//   NO PENDING INTENT      ->  the standalone "VIRULE is ready" card
 //
-// THE STANDALONE CONCLUSION IS REVOCABLE (P1 corrective pass 2026-09-04).
-// A browser-owned pending operation is INVISIBLE to this machine while no
-// page is talking (a closed or throttled virule.app tab holds its durable
-// INSTALL_ADMIN intent in browser storage), so "no envelope + no page for
-// the grace" can never be a positive proof of standalone-ness. The
-// measured incident: Setup transferred no envelope, the standalone card
-// showed at +10s, and the browser delivered its pending admin_install 18
-// seconds LATER - two surfaces claiming the same run. So any browser-owned
-// operation arriving at ANY point after a STANDALONE takeover
-// (a page-driven admin_install or qa_accept, or Setup's late-envelope
-// upgrade) SUPERSEDES the standalone conclusion: the watch stands down and
-// a standing "VIRULE is ready" card closes itself immediately - the page
-// owns the flow from that moment.
+// The existence of a live browser page does NOT waive the native
+// continuation: the page renders its own progress IN PARALLEL, it never
+// replaces the native surface. (The prior page-alive branches released
+// Setup quietly and the owner's real reinstall sat in native dead air for
+// the whole Admin installation.)
+//
+//   QA_ACCEPT       "Finishing up…" the moment Setup may close, then
+//                   "You're all set." and the card closes itself. A live
+//                   page still receives the result push and reaches its
+//                   own success state simultaneously.
+//   INSTALL_ADMIN   "Finishing up…" unconditionally, held until the Admin
+//                   installation completes and the Admin launches, then
+//                   the card closes. Envelope-driven and page-driven
+//                   installs converge on ONE operation (g_busy); the card
+//                   outlives whichever started it.
+//   (no envelope)   the watch waits a bounded grace for an operation to
+//                   identify itself (a late envelope upgrade, a
+//                   page-driven admin_install, native QA progress). One
+//                   arriving becomes the continuation; the grace expiring
+//                   with nothing is as positive a "no pending intent"
+//                   conclusion as this machine can ever reach, and the
+//                   standalone card shows. TERMINAL from then on - but
+//                   still REVOCABLE: a browser-owned operation arriving
+//                   late (a closed/throttled tab delivering its durable
+//                   intent) supersedes the standing card and closes it.
+//   (page-driven QA during the watch)  QA keeps its own browser/native
+//                   ownership doctrine (the page owns ALL visible
+//                   verification UX); the watch stands down quietly.
 //
 // INTENT, NEVER AUTHORIZATION: the envelope grants nothing. A QA token
 // still has to survive service redemption with this machine's proof; an
@@ -77,46 +79,25 @@
 
 namespace vclient::takeover {
 
-// How long the client watches for a live page before concluding the
-// browser is gone and providing native feedback itself. The page's
-// reconnect loop runs every 1.5 s and connects within a couple of
-// attempts; this is several.
-constexpr unsigned long long kPageGraceMs = 6000;
-
-// The standalone case watches a little longer (a slow page, a pending
-// permission ask, a virule://-driven flow) before showing the completion
-// card, because showing it to a user whose browser is mid-flow would be
-// wrong twice.
+// How long the standalone watch waits for a pending operation to identify
+// itself (a slow page, a pending permission ask, a virule://-driven flow)
+// before the no-intent conclusion becomes terminal.
 constexpr unsigned long long kStandaloneGraceMs = 10000;
+
+// A held operation never holds the continuation card forever: the Admin
+// package is large, but a whole multiple of the page's own install
+// timeout still bounds it.
+constexpr unsigned long long kContinuationHoldMs = 15ull * 60ull * 1000ull;
 
 inline std::atomic<bool> g_released{ false };
 inline std::mutex g_mutex;
 inline std::string g_op;               // "" until a takeover arrived
 inline std::atomic<bool> g_superseded{ false }; // standalone replaced by an op
+inline std::atomic<bool> g_standalone_terminal{ false }; // watch concluded
 
 inline bool released() { return g_released.load(); }
 
 inline void release() { g_released.store(true); }
-
-// A page is a ready feedback surface once it acknowledged its state or
-// drove the operation itself; a merely-connected page still counts after
-// the grace (it is rendering SOMETHING), which keeps older page builds and
-// odd orderings honest rather than stranding Setup.
-inline bool page_ready() {
-    return bridge::g_page_acked.load() || bridge::g_page_drove.load();
-}
-
-// Wait up to `grace_ms` for a live page. True = a page owns the flow.
-inline bool wait_for_page(unsigned long long grace_ms) {
-    const ULONGLONG deadline = GetTickCount64() + grace_ms;
-    for (;;) {
-        if (page_ready()) return true;
-        if (GetTickCount64() >= deadline) {
-            return bridge::open_page_count() > 0;
-        }
-        Sleep(150);
-    }
-}
 
 // Wait for the native card to actually exist before releasing Setup (the
 // invariant is about VISIBLE surfaces, not intentions).
@@ -175,20 +156,35 @@ inline void run_qa(const std::string& token) {
 // ---- INSTALL_ADMIN ----
 
 inline void run_admin(bool shortcut) {
-    if (wait_for_page(kPageGraceMs)) {
-        // The page owns the install UX: it hands admin_install over itself
-        // (its pending intent) and renders every state. Release Setup and
-        // step aside.
-        release();
-        return;
-    }
-    // Browser gone after handoff: the client owns the Admin installation
-    // with immediate native feedback, and the Admin itself is the final
-    // surface.
-    // The card is branded; the copy never repeats VIRULE (owner copy rule).
-    const bool updating = admin_install::admin_installed();
-    show_working_retry(updating ? "Updating\xE2\x80\xA6" : "Installing\xE2\x80\xA6");
+    // THE NATIVE CONTINUATION IS UNCONDITIONAL (owner handoff rule): Setup
+    // may close only into a ready native surface, and a live browser page
+    // does not waive that - it renders its own progress in parallel.
+    log::client("takeover: INSTALL_ADMIN; native continuation");
+    show_working_retry("Finishing up\xE2\x80\xA6");
     release_when_card_visible();
+
+    // Already present and current: the intent ("get VIRULE onto this
+    // machine") is satisfied by opening it; re-running the verified
+    // pipeline would re-download the whole package for nothing. Unknown
+    // versions never short-circuit (no currency claims from unknowns).
+    if (admin_install::admin_installed()) {
+        admin_install::refresh_update_check(admin_install::kUpdateCheckFreshMs);
+        std::string approved;
+        {
+            std::lock_guard<std::mutex> lock(admin_install::g_update_mutex);
+            approved = admin_install::g_approved_version;
+        }
+        const std::string installed = admin_install::authoritative_admin_version();
+        if (!approved.empty() && !installed.empty() &&
+            !admin_install::version_is_upgrade(approved, installed)) {
+            log::client("takeover: Admin already current; opening it");
+            (void)admin_install::open_installed_admin();
+            result_card::close();
+            release();
+            return;
+        }
+    }
+
     const std::string state = admin_install::run(shortcut);
     if (state == "installed") {
         // The fresh install launched the Admin: the Admin window IS the
@@ -199,8 +195,13 @@ inline void run_admin(bool shortcut) {
         (void)admin_install::open_installed_admin();
         result_card::close();
     } else if (state == "busy") {
-        // Another surface already owns a running operation; its own
-        // feedback covers this.
+        // The page's own admin_install won the start race; ONE operation
+        // runs either way, and this card holds until it finishes (a fresh
+        // install launches the Admin itself at completion).
+        const ULONGLONG deadline = GetTickCount64() + kContinuationHoldMs;
+        while (admin_install::g_busy.load() && GetTickCount64() < deadline) {
+            Sleep(300);
+        }
         result_card::close();
     } else {
         result_card::update("Something went wrong.", "Try again at virule.app.");
@@ -209,55 +210,88 @@ inline void run_admin(bool shortcut) {
     release();
 }
 
+// The STANDALONE watch identified a browser-driven Admin operation: the
+// same continuation surface, held until that (page-owned) operation ends.
+inline void run_admin_continuation() {
+    log::client("takeover: browser-owned Admin operation; native continuation");
+    show_working_retry("Finishing up\xE2\x80\xA6");
+    release_when_card_visible();
+    // The page's operation may still be spinning up (the drove flag
+    // precedes the busy flag by a thread hop); give it a moment to exist,
+    // then hold until it ends. A fresh install launches the Admin itself.
+    const ULONGLONG start_deadline = GetTickCount64() + 5000;
+    while (!admin_install::g_busy.load() &&
+           GetTickCount64() < start_deadline) {
+        Sleep(100);
+    }
+    const ULONGLONG deadline = GetTickCount64() + kContinuationHoldMs;
+    while (admin_install::g_busy.load() && GetTickCount64() < deadline) {
+        Sleep(300);
+    }
+    result_card::close();
+    release();
+}
+
 // ---- no envelope (standalone / stale Setup) ----
 
 inline void run_standalone() {
-    // A short watch: a slow live page, or a flow arriving through
-    // virule:// (QA activity), still gets to own the outcome. An op
-    // upgrade (Setup forwarding a late envelope) supersedes this thread.
+    // THE SINGLE AUTHORITATIVE DECISION: this watch terminates in exactly
+    // one of two surfaces - a pending operation's continuation, or the
+    // standalone completion card. It never releases Setup into neither
+    // (a merely-connected idle page is NOT an operation and no longer
+    // suppresses the card: with no pending intent anywhere, Ready +
+    // Continue IS the correct standalone experience).
     const ULONGLONG deadline = GetTickCount64() + kStandaloneGraceMs;
     for (;;) {
-        if (g_superseded.load()) return;
-        if (page_ready() || bridge::open_page_count() > 0) {
-            log::client("takeover: a page owns the flow; no native surface");
+        if (g_superseded.load()) return; // a late envelope owns the run
+        if (bridge::g_last_qa_tick.load() != 0) {
+            // A QA verification is being driven; QA's own browser/native
+            // ownership doctrine provides the surface (unchanged, on
+            // purpose - QA semantics are locked).
+            log::client("takeover: native QA progress owns the flow");
             release();
             return;
         }
-        if (bridge::g_last_qa_tick.load() != 0) {
-            // A QA verification is being driven natively; its own
-            // ownership logic (page push / result card) provides the
-            // surface.
-            log::client("takeover: native QA progress owns the flow");
-            release();
+        if (bridge::g_page_drove_admin.load() ||
+            admin_install::g_busy.load()) {
+            // A browser-driven Admin operation identified itself DURING
+            // the watch: pending intent exists, the continuation wins,
+            // and Ready/Continue never flashes first.
+            run_admin_continuation();
             return;
         }
         if (GetTickCount64() >= deadline) break;
         Sleep(200);
     }
-    if (g_superseded.load()) return;
-    // No recoverable intent exists, and none is invented: the standalone
-    // completion surface, with the one explicit way onward. The
-    // conclusion stays REVOCABLE: supersede_standalone() closes this card
-    // the moment a browser-owned operation surfaces.
+    // The grace expired with no operation: as positively as this machine
+    // can ever conclude, no pending intent exists. TERMINAL from here (a
+    // late browser-owned operation revokes the standing card through
+    // supersede_standalone).
+    g_standalone_terminal.store(true);
     log::client("takeover: standalone completion surface");
     result_card::show_ready();
     release_when_card_visible();
-    // A supersession that raced the card's creation still wins: the show
+    // A revocation that raced the card's creation still wins: the show
     // above is what it could not close yet.
-    if (g_superseded.load()) result_card::close();
+    if (g_superseded.load() || bridge::g_page_drove_admin.load() ||
+        admin_install::g_busy.load()) {
+        result_card::close();
+    }
 }
 
-// A browser-owned operation surfaced (a page drove admin_install or
-// qa_accept over the bridge, or Setup forwarded a late envelope): the
-// STANDALONE conclusion, if one was reached or is being reached, is
-// revoked. The pending watch stands down and a standing "VIRULE is
-// ready" card closes; the page owns the flow now. A no-op unless this
-// Setup run actually concluded standalone.
+// A browser-owned operation surfaced AFTER the standalone conclusion
+// became terminal (a closed/throttled tab delivering its durable intent
+// late): the standing "VIRULE is ready" card closes; the operation owns
+// the flow now. BEFORE the conclusion is terminal this is deliberately a
+// no-op - the watch itself converts a live arrival into the native
+// continuation (and Setup is still waiting on that thread's release, so
+// standing it down here would strand Setup with no surface at all).
 inline void supersede_standalone() {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (g_op != "STANDALONE") return;
-        if (g_superseded.exchange(true)) return; // already revoked
+        if (!g_standalone_terminal.load()) return; // the watch converts
+        if (g_superseded.exchange(true)) return;   // already revoked
     }
     log::client("takeover: standalone superseded by a browser-owned operation");
     result_card::close();

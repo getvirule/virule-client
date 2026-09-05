@@ -6,7 +6,8 @@
 // executable that flashes and disappears reads as nothing happened. So Setup
 // now says exactly what it is doing, in VIRULE's own native visual language
 // (the Admin splash / QA result card grammar: rounded dark card, yellow V
-// mark, spaced wordmark, one muted line), and nothing more.
+// mark, one muted line; NO separate wordmark - owner correction
+// 2026-09-04, the mark and the copy already say VIRULE), and nothing more.
 //
 // NOT A WIZARD. No pages, no Next/Back, no destination picker, no component
 // list, no license page, no technical terminology, no user choices of any
@@ -157,26 +158,9 @@ inline void paint(HWND hwnd) {
         DeleteObject(f);
     }
 
-    // Wordmark. Measured TextOut, not DrawText(DT_CENTER): letter spacing is
-    // invisible to DrawText's centering math (the Admin splash's finding).
-    {
-        HFONT f = CreateFontW(-sc(15), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        HGDIOBJ old_f = SelectObject(mem, f);
-        SetTextColor(mem, g_pal.word);
-        const int extra = sc(4);
-        const wchar_t word[] = L"VIRULE";
-        const int word_len = (int)(sizeof(word) / sizeof(word[0])) - 1;
-        SIZE sz{};
-        GetTextExtentPoint32W(mem, word, word_len, &sz);
-        const int total_w = sz.cx + extra * (word_len - 1);
-        SetTextCharacterExtra(mem, extra);
-        TextOutW(mem, (w - total_w) / 2, mark_y + mark + sc(14), word, word_len);
-        SetTextCharacterExtra(mem, 0);
-        SelectObject(mem, old_f);
-        DeleteObject(f);
-    }
+    // NO separate wordmark (owner correction 2026-09-04): the V mark and
+    // the status copy already say VIRULE; repeating it as a header read as
+    // branding noise.
 
     // The subtle activity treatment: one thin indeterminate bar, the same
     // language the browser's "Installing VIRULE..." view uses. It exists
@@ -185,7 +169,7 @@ inline void paint(HWND hwnd) {
         const int bar_w = sc(168);
         const int bar_h = sc(3);
         const int bar_x = (w - bar_w) / 2;
-        const int bar_y = sc(130);
+        const int bar_y = sc(100);
         {
             HBRUSH b = CreateSolidBrush(g_pal.line);
             RECT track{ bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
@@ -220,7 +204,7 @@ inline void paint(HWND hwnd) {
             nl == std::wstring::npos ? line : line.substr(0, nl);
         const std::wstring rest =
             nl == std::wstring::npos ? L"" : line.substr(nl + 1);
-        RECT tr{ sc(26), sc(152), w - sc(26), h - sc(14) };
+        RECT tr{ sc(26), sc(122), w - sc(26), h - sc(14) };
         if (rest.empty()) {
             HFONT f = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -325,7 +309,7 @@ inline DWORD WINAPI thread_main(LPVOID) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassW(&wc)) return 0;
 
-    const int w = sc(340), h = sc(200);
+    const int w = sc(340), h = sc(176);
     RECT work{ 0, 0, 0, 0 };
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     const int x = work.left + ((work.right - work.left) - w) / 2;

@@ -4,12 +4,17 @@
 // machine state (every spawned process gets LOCALAPPDATA pointed at a
 // throwaway directory; the client runs --no-register):
 //
-//   1. setup_takeover QA_ACCEPT with a live page: released only after the
-//      page's surface_ack, and the page receives the qa_result push.
-//   2. setup_takeover INSTALL_ADMIN with a live page: released on the
-//      page ack; the client steps aside (no admin_result push).
+//   1. setup_takeover QA_ACCEPT with a live page: the native "Finishing
+//      up…" continuation releases Setup, and the page receives the
+//      qa_result push in parallel.
+//   2. setup_takeover INSTALL_ADMIN with a live page: THE NATIVE
+//      CONTINUATION IS UNCONDITIONAL (P1 final handoff correction
+//      2026-09-04) - the client shows "Finishing up…" and RUNS the
+//      operation itself even though a page is connected; it never steps
+//      aside into native dead air.
 //   3. setup_takeover with NO envelope (standalone): released only after
-//      the grace watch, via the native "VIRULE is ready" card.
+//      the full grace watch, via the native "VIRULE is ready" card (a
+//      merely-connected idle page no longer suppresses it).
 //   4. Version recovery (the false-"up to date" fix): metadata file wins,
 //      state.json heals, and an UNKNOWN installed version never claims an
 //      update in either direction.
@@ -18,11 +23,15 @@
 //      envelope accept, install, takeover transfer, release, exit 0.
 //   6. THE STANDALONE CONCLUSION IS REVOCABLE (P1 corrective pass,
 //      2026-09-04; the measured 00:38 incident replayed): a STANDALONE
-//      takeover concludes with the ready card because no page talked
-//      during the grace, then a page arrives LATE and drives
-//      admin_install - the standalone conclusion must be superseded and
-//      the standing card must close, because the browser owned a pending
-//      INSTALL_ADMIN the whole time.
+//      takeover concludes with the ready card because no operation
+//      identified itself during the grace, then a page arrives LATE and
+//      drives admin_install - the standalone conclusion must be
+//      superseded and the standing card must close, because the browser
+//      owned a pending INSTALL_ADMIN the whole time.
+//   7. LATE INTENT DURING THE WATCH (P1 final handoff correction): a
+//      page-driven admin_install arriving BEFORE the standalone
+//      conclusion is terminal converts the watch into the native
+//      "Finishing up…" continuation; Ready/Continue never flashes first.
 //
 // Run: node tools/takeover_test.mjs           (builds must exist already)
 
@@ -261,11 +270,13 @@ async function main() {
     await stopClient();
   }
 
-  console.log("2. INSTALL_ADMIN takeover with a live page (client steps aside)");
+  console.log("2. INSTALL_ADMIN takeover with a live page (native continuation, no stepping aside)");
   {
     const root = path.join(SANDBOX, "b");
     fs.mkdirSync(root, { recursive: true });
     check("client starts (sandbox b)", await startClient(root));
+    const logFile = path.join(root, "VIRULE", "client", "logs", "virule-client.log");
+    const logNow = () => { try { return fs.readFileSync(logFile, "utf8"); } catch { return ""; } };
     const page = await connect();
     await page.next();
     const local = await connect({ origin: null });
@@ -273,12 +284,21 @@ async function main() {
     local.sendText('{"type":"setup_takeover","op":"INSTALL_ADMIN","shortcut":true}');
     const ack = await local.next();
     check("takeover acknowledged", !!ack && ack.includes('"takeover"'), ack ?? "none");
-    page.sendText('{"type":"surface_ack"}');
-    await page.next();
-    check("released after page ack", await pollReleased(local, 10000));
-    const stray = await page.next(4000);
-    check("no admin_result push (page owns the install)",
-      !stray || !stray.includes("admin_result"), stray ?? "none");
+    // Released only into the READY native surface (the card), page or no
+    // page - never quietly.
+    check("released via the native continuation", await pollReleased(local, 10000));
+    check("native continuation logged (never steps aside for the page)",
+      logNow().includes("takeover: INSTALL_ADMIN; native continuation"),
+      logNow().split("\n").slice(-5).join(" | "));
+    // The client RUNS the operation itself (the sandbox install is doomed
+    // against the real manifest; shut down before the download grows).
+    let opStarted = false;
+    for (let i = 0; i < 20 && !opStarted; i++) {
+      await sleep(250);
+      opStarted = logNow().includes("admin: install requested");
+    }
+    check("the client runs the Admin operation itself", opStarted,
+      logNow().split("\n").slice(-5).join(" | "));
     page.end();
     local.end();
     await stopClient();
@@ -298,21 +318,12 @@ async function main() {
     const released = await pollReleased(local, 20000);
     const elapsed = Date.now() - t0;
     check("released via the standalone card", released);
-    // A REAL virule.app page connected to the sandbox client (a browser
-    // tab open on the development machine, probing 47612) legitimately
-    // owns the flow and releases the takeover early - that is the product
-    // rule, not a defect. The grace-watch assertion therefore accepts
-    // either: the full watch ran, OR a page was connected at release.
-    let pagesAtRelease = 0;
-    {
-      local.sendText('{"type":"status"}');
-      const st = await local.next();
-      const m = /"pages":(\d+)/.exec(st ?? "");
-      pagesAtRelease = m ? Number(m[1]) : 0;
-    }
-    check("release respected the grace watch (>=9s, or a live page owned the flow)",
-      elapsed >= 9000 || pagesAtRelease > 0,
-      `${elapsed}ms, pages=${pagesAtRelease}`);
+    // The FULL grace watch always runs now (P1 final handoff correction):
+    // a merely-connected idle page - a real virule.app tab on the dev
+    // machine included - is not an operation and no longer suppresses or
+    // pre-empts the standalone conclusion.
+    check("release respected the full grace watch (>=9s)",
+      elapsed >= 9000, `${elapsed}ms`);
     local.end();
     await stopClient();
   }
@@ -513,17 +524,16 @@ async function main() {
     local.sendText('{"type":"setup_takeover"}');
     const ack = await local.next();
     check("takeover acknowledged", !!ack && ack.includes('"takeover"'), ack ?? "none");
-    // No page for the whole grace: the standalone card shows (the incident
-    // precondition - a closed/asleep browser holding a pending intent).
-    // A REAL virule.app tab on this machine connecting to the sandbox
-    // client would release early instead; detect that and still run the
-    // supersede assertion (which is the point of this scenario).
+    // No operation for the whole grace: the standalone card shows (the
+    // incident precondition - a closed/asleep browser holding a pending
+    // intent). An idle real virule.app tab connecting to the sandbox
+    // client changes nothing (not an operation).
     check("released (standalone conclusion reached)", await pollReleased(local, 20000));
     const logFile = path.join(root, "VIRULE", "client", "logs", "virule-client.log");
     const logNow = () => { try { return fs.readFileSync(logFile, "utf8"); } catch { return ""; } };
-    const concluded = logNow().includes("standalone completion surface");
-    check("standalone completion surface reached (or a live page owned the flow)",
-      concluded || logNow().includes("a page owns the flow"));
+    check("standalone completion surface reached",
+      logNow().includes("standalone completion surface"),
+      logNow().split("\n").slice(-5).join(" | "));
     // THE LATE BROWSER: a page connects and drives admin_install (the
     // pending INSTALL_ADMIN it held all along).
     const page = await connect();
@@ -531,18 +541,60 @@ async function main() {
     page.sendText('{"type":"admin_install","shortcut":false}');
     const started = await page.next();
     check("late admin_install accepted", !!started && started.includes("admin_install_started"), started ?? "none");
-    if (concluded) {
+    {
       let superseded = false;
       for (let i = 0; i < 20 && !superseded; i++) {
         await sleep(250);
         superseded = logNow().includes("standalone superseded by a browser-owned operation");
       }
       check("standalone conclusion superseded (card closed)", superseded, logNow().split("\n").slice(-6).join(" | "));
-    } else {
-      check("standalone conclusion superseded (card closed)", true, "early page release; no card existed to revoke");
     }
     // Shut down promptly: the (doomed) sandbox admin install must not keep
     // downloading the real package.
+    page.end();
+    local.end();
+    await stopClient();
+  }
+
+  console.log("7. intent arrives DURING the watch: continuation, never a Ready flash");
+  {
+    const root = path.join(SANDBOX, "g");
+    fs.mkdirSync(root, { recursive: true });
+    // Free the port for real (scenario 6's client may still be exiting).
+    for (let i = 0; i < 10; i++) {
+      try {
+        const c = await connect({ origin: null });
+        await c.next();
+        c.sendText('{"type":"shutdown"}');
+        await c.next(2000);
+        c.end();
+        await sleep(900);
+      } catch { break; }
+    }
+    check("client starts (sandbox g)", await startClient(root));
+    const logFile = path.join(root, "VIRULE", "client", "logs", "virule-client.log");
+    const logNow = () => { try { return fs.readFileSync(logFile, "utf8"); } catch { return ""; } };
+    const local = await connect({ origin: null });
+    await local.next();
+    local.sendText('{"type":"setup_takeover"}');
+    const ack = await local.next();
+    check("takeover acknowledged", !!ack && ack.includes('"takeover"'), ack ?? "none");
+    // ~2s into the 10s watch, the page's pending INSTALL_ADMIN arrives.
+    await sleep(2000);
+    const page = await connect();
+    await page.next();
+    page.sendText('{"type":"admin_install","shortcut":false}');
+    const started = await page.next();
+    check("mid-watch admin_install accepted",
+      !!started && started.includes("admin_install_started"), started ?? "none");
+    check("released via the continuation", await pollReleased(local, 15000));
+    check("continuation surface logged (intent won the watch)",
+      logNow().includes("browser-owned Admin operation; native continuation"),
+      logNow().split("\n").slice(-5).join(" | "));
+    check("Ready/Continue never flashed",
+      !logNow().includes("standalone completion surface"),
+      logNow().split("\n").slice(-5).join(" | "));
+    // Shut down promptly (the doomed sandbox install again).
     page.end();
     local.end();
     await stopClient();
