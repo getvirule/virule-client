@@ -546,7 +546,10 @@ async function main() {
 
   if (server) server.close();
   await freePort();
-  fs.rmSync(SANDBOX, { recursive: true, force: true });
+  for (let i = 0; i < 30; i++) {
+    try { fs.rmSync(SANDBOX, { recursive: true, force: true }); break; }
+    catch { await sleep(500); }
+  }
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }
