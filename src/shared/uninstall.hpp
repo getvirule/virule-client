@@ -126,6 +126,11 @@ inline void temp_log(const std::string& what) {
 
 inline void register_uninstall_entry(const std::wstring& exe_path,
                                      const std::wstring& version) {
+    // HKCU is REAL machine state even when the filesystem world is
+    // redirected: a sandboxed test run must never stamp throwaway paths
+    // into the user's Apps & Features entry (the P3 contamination fix;
+    // paths.hpp environment_redirected records the incident).
+    if (paths::environment_redirected()) return;
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kUninstallKey, 0, nullptr, 0,
                         KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {

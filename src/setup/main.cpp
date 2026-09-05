@@ -518,7 +518,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     // 6. Per-user registration: virule:// and the uninstall entry. The
     // installed client is the canonical virule:// handler; the VIRULE Admin
-    // defers to it rather than taking the scheme back.
+    // defers to it rather than taking the scheme back. Both registration
+    // functions refuse on their own under a redirected (test-sandbox)
+    // environment; the log line records why nothing was written.
+    if (vclient::paths::environment_redirected()) {
+        vclient::log::setup("redirected environment (test sandbox): machine registrations skipped");
+    }
     vclient::protocol_reg::register_protocol(target.wstring());
     vclient::uninstall::register_uninstall_entry(
         target.wstring(), widen(manifest.version));

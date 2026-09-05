@@ -655,6 +655,13 @@ inline void refresh_installed_identity() {
         s.installed_version = VIRULE_CLIENT_VERSION_STRING;
         (void)state::save(s);
     }
+    // A redirected (test-sandbox) world heals only its own filesystem
+    // mirror above; the registry is the real machine's and stays untouched.
+    // The "ours" check below is no defense there: a contaminated entry's
+    // UninstallString names the SANDBOX exe, which IS the sandboxed
+    // client's own installed_client_exe, so it once "healed" DisplayVersion
+    // on the real entry (the P3 contamination incident's second writer).
+    if (paths::environment_redirected()) return;
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, uninstall::kUninstallKey, 0,
                       KEY_SET_VALUE | KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {

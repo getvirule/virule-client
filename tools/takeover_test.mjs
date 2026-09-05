@@ -50,6 +50,25 @@ const SANDBOX = path.join(repo, "build", "takeover-test-sandbox");
 const PORT = 47612;
 const HANDOFF_PORT = 47613;
 
+// REGISTRY CAVEAT (P3 ARP contamination fix, 2026-09-05): sandboxEnv
+// redirects only the FILESYSTEM; HKCU is always the real user's hive. A
+// pre-fix run of scenario 5 stamped this sandbox's paths into the real
+// Apps & Features entry. The product now refuses machine registrations
+// from a redirected environment, and this harness proves it stays that
+// way: the real entry is snapshotted up front and must be byte-identical
+// after the Setup end-to-end scenario and at the end of the run.
+const ARP_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ViruleClient";
+function readRealArp() {
+  try {
+    return execFileSync("reg.exe", ["query", ARP_KEY, "/s"], { encoding: "utf8" });
+  } catch { return null; } // absent is a legitimate real state
+}
+function checkArpUntouched(snapshot, when) {
+  const now = readRealArp();
+  check(`real ARP entry untouched (${when})`, now === snapshot,
+    now === snapshot ? "" : `real entry changed:\n${now ?? "ABSENT"}`);
+}
+
 let pass = 0;
 let fail = 0;
 function check(name, ok, detail = "") {
@@ -223,6 +242,8 @@ const FAKE_TOKEN = "Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4z"; // 32-char Base64URL gram
 async function main() {
   fs.rmSync(SANDBOX, { recursive: true, force: true });
   fs.mkdirSync(SANDBOX, { recursive: true });
+
+  const arpSnapshot = readRealArp();
 
   // Make sure no other client holds the port (a real installed client, an
   // earlier test run). Asking it to shut down is non-destructive: it is an
@@ -499,6 +520,10 @@ async function main() {
       c.end();
     } catch { /* gone */ }
     server.close();
+    // The scenario that once contaminated the real machine: the sandboxed
+    // Setup registered, the sandboxed client refreshed. Neither may have
+    // touched the real entry.
+    checkArpUntouched(arpSnapshot, "after sandboxed Setup end to end");
   }
 
   console.log("6. standalone conclusion revoked by a LATE page-driven admin_install");
@@ -610,6 +635,8 @@ async function main() {
       break;
     } catch { /* retry */ }
   }
+
+  checkArpUntouched(arpSnapshot, "end of run");
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);

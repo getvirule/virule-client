@@ -12,6 +12,8 @@
 #include <optional>
 #include <string>
 
+#include "shared/paths.hpp"
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -39,6 +41,10 @@ inline void set_reg_string(const wchar_t* subkey, const wchar_t* name,
 
 // Register virule:// to launch `exe_path` (defaults to this executable).
 inline void register_protocol(const std::wstring& exe_path_in = L"") {
+    // Same machine-registration guard as the Apps & Features entry: HKCU
+    // is the real hive even under a redirected (test-sandbox) filesystem
+    // world, so a sandboxed run never rewrites the real virule:// handler.
+    if (paths::environment_redirected()) return;
     std::wstring exe_path = exe_path_in;
     if (exe_path.empty()) {
         wchar_t exe[MAX_PATH] = {};

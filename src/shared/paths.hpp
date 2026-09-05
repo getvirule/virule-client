@@ -60,6 +60,41 @@ inline std::filesystem::path local_appdata() {
     return {};
 }
 
+// MACHINE-REGISTRATION GUARD (P3 ARP contamination fix, 2026-09-05). Test
+// harnesses sandbox the FILESYSTEM world by pointing LOCALAPPDATA at a
+// throwaway tree, but HKCU is always the real user's hive: a sandboxed run
+// that writes a per-user machine registration (the Apps & Features entry,
+// virule://) stamps its throwaway paths into the REAL registry. That
+// happened: takeover_test scenario 5's sandboxed Virule-Setup left the real
+// VIRULE uninstall entry pointing into build\takeover-test-sandbox. Every
+// registration WRITE therefore refuses when this answers true. True = the
+// env-resolved local appdata is not the OS-known per-user folder (the shell
+// known folder ignores the env override, so a redirected world is a
+// definite mismatch). Fails open (false) when the shell cannot answer, so a
+// real install never loses its registration to an API hiccup. Removal paths
+// are deliberately NOT guarded: uninstall semantics are unchanged, and
+// uninstall_lifecycle_test.mjs owns its documented snapshot/restore.
+inline bool environment_redirected() {
+    const auto resolved = local_appdata();
+    if (resolved.empty()) return false;
+    PWSTR known = nullptr;
+    bool redirected = false;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr,
+                                       &known)) && known) {
+        auto canon = [](std::wstring s) {
+            for (wchar_t& c : s) {
+                if (c == L'/') c = L'\\';
+                c = (wchar_t)towlower(c);
+            }
+            while (!s.empty() && s.back() == L'\\') s.pop_back();
+            return s;
+        };
+        redirected = canon(resolved.wstring()) != canon(std::wstring(known));
+    }
+    if (known) CoTaskMemFree(known);
+    return redirected;
+}
+
 // %LOCALAPPDATA%\VIRULE - the shared VIRULE user-data root.
 inline std::filesystem::path virule_data_root() {
     const auto base = local_appdata();
