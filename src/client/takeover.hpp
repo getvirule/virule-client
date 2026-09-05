@@ -36,6 +36,20 @@
 //                   [ Continue ] action (opens virule.app). Setup never
 //                   opens a browser; only that click does.
 //
+// THE STANDALONE CONCLUSION IS REVOCABLE (P1 corrective pass 2026-09-04).
+// A browser-owned pending operation is INVISIBLE to this machine while no
+// page is talking (a closed or throttled virule.app tab holds its durable
+// INSTALL_ADMIN intent in browser storage), so "no envelope + no page for
+// the grace" can never be a positive proof of standalone-ness. The
+// measured incident: Setup transferred no envelope, the standalone card
+// showed at +10s, and the browser delivered its pending admin_install 18
+// seconds LATER - two surfaces claiming the same run. So any browser-owned
+// operation arriving at ANY point after a STANDALONE takeover
+// (a page-driven admin_install or qa_accept, or Setup's late-envelope
+// upgrade) SUPERSEDES the standalone conclusion: the watch stands down and
+// a standing "VIRULE is ready" card closes itself immediately - the page
+// owns the flow from that moment.
+//
 // INTENT, NEVER AUTHORIZATION: the envelope grants nothing. A QA token
 // still has to survive service redemption with this machine's proof; an
 // Admin install still runs the verified manifest/signature pipeline.
@@ -222,10 +236,31 @@ inline void run_standalone() {
     }
     if (g_superseded.load()) return;
     // No recoverable intent exists, and none is invented: the standalone
-    // completion surface, with the one explicit way onward.
+    // completion surface, with the one explicit way onward. The
+    // conclusion stays REVOCABLE: supersede_standalone() closes this card
+    // the moment a browser-owned operation surfaces.
     log::client("takeover: standalone completion surface");
     result_card::show_ready();
     release_when_card_visible();
+    // A supersession that raced the card's creation still wins: the show
+    // above is what it could not close yet.
+    if (g_superseded.load()) result_card::close();
+}
+
+// A browser-owned operation surfaced (a page drove admin_install or
+// qa_accept over the bridge, or Setup forwarded a late envelope): the
+// STANDALONE conclusion, if one was reached or is being reached, is
+// revoked. The pending watch stands down and a standing "VIRULE is
+// ready" card closes; the page owns the flow now. A no-op unless this
+// Setup run actually concluded standalone.
+inline void supersede_standalone() {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_op != "STANDALONE") return;
+        if (g_superseded.exchange(true)) return; // already revoked
+    }
+    log::client("takeover: standalone superseded by a browser-owned operation");
+    result_card::close();
 }
 
 // ---- entry (bridge callback) ----

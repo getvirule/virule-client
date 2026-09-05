@@ -286,6 +286,9 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
 
     vclient::bridge::Callbacks callbacks;
     callbacks.on_qa_accept = [](const std::string& token) {
+        // A page is driving the redemption: any standalone Setup
+        // conclusion is revoked (the browser owns the flow).
+        vclient::takeover::supersede_standalone();
         // Redemption runs off the connection thread; the flow pushes its
         // result to watching pages (or the Admin bridge, or the card).
         struct Arg { std::string token; };
@@ -308,7 +311,12 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         // caller is the Admin's own Settings Update: the client owns the
         // visible feedback there (the native "Updating…" card after the
         // Admin closes - the dead-air fix); a page-driven operation leaves
-        // the visible flow to the page.
+        // the visible flow to the page - and REVOKES any standalone Setup
+        // conclusion (P1 2026-09-04: a browser that was asleep or closed
+        // during the takeover grace delivers its pending INSTALL_ADMIN
+        // late; the page owns the flow from that moment and a standing
+        // "VIRULE is ready" card must close, never stand beside it).
+        if (from_page) vclient::takeover::supersede_standalone();
         struct Arg { bool shortcut; bool native_feedback; };
         auto* arg = new Arg{ shortcut, !from_page };
         HANDLE h = CreateThread(nullptr, 0,

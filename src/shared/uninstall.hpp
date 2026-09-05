@@ -29,7 +29,9 @@
 // integration and PRESERVES every piece of user-owned VIRULE data:
 //   - %LOCALAPPDATA%\VIRULE\client\           (client software state)
 //   - %LOCALAPPDATA%\Programs\VIRULE\         (client + managed Admin\)
-//   - the desktop VIRULE.lnk ONLY when the client created it
+//   - the desktop / Start Menu VIRULE.lnk when VIRULE-owned: recorded
+//     provenance OR a stored target inside the managed install tree
+//     (never a VIRULE-named shortcut pointing elsewhere)
 //   - virule:// ONLY while it points into the removed tree
 //   - the HKCU uninstall entry
 //   - %LOCALAPPDATA%\VIRULE\ itself only if left empty
@@ -84,6 +86,11 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <objbase.h>
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 #endif
 
 namespace vclient::uninstall {
@@ -257,6 +264,50 @@ inline bool remove_tree_with_retries(const std::filesystem::path& p,
     return !std::filesystem::exists(p, ec);
 }
 
+// ---- shortcut ownership (P1 corrective pass 2026-09-04) ----
+
+// Does this .lnk's STORED target path point into the managed VIRULE
+// install tree (%LOCALAPPDATA%\Programs\VIRULE\...: the managed
+// virule.exe, virule-client.exe, anything under Admin\)? SLGP_RAWPATH
+// reads the stored path without shell resolution, so the answer is
+// correct even after the target files were already removed. False for a
+// missing/unreadable shortcut and for anything pointing elsewhere.
+inline bool shortcut_targets_managed_install(const std::filesystem::path& lnk) {
+    if (lnk.empty()) return false;
+    std::error_code ec;
+    if (!std::filesystem::exists(lnk, ec) || ec) return false;
+
+    std::wstring prefix = paths::install_dir().wstring();
+    if (prefix.empty()) return false;
+    if (prefix.back() != L'\\') prefix += L'\\';
+    for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
+
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninit = SUCCEEDED(init);
+    bool owned = false;
+    IShellLinkW* link = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_IShellLinkW, (void**)&link))) {
+        IPersistFile* file = nullptr;
+        if (SUCCEEDED(link->QueryInterface(IID_IPersistFile, (void**)&file))) {
+            if (SUCCEEDED(file->Load(lnk.wstring().c_str(), STGM_READ))) {
+                wchar_t target[MAX_PATH * 2] = {};
+                if (SUCCEEDED(link->GetPath(target,
+                                            (int)(sizeof(target) / sizeof(target[0])),
+                                            nullptr, SLGP_RAWPATH))) {
+                    std::wstring path(target);
+                    for (wchar_t& c : path) c = (wchar_t)towlower(c);
+                    if (!path.empty() && path.rfind(prefix, 0) == 0) owned = true;
+                }
+            }
+            file->Release();
+        }
+        link->Release();
+    }
+    if (uninit) CoUninitialize();
+    return owned;
+}
+
 // FILES ONLY: the software-owned files and directories. Registrations are
 // deliberately NOT touched here; they go last, through
 // remove_registrations(), and only after this reports success. True = the
@@ -266,10 +317,27 @@ inline bool remove_files(bool delete_data) {
     const state::State s = state::load();
     std::error_code ec;
 
-    // The desktop shortcut, ONLY when this client created it (a shortcut
-    // the user made themselves stays, in both modes).
-    if (s.created_desktop_shortcut) {
-        remove_file_quiet(paths::desktop_shortcut());
+    // VIRULE-owned shortcuts. A shortcut is VIRULE-owned when this client
+    // recorded creating it (state.json provenance) OR when its stored
+    // target resolves into the managed install tree (the target-based
+    // supplement: a 2026-09-04 incident destroyed the provenance record
+    // and a real uninstall then stranded the shortcut). A VIRULE-named
+    // shortcut pointing anywhere else is the user's and stays, in both
+    // modes. Desktop first, then any Start Menu VIRULE shortcut
+    // (target-owned only; the client never creates one, so it has no
+    // provenance by definition).
+    {
+        const auto desktop = paths::desktop_shortcut();
+        if (s.created_desktop_shortcut ||
+            shortcut_targets_managed_install(desktop)) {
+            remove_file_quiet(desktop);
+            temp_log("removed desktop shortcut (VIRULE-owned)");
+        }
+        const auto start_menu = paths::start_menu_shortcut();
+        if (shortcut_targets_managed_install(start_menu)) {
+            remove_file_quiet(start_menu);
+            temp_log("removed Start Menu shortcut (VIRULE-owned)");
+        }
     }
 
     // The client state directory (state.json, client logs): software

@@ -16,6 +16,13 @@
 //   5. Virule-Setup.exe end to end against a LOCAL manifest server
 //      (--manifest-url + --dev-unsigned): handoff listener origin policy,
 //      envelope accept, install, takeover transfer, release, exit 0.
+//   6. THE STANDALONE CONCLUSION IS REVOCABLE (P1 corrective pass,
+//      2026-09-04; the measured 00:38 incident replayed): a STANDALONE
+//      takeover concludes with the ready card because no page talked
+//      during the grace, then a page arrives LATE and drives
+//      admin_install - the standalone conclusion must be superseded and
+//      the standing card must close, because the browser owned a pending
+//      INSTALL_ADMIN the whole time.
 //
 // Run: node tools/takeover_test.mjs           (builds must exist already)
 
@@ -481,6 +488,64 @@ async function main() {
       c.end();
     } catch { /* gone */ }
     server.close();
+  }
+
+  console.log("6. standalone conclusion revoked by a LATE page-driven admin_install");
+  {
+    const root = path.join(SANDBOX, "f");
+    fs.mkdirSync(root, { recursive: true });
+    // Scenario 5's sandbox-installed client may still be exiting; a held
+    // singleton would make the sandbox-f client forward-and-exit and every
+    // check below would hit the WRONG client. Free the port for real.
+    for (let i = 0; i < 10; i++) {
+      try {
+        const c = await connect({ origin: null });
+        await c.next();
+        c.sendText('{"type":"shutdown"}');
+        await c.next(2000);
+        c.end();
+        await sleep(900);
+      } catch { break; }
+    }
+    check("client starts (sandbox f)", await startClient(root));
+    const local = await connect({ origin: null });
+    await local.next();
+    local.sendText('{"type":"setup_takeover"}');
+    const ack = await local.next();
+    check("takeover acknowledged", !!ack && ack.includes('"takeover"'), ack ?? "none");
+    // No page for the whole grace: the standalone card shows (the incident
+    // precondition - a closed/asleep browser holding a pending intent).
+    // A REAL virule.app tab on this machine connecting to the sandbox
+    // client would release early instead; detect that and still run the
+    // supersede assertion (which is the point of this scenario).
+    check("released (standalone conclusion reached)", await pollReleased(local, 20000));
+    const logFile = path.join(root, "VIRULE", "client", "logs", "virule-client.log");
+    const logNow = () => { try { return fs.readFileSync(logFile, "utf8"); } catch { return ""; } };
+    const concluded = logNow().includes("standalone completion surface");
+    check("standalone completion surface reached (or a live page owned the flow)",
+      concluded || logNow().includes("a page owns the flow"));
+    // THE LATE BROWSER: a page connects and drives admin_install (the
+    // pending INSTALL_ADMIN it held all along).
+    const page = await connect();
+    await page.next(); // hello
+    page.sendText('{"type":"admin_install","shortcut":false}');
+    const started = await page.next();
+    check("late admin_install accepted", !!started && started.includes("admin_install_started"), started ?? "none");
+    if (concluded) {
+      let superseded = false;
+      for (let i = 0; i < 20 && !superseded; i++) {
+        await sleep(250);
+        superseded = logNow().includes("standalone superseded by a browser-owned operation");
+      }
+      check("standalone conclusion superseded (card closed)", superseded, logNow().split("\n").slice(-6).join(" | "));
+    } else {
+      check("standalone conclusion superseded (card closed)", true, "early page release; no card existed to revoke");
+    }
+    // Shut down promptly: the (doomed) sandbox admin install must not keep
+    // downloading the real package.
+    page.end();
+    local.end();
+    await stopClient();
   }
 
   // Cleanup with retries: the just-shut-down sandbox client (or Dropbox

@@ -122,8 +122,12 @@ inline std::filesystem::path admin_download_zip() {
 }
 
 // The desktop shortcut the client creates for the installed Admin when the
-// browser's install intent asked for one. Removed by uninstall ONLY when
-// client-created (state.json provenance).
+// browser's install intent asked for one. Removed by uninstall when
+// client-created (state.json provenance) OR when its stored target
+// resolves into the managed install tree (P1 corrective pass 2026-09-04:
+// provenance can be lost - a pre-fix incident destroyed state.json - so
+// target-based ownership supplements it; a shortcut pointing anywhere
+// else is the user's and stays).
 inline std::filesystem::path desktop_shortcut() {
     PWSTR desktop = nullptr;
     std::filesystem::path out;
@@ -131,6 +135,20 @@ inline std::filesystem::path desktop_shortcut() {
         out = std::filesystem::path(desktop) / L"VIRULE.lnk";
     }
     if (desktop) CoTaskMemFree(desktop);
+    return out;
+}
+
+// The per-user Start Menu Programs location a VIRULE shortcut would live
+// at. The client does not currently create one, but uninstall still
+// removes a VIRULE.lnk here when its target resolves into the managed
+// install tree (same target-based ownership rule as the desktop).
+inline std::filesystem::path start_menu_shortcut() {
+    PWSTR programs = nullptr;
+    std::filesystem::path out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &programs))) {
+        out = std::filesystem::path(programs) / L"VIRULE.lnk";
+    }
+    if (programs) CoTaskMemFree(programs);
     return out;
 }
 

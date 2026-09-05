@@ -29,6 +29,14 @@
 //      completes the removal.
 //   7. SETUP SUPERSEDES A STALE LATCH: an explicit install clears the
 //      uninstall intent, and the freshly installed client serves.
+//   8. SHORTCUT OWNERSHIP (P1 corrective pass 2026-09-04): a desktop
+//      VIRULE.lnk is removed when provenance-known (A) OR when its stored
+//      target resolves into the managed install tree despite lost
+//      provenance (B), and preserved when it points somewhere unrelated
+//      (C). The desktop known folder is registry-resolved (not
+//      env-sandboxable), so this scenario TEMPORARILY redirects the HKCU
+//      User Shell Folders Desktop value into the sandbox and restores the
+//      exact prior values afterwards.
 //
 // Run: node tools/uninstall_lifecycle_test.mjs   (builds must exist)
 
@@ -687,6 +695,115 @@ async function main() {
       // Setup registered the sandbox exe + real ARP entry; clean both up
       // (the real installed client re-heals virule:// on its next serve).
       removeArp();
+    }
+    clearLatch();
+    closeResultCard();
+    console.log("8. shortcut ownership: provenance/managed-target removed, unrelated preserved");
+    {
+      // Redirect the Desktop known folder into the sandbox for this
+      // scenario only. Snapshot the exact current values first; restore in
+      // finally no matter what.
+      const desktopSandbox = path.join(SANDBOX, "desktop");
+      fs.mkdirSync(desktopSandbox, { recursive: true });
+      const USF = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders";
+      const SF = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders";
+      const readDesktopValue = (key) => {
+        try {
+          const out = execFileSync("reg.exe", ["query", key, "/v", "Desktop"],
+            { stdio: "pipe" }).toString();
+          const m = /Desktop\s+(REG_[A-Z_]+)\s+(.+)\r?\n/.exec(out);
+          return m ? { type: m[1], data: m[2].trim() } : null;
+        } catch { return null; }
+      };
+      const writeDesktopValue = (key, v) => {
+        execFileSync("reg.exe", ["add", key, "/v", "Desktop", "/t", v.type,
+          "/d", v.data, "/f"], { stdio: "pipe" });
+      };
+      const prevUsf = readDesktopValue(USF);
+      const prevSf = readDesktopValue(SF);
+      const makeLnk = (target) => {
+        const lnk = path.join(desktopSandbox, "VIRULE.lnk");
+        execFileSync("powershell.exe", ["-NoProfile", "-Command",
+          `$s=(New-Object -ComObject WScript.Shell).CreateShortcut('${lnk}');` +
+          `$s.TargetPath='${target}';$s.Save()`], { stdio: "pipe" });
+        return lnk;
+      };
+      const runDefaultUninstall = async (root) => {
+        const local = await connect({ origin: null });
+        await local.next();
+        await requireSandbox(local, '"version":"1.0.0-test"', "pre-uninstall");
+        local.sendText('{"type":"uninstall_local","delete_data":false}');
+        const started = await local.next();
+        const ok = !!started && started.includes("uninstall_started");
+        local.end();
+        return ok;
+      };
+      if (!prevUsf) {
+        check("desktop redirect prerequisites (User Shell Folders readable)", false);
+      } else {
+        try {
+          writeDesktopValue(USF, { type: prevUsf.type, data: desktopSandbox });
+          if (prevSf) writeDesktopValue(SF, { type: prevSf.type, data: desktopSandbox });
+
+          // A. provenance-known managed shortcut: removed.
+          {
+            const root = path.join(SANDBOX, "h1");
+            const { programs } = makeInstallTree(root);
+            const clientDir = path.join(root, "VIRULE", "client");
+            fs.mkdirSync(clientDir, { recursive: true });
+            fs.writeFileSync(path.join(clientDir, "state.json"),
+              '{"version":1,"created_dev_machine_cred":false,"installed_version":"0.6.4","admin_version":"1.0.0-test","created_desktop_shortcut":true}');
+            const lnk = makeLnk(path.join(programs, "Admin", "virule.exe"));
+            createArp();
+            check("client starts (sandbox h1)", await startClient(root));
+            check("uninstall accepted (A)", await runDefaultUninstall(root));
+            check("software removed (A)", await waitFor(() => !fs.existsSync(programs), 40000));
+            check("A: provenance-known shortcut REMOVED",
+              await waitFor(() => !fs.existsSync(lnk), 10000));
+            await waitFor(() => !latchSet(), 10000);
+            await stopClient();
+          }
+
+          // B. provenance LOST, target inside the managed tree: removed
+          // (the owner's real 2026-09-04 residue case).
+          {
+            const root = path.join(SANDBOX, "h2");
+            const { programs } = makeInstallTree(root);
+            const lnk = makeLnk(path.join(programs, "Admin", "virule.exe"));
+            createArp();
+            check("client starts (sandbox h2)", await startClient(root));
+            check("uninstall accepted (B)", await runDefaultUninstall(root));
+            check("software removed (B)", await waitFor(() => !fs.existsSync(programs), 40000));
+            check("B: provenance-missing managed-target shortcut REMOVED",
+              await waitFor(() => !fs.existsSync(lnk), 10000));
+            await waitFor(() => !latchSet(), 10000);
+            await stopClient();
+          }
+
+          // C. an unrelated shortcut that merely shares the VIRULE name:
+          // preserved in both rules (no provenance, foreign target).
+          {
+            const root = path.join(SANDBOX, "h3");
+            const { programs } = makeInstallTree(root);
+            const lnk = makeLnk("C:\\Windows\\System32\\notepad.exe");
+            createArp();
+            check("client starts (sandbox h3)", await startClient(root));
+            check("uninstall accepted (C)", await runDefaultUninstall(root));
+            check("software removed (C)", await waitFor(() => !fs.existsSync(programs), 40000));
+            await waitFor(() => !latchSet(), 10000);
+            await sleep(1500); // give a wrong removal every chance to show
+            check("C: unrelated VIRULE-named shortcut PRESERVED", fs.existsSync(lnk));
+            await stopClient();
+          }
+        } finally {
+          // Restore the machine's real Desktop redirection EXACTLY.
+          try { writeDesktopValue(USF, prevUsf); } catch {}
+          if (prevSf) { try { writeDesktopValue(SF, prevSf); } catch {} }
+          const back = readDesktopValue(USF);
+          check("desktop known-folder registry restored",
+            !!back && back.data === prevUsf.data, JSON.stringify({ back, prevUsf }));
+        }
+      }
     }
   } finally {
     // Restore the machine's registry to its pre-run state.
