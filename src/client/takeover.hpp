@@ -116,11 +116,18 @@ inline void release_when_card_visible() {
 
 // Show a Working card, retrying briefly: a superseded standalone card
 // closes asynchronously, and the one-card-at-a-time rule makes show a
-// no-op until its thread is reaped. Idempotent when a card is already up.
+// no-op until its thread is reaped. Idempotent when a Working card is
+// already up. SUCCESS IS A WORKING CARD SPECIFICALLY (dead-air fix
+// 2026-09-05): a card that close() has already condemned can keep its
+// window alive for a few more milliseconds, and accepting that dying
+// window as "the next surface is visible" released Setup into ~15s of
+// nothing while the Admin package installed. A non-Working card here is
+// never the surface this handoff needs, so keep retrying until the
+// Working card actually exists.
 inline void show_working_retry(const char* primary) {
     for (int i = 0; i < 12; ++i) {
         result_card::show_working(primary, "");
-        if (result_card::is_visible()) return;
+        if (result_card::is_working_visible()) return;
         Sleep(100);
     }
 }
@@ -346,9 +353,19 @@ inline void on_setup_takeover(const std::string& payload) {
         if (g_op == op) return; // Setup's retry; already running
         if (!g_op.empty()) {
             if (g_op == "STANDALONE" && op != "STANDALONE") {
-                // The late-envelope upgrade.
+                // The late-envelope upgrade. A LIVE WORKING CARD IS KEPT
+                // (dead-air fix 2026-09-05): when the standalone watch has
+                // already converted into the continuation ("Finishing up…"),
+                // that card IS the surface the upgraded operation wants.
+                // Closing it here just to re-show the identical card opened
+                // a race - the re-show accepted the dying window as visible,
+                // Setup was released, the queued close then destroyed the
+                // card, and the owner's real install ran behind ~15s of
+                // dead air. Only a non-Working card (the standalone Ready
+                // card) still closes; the standalone conclusion stays
+                // revocable exactly as before.
                 g_superseded.store(true);
-                result_card::close();
+                if (!result_card::is_working_visible()) result_card::close();
                 g_released.store(false);
             } else {
                 return; // one takeover per Setup run
