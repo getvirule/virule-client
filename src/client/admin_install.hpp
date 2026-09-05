@@ -56,6 +56,7 @@
 // install over, the client finishes on its own and the Admin still opens.
 
 #include <atomic>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -108,6 +109,17 @@ constexpr unsigned long long kMaxPackageBytes = 2ull * 1024ull * 1024ull * 1024u
 
 // The identity every VIRULE-owned staged binary must be signed with.
 constexpr wchar_t kExpectedSigner[] = L"CN=Heath Michaels";
+
+// ---- development seams (set once by main.cpp before serving) ----
+// The same two seams the client self-update has: --dev-unsigned relaxes
+// ONLY the Authenticode gates (a test sandbox has no signed Admin
+// binaries), and --admin-manifest-url= points the approved-manifest fetch
+// at a local server, relaxing ONLY the host and the package-repository
+// pin. Grammar, exact size and the exact-hash gate hold exactly as in
+// production. Both are inert in a normal install (never set by anything
+// but an explicit command line).
+inline bool g_dev_unsigned = false;
+inline std::wstring g_manifest_override; // empty = production virule.app
 
 // Every VIRULE-owned binary the package must carry, verified in the staged
 // tree before placement (stock CEF runtime files are third-party and carry
@@ -229,13 +241,63 @@ inline void reconcile_installed_version() {
     }
 }
 
-// STARTUP RESIDUE RECONCILIATION (the minimum the uninstall corrective
-// pass requires, 2026-09-04): an interrupted update (crash, power loss,
-// an uninstall cancelling mid-pipeline whose helper then failed) must not
-// strand the managed tree in an ambiguous state. If the live Admin\ is
-// missing but the known-good Admin.previous survives, restore it; stale
-// staging and a stale download are debris. Runs once at client startup,
-// before any operation can be in flight.
+// Is this directory a complete, known-good managed Admin installation
+// that may be promoted back to Admin\? The bar is the pipeline's own:
+// the atomic install metadata must be present and well-formed, and every
+// required VIRULE-signed component must exist and carry a valid VIRULE
+// signature (--dev-unsigned relaxes only the signature half, exactly as
+// it does for the client's own self-update). Anything less is never
+// restored: a normal repair/install stays the recovery path, and the
+// rejected tree is left in place untouched (the next pipeline run clears
+// it as debris; startup destroys nothing it cannot vouch for).
+inline bool previous_install_restorable(const std::filesystem::path& previous,
+                                        std::string& why) {
+    std::error_code ec;
+    {
+        std::ifstream in(previous / L"installed-release.json", std::ios::binary);
+        if (!in) {
+            why = "no install metadata";
+            return false;
+        }
+        std::string text((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        std::string version;
+        if (text.size() > 4096 ||
+            !json_scan::find_string_in(text, 0, text.size(), "version", version) ||
+            !is_version_grammar(version)) {
+            why = "install metadata malformed";
+            return false;
+        }
+    }
+    for (const wchar_t* rel : kRequiredSigned) {
+        const auto p = previous / rel;
+        ec.clear();
+        if (!std::filesystem::exists(p, ec) || ec) {
+            why = "required component missing: " + p.filename().string();
+            return false;
+        }
+        if (!g_dev_unsigned &&
+            (!verify_binary::authenticode_valid(p) ||
+             !verify_binary::signed_by(p, kExpectedSigner))) {
+            why = "signature verification failed: " + p.filename().string();
+            return false;
+        }
+    }
+    return true;
+}
+
+// STARTUP RESIDUE RECONCILIATION (uninstall corrective pass 2026-09-04;
+// hardened by the P2 pass, audit H3): an interrupted update (crash, power
+// loss, a kill between the two swap renames, an uninstall cancelling
+// mid-pipeline whose helper then failed) must not strand the managed tree
+// in an ambiguous state. If the live Admin\ is missing but a VALIDATED
+// known-good Admin.previous survives, restore it locally, so the install
+// never reads as absent and never forces a needless full re-download; a
+// previous tree that fails validation is never promoted (and never
+// deleted here). Stale staging and a stale download are always debris:
+// this runs once at client startup, before any operation can be in
+// flight, so nothing owns them. Runs BEFORE any Admin install or launch
+// decision (the reconciliation-order contract in main.cpp).
 inline void reconcile_startup_residue() {
     if (g_busy.load()) return;
     std::error_code ec;
@@ -244,10 +306,18 @@ inline void reconcile_startup_residue() {
     if (!admin_dir.empty() && !previous.empty() &&
         !std::filesystem::exists(admin_dir, ec) &&
         std::filesystem::exists(previous, ec)) {
-        ec.clear();
-        std::filesystem::rename(previous, admin_dir, ec);
-        if (!ec) {
-            log::client("admin: recovered known-good install from Admin.previous");
+        std::string why;
+        if (previous_install_restorable(previous, why)) {
+            ec.clear();
+            std::filesystem::rename(previous, admin_dir, ec);
+            if (!ec) {
+                log::client("admin: recovered known-good install from Admin.previous");
+            } else {
+                log::client("admin: Admin.previous restore rename failed");
+            }
+        } else {
+            log::client("admin: Admin.previous NOT restored (" + why +
+                        "); normal install/repair remains the path");
         }
     }
     ec.clear();
@@ -443,6 +513,123 @@ inline bool open_installed_admin() {
     return true;
 }
 
+// ---- Admin relaunch recovery (audit M15, P2 pass 2026-09-04) ----
+// After an update (or a launch handoff) the client owes the user a
+// VISIBLE Admin. A relaunch used to be fire-and-forget: a virule.exe that
+// failed to start, or died before its interface appeared, was one log
+// line and a user staring at nothing. These primitives make every
+// update-path launch WATCHED and bounded: one automatic retry, then a
+// small client-owned failure surface whose Try again retries ONLY the
+// launch (the installed Admin is intact and is never re-downloaded for a
+// launch problem).
+
+// One watched launch attempt. True = the Admin demonstrably came up (its
+// process is alive past the watch window, or a managed-directory process
+// is running). False = the launch concretely failed; `why` names it.
+inline bool launch_admin_watched(std::string& why) {
+    why.clear();
+    if (!admin_installed()) {
+        why = "no managed Admin installation";
+        return false;
+    }
+    if (admin_running()) {
+        focus_running_admin();
+        return true;
+    }
+    g_last_admin_launch_tick.store(GetTickCount64());
+    const auto exe = paths::installed_admin_exe();
+    const auto dir = paths::admin_install_dir();
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + exe.wstring() + L"\"";
+    if (!CreateProcessW(exe.wstring().c_str(), cmd.data(), nullptr, nullptr,
+                        FALSE, 0, nullptr, dir.wstring().c_str(), &si, &pi)) {
+        why = "CreateProcess failed, error=" + std::to_string(GetLastError());
+        g_last_admin_launch_tick.store(0);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    bridge::push_lifecycle_status();
+    // The launched virule.exe stays alive for the whole Admin session (it
+    // waits on the CEF host), so a quick exit IS a failed launch unless
+    // another managed process is carrying the session by then.
+    bool ok = true;
+    DWORD exit_code = 0;
+    const ULONGLONG deadline = GetTickCount64() + 8000;
+    for (;;) {
+        const DWORD waited = WaitForSingleObject(pi.hProcess, 500);
+        if (waited == WAIT_OBJECT_0) {
+            GetExitCodeProcess(pi.hProcess, &exit_code);
+            ok = admin_running();
+            if (!ok) {
+                why = "virule.exe exited (code " + std::to_string(exit_code) +
+                      ") before the Admin appeared";
+                g_last_admin_launch_tick.store(0);
+            }
+            break;
+        }
+        if (GetTickCount64() >= deadline) break; // still alive: healthy
+        bridge::touch_activity();
+    }
+    CloseHandle(pi.hProcess);
+    if (ok) log::client("admin: launched installed virule.exe");
+    return ok;
+}
+
+// The bounded recovery around it: verify, one automatic retry after a
+// short delay, then the client-owned failure card. Try again on the card
+// retries only the launch; dismissing it ends the recovery with the
+// installation intact (Settings, the site and the desktop shortcut all
+// remain normal ways back in). Never an automatic retry loop.
+inline void launch_admin_with_recovery() {
+    std::string why;
+    if (launch_admin_watched(why)) return;
+    log::client("admin: relaunch failed (" + why + "); retrying once");
+    Sleep(2000);
+    std::string why2;
+    if (launch_admin_watched(why2)) {
+        log::client("admin: relaunch retry succeeded");
+        return;
+    }
+    log::client("admin: relaunch retry failed (" + why2 +
+                "); recovery card shown (Try again)");
+    // A live Working card ("Updating…") owns the surface and show_action
+    // would no-op against it: resolve it in place. The card window appears
+    // asynchronously; wait for it before the loop reads visibility, or a
+    // slow paint is mistaken for a dismissal.
+    auto show_failure_card = []() {
+        if (result_card::is_working_visible()) {
+            result_card::update_to_action("Something went wrong.", "Try again");
+        } else {
+            result_card::show_action("Something went wrong.", "Try again");
+        }
+        for (int i = 0; i < 20 && !result_card::is_visible(); ++i) Sleep(100);
+    };
+    show_failure_card();
+    for (;;) {
+        // Clicking the action closes the card and raises the flag: consume
+        // the flag BEFORE reading visibility, or every click reads as a
+        // dismissal (the uninstall helper's loop learned the same order).
+        if (result_card::take_action_clicked()) {
+            result_card::wait_closed(3000); // reap the clicked card's thread
+            std::string why3;
+            if (launch_admin_watched(why3)) {
+                log::client("admin: relaunch recovered by user retry");
+                return;
+            }
+            log::client("admin: user retry failed (" + why3 + ")");
+            show_failure_card();
+        }
+        if (!result_card::is_visible()) {
+            log::client("admin: relaunch recovery dismissed; installation intact");
+            return;
+        }
+        bridge::touch_activity(); // a live recovery surface is not idle
+        Sleep(250);
+    }
+}
+
 // ---- the manifest ----
 
 struct Manifest {
@@ -567,11 +754,24 @@ inline bool version_is_upgrade(const std::string& approved,
 }
 
 inline bool fetch_manifest(Manifest& out, std::string& why) {
+    const bool dev = !g_manifest_override.empty();
     unsigned long status = 0;
     std::string body;
-    if (!http::https_get(kManifestHost, kManifestPath, kMaxManifestBytes,
-                         status, body) ||
-        status != 200) {
+    if (dev) {
+        http::Url u;
+        if (!http::parse_url(g_manifest_override, u)) {
+            why = "unparseable --admin-manifest-url";
+            return false;
+        }
+        if (!http::http_get(u.host.c_str(), u.port, u.secure, u.path.c_str(),
+                            kMaxManifestBytes, status, body) ||
+            status != 200) {
+            why = "manifest fetch failed, status=" + std::to_string(status);
+            return false;
+        }
+    } else if (!http::https_get(kManifestHost, kManifestPath, kMaxManifestBytes,
+                                status, body) ||
+               status != 200) {
         why = "manifest fetch failed, status=" + std::to_string(status);
         return false;
     }
@@ -580,9 +780,11 @@ inline bool fetch_manifest(Manifest& out, std::string& why) {
         why = "manifest version missing or malformed";
         return false;
     }
+    // The dev seam relaxes ONLY the repository pin; grammar and the hash
+    // gate hold exactly as in production.
     if (!json_scan::find_string_in(body, 0, body.size(), "url", out.url) ||
         out.url.empty() || out.url.size() > 512 ||
-        out.url.rfind(kPackageUrlPrefix, 0) != 0) {
+        (!dev && out.url.rfind(kPackageUrlPrefix, 0) != 0)) {
         why = std::string("manifest url missing or not under ") + kPackageUrlPrefix;
         return false;
     }
@@ -665,49 +867,124 @@ inline void refresh_update_check(unsigned long long fresh_ms) {
     g_approved_version = manifest.version;
 }
 
-// THE LAUNCH-TIME LOOP BREAKER (2026-09-04). A failed launch-time update
-// falls open into launching the current Admin; that Admin sees the same
-// approved update at startup and hands the launch straight back, so
-// without memory the pair loops forever (observed live: alpha.15 ->
-// alpha.16, one 322MB download every ~30 seconds; suppressing only the
-// handoff still relaunch-loops, because every relaunched Admin re-checks
-// and re-hands-off). The terminator therefore sits at the CLAIM: while
-// the hold lasts, admin_update_check answers update:false, so a
-// relaunched Admin simply launches normally. The virule.app Update
-// button stays live (the page compares versions itself), a genuinely
-// later launch retries once after the hold expires, and a successful
-// update clears it.
-// The hold only has to outlive the fallback relaunch's own startup check
-// (seconds). Kept SHORT on purpose: it must not hide the Settings Update
-// answer for long, and a genuinely new user launch after it expires earns
-// exactly one fresh attempt - one transaction per launch, never an
-// automatic retry loop.
-inline std::string g_launch_update_failed_version;      // under g_update_mutex
-inline unsigned long long g_launch_update_failed_tick = 0;
-constexpr unsigned long long kLaunchUpdateHoldMs = 90ull * 1000ull;
+// THE LAUNCH-TIME LOOP BREAKER, PERSISTED (2026-09-04; hardened by the P2
+// pass, audit M2). A failed launch-time update falls open into launching
+// the current Admin; that Admin sees the same approved update at startup
+// and hands the launch straight back, so without memory the pair loops
+// forever (observed live: alpha.15 -> alpha.16, one 322MB download every
+// ~30 seconds). The terminator sits at the CLAIM: while the hold lasts,
+// admin_update_check answers update:false for that exact version, so a
+// relaunched Admin simply launches normally.
+//
+// The hold is ONE persisted record in state.json ({version, failed_utc,
+// until_utc}) with TWO windows read from it:
+//
+//   - the CLAIM-SUPPRESSION window (90s, every caller): outlives the
+//     fallback relaunch's own startup check, which is all the loop
+//     breaker itself needs, and never hides the Settings Update answer
+//     for long;
+//   - the LAUNCH-RETRY window (6h, only callers that declare
+//     context:"launch": the managed virule.exe's update-on-launch check,
+//     and the launch handoff's own gate): a persistently failing package
+//     is not re-downloaded on every fresh VIRULE launch. Passive holds
+//     only; the user's explicit Update (Settings after the 90s window,
+//     the virule.app button always) still gets a real attempt.
+//
+// Because the record persists, a client death right after the failure no
+// longer forfeits the hold (the audit's M2). Never a stale block: the
+// hold names ONE exact version (a newer approved version is never held),
+// a successful install/update clears it, and startup housekeeping clears
+// a record that is expired, malformed, or moot because the installed
+// version already reached it.
+inline std::string g_hold_version;      // under g_update_mutex ("" = none)
+inline long long g_hold_failed_utc = 0; //   mirrors state.json
+inline long long g_hold_until_utc = 0;
+constexpr long long kHoldClaimSuppressS = 90;
+constexpr long long kHoldLaunchRetryS = 6ll * 60ll * 60ll;
 
-inline bool launch_update_on_hold(const std::string& approved) {
+inline void persist_hold_locked() {
+    auto s = state::load();
+    s.admin_hold_version = g_hold_version;
+    s.admin_hold_failed_utc = g_hold_failed_utc;
+    s.admin_hold_until_utc = g_hold_until_utc;
+    (void)state::save(s);
+}
+
+inline bool launch_update_on_hold(const std::string& approved,
+                                  bool launch_context) {
     std::lock_guard<std::mutex> lock(g_update_mutex);
-    return !approved.empty() && g_launch_update_failed_version == approved &&
-           g_launch_update_failed_tick != 0 &&
-           GetTickCount64() - g_launch_update_failed_tick < kLaunchUpdateHoldMs;
+    if (approved.empty() || g_hold_version != approved) return false;
+    const long long now = (long long)time(nullptr);
+    if (g_hold_failed_utc > now + 300) {
+        // A failure stamped in the future is clock damage, not a hold.
+        return false;
+    }
+    if (now - g_hold_failed_utc < kHoldClaimSuppressS) return true;
+    return launch_context && now < g_hold_until_utc;
 }
 
 inline void set_launch_update_hold(const std::string& approved) {
     std::lock_guard<std::mutex> lock(g_update_mutex);
-    g_launch_update_failed_version = approved;
-    g_launch_update_failed_tick = GetTickCount64();
+    g_hold_version = approved;
+    g_hold_failed_utc = (long long)time(nullptr);
+    g_hold_until_utc = g_hold_failed_utc + kHoldLaunchRetryS;
+    persist_hold_locked();
+    log::client("admin: launch-update failure hold recorded for " + approved);
 }
 
 inline void clear_launch_update_hold() {
     std::lock_guard<std::mutex> lock(g_update_mutex);
-    g_launch_update_failed_version.clear();
-    g_launch_update_failed_tick = 0;
+    if (g_hold_version.empty()) {
+        // Still scrub a persisted record this process never loaded.
+        auto s = state::load();
+        if (s.admin_hold_version.empty()) return;
+    }
+    g_hold_version.clear();
+    g_hold_failed_utc = 0;
+    g_hold_until_utc = 0;
+    persist_hold_locked();
+}
+
+// Startup housekeeping (the reconciliation-order contract in main.cpp):
+// load the persisted hold into this process, dropping a record that can
+// no longer mean anything - expired, malformed, stamped in the future, or
+// moot because the installed Admin already reached the held version.
+inline void reconcile_launch_update_hold() {
+    const auto s = state::load();
+    if (s.admin_hold_version.empty()) return;
+    const long long now = (long long)time(nullptr);
+    const std::string installed = authoritative_admin_version();
+    const bool malformed = !is_version_grammar(s.admin_hold_version) ||
+                           s.admin_hold_failed_utc <= 0 ||
+                           s.admin_hold_until_utc <= s.admin_hold_failed_utc;
+    const bool expired = now >= s.admin_hold_until_utc;
+    const bool future = s.admin_hold_failed_utc > now + 300;
+    const bool moot = !installed.empty() &&
+                      !version_is_upgrade(s.admin_hold_version, installed);
+    if (malformed || expired || future || moot) {
+        std::lock_guard<std::mutex> lock(g_update_mutex);
+        g_hold_version.clear();
+        g_hold_failed_utc = 0;
+        g_hold_until_utc = 0;
+        persist_hold_locked();
+        log::client("admin: stale launch-update hold cleared (" +
+                    s.admin_hold_version + ")");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_hold_version = s.admin_hold_version;
+    g_hold_failed_utc = s.admin_hold_failed_utc;
+    g_hold_until_utc = s.admin_hold_until_utc;
+    log::client("admin: launch-update hold active for " + g_hold_version);
 }
 
 // The admin_update_status answer for the bridge's local
-// admin_update_check message.
-inline std::string update_status_json() {
+// admin_update_check message. `launch_context` = the caller declared
+// {"context":"launch"} (a managed virule.exe's update-on-launch check):
+// only those callers observe the long launch-retry hold window; everyone
+// else (Settings, older Admins sending no context) sees only the short
+// claim-suppression window.
+inline std::string update_status_json(bool launch_context) {
     const bool installed = admin_installed();
     std::string admin_version;
     if (installed) admin_version = authoritative_admin_version();
@@ -726,7 +1003,7 @@ inline std::string update_status_json() {
     bool update = installed && !approved.empty() &&
                   !admin_version.empty() &&
                   version_is_upgrade(approved, admin_version);
-    if (update && launch_update_on_hold(approved)) update = false;
+    if (update && launch_update_on_hold(approved, launch_context)) update = false;
     std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
     out += installed ? "true" : "false";
     out += ",\"admin_version\":\"" + json_scan::json_escape(admin_version) + "\"";
@@ -936,22 +1213,16 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
                 " size=" + std::to_string(manifest.size) +
                 " sha256=" + manifest.sha256);
 
-    // Parse the package url (an https github.com asset; WinHTTP follows the
-    // CDN redirect).
-    std::wstring whost, wpath;
+    // Parse the package url (production: an https github.com asset, WinHTTP
+    // follows the CDN redirect; the dev seam may point at a local server).
+    http::Url package_url;
     {
-        const std::string prefix = "https://";
-        std::string rest = manifest.url.substr(prefix.size());
-        const size_t slash = rest.find('/');
-        if (slash == std::string::npos) {
+        std::wstring wurl(manifest.url.begin(), manifest.url.end());
+        if (!http::parse_url(wurl, package_url)) {
             log::client("admin: manifest url unparseable");
             broadcast_result("failed", "");
             return "failed";
         }
-        const std::string host = rest.substr(0, slash);
-        const std::string path = rest.substr(slash);
-        whost.assign(host.begin(), host.end());
-        wpath.assign(path.begin(), path.end());
     }
 
     cleanup_staging();
@@ -970,13 +1241,37 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     unsigned long status = 0;
     unsigned long long got_size = 0;
     std::string got_sha;
-    if (!http::https_get_to_file(whost.c_str(), wpath.c_str(),
-                                 (unsigned long long)manifest.size, zip_path,
-                                 status, got_size, got_sha,
-                                 []() {
-                                     bridge::touch_activity();
-                                     return !g_cancel.load();
-                                 })) {
+    bool downloaded = false;
+    if (package_url.secure && package_url.port == 443) {
+        downloaded = http::https_get_to_file(
+            package_url.host.c_str(), package_url.path.c_str(),
+            (unsigned long long)manifest.size, zip_path,
+            status, got_size, got_sha,
+            []() {
+                bridge::touch_activity();
+                return !g_cancel.load();
+            });
+    } else if (!g_manifest_override.empty()) {
+        // Dev seam only (--admin-manifest-url against a local server): the
+        // test package is small enough to buffer; the same exact-size and
+        // exact-hash gates apply below.
+        std::string payload;
+        if (http::http_get(package_url.host.c_str(), package_url.port,
+                           package_url.secure, package_url.path.c_str(),
+                           (size_t)manifest.size, status, payload) &&
+            status == 200) {
+            std::ofstream out(zip_path, std::ios::binary | std::ios::trunc);
+            if (out && out.write(payload.data(),
+                                 (std::streamsize)payload.size()).good()) {
+                got_size = payload.size();
+                got_sha = verify_binary::sha256_hex(
+                    reinterpret_cast<const unsigned char*>(payload.data()),
+                    payload.size());
+                downloaded = true;
+            }
+        }
+    }
+    if (!downloaded) {
         if (g_cancel.load()) {
             log::client("admin: package download aborted (uninstall in progress)");
         } else {
@@ -1024,8 +1319,9 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
             broadcast_result("failed", "");
             return "failed";
         }
-        if (!verify_binary::authenticode_valid(p) ||
-            !verify_binary::signed_by(p, kExpectedSigner)) {
+        if (!g_dev_unsigned &&
+            (!verify_binary::authenticode_valid(p) ||
+             !verify_binary::signed_by(p, kExpectedSigner))) {
             log::client("admin: staged binary failed signature verification: " +
                         p.filename().string());
             cleanup_staging();
@@ -1097,13 +1393,17 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     ec.clear();
     std::filesystem::remove(zip_path, ec);
 
-    // 8. Record the installed version (the manifest's).
+    // 8. Record the installed version (the manifest's), and retire any
+    // launch-update failure hold: a fresh successful install/update is
+    // proof the pipeline works again, and a hold for the version that
+    // just landed (or an older one) is moot by definition.
     {
         auto s = state::load();
         s.admin_version = manifest.version;
         if (shortcut) s.created_desktop_shortcut = true;
         (void)state::save(s);
     }
+    clear_launch_update_hold();
 
     // 9. The desktop shortcut, when the browser's intent asked for one.
     if (shortcut) {
@@ -1198,15 +1498,22 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
 
     if (state == "installed") {
         // A fresh install opens the Admin automatically; the Admin window
-        // is the next feedback surface.
-        (void)open_installed_admin();
-        if (native_feedback) result_card::close();
+        // is the next feedback surface. The launch is WATCHED (audit M15):
+        // a launch that concretely fails earns one bounded retry and then
+        // the client-owned Try again card instead of silence.
+        launch_admin_with_recovery();
+        if (native_feedback && result_card::is_working_visible()) {
+            result_card::close();
+        }
     } else if (state == "updated") {
         if (closed_admin_for_update) {
             // Relaunch the Admin the client closed (the user never reopens
-            // VIRULE by hand), then retire the card: next owner first.
-            (void)open_installed_admin();
-            if (native_feedback) result_card::close();
+            // VIRULE by hand), watched + recovered, then retire the card:
+            // next owner first.
+            launch_admin_with_recovery();
+            if (native_feedback && result_card::is_working_visible()) {
+                result_card::close();
+            }
         }
         // An update of an Admin that was already closed leaves the user
         // where they are (the caller may still choose to launch: the
@@ -1215,10 +1522,14 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
         // The update failed AFTER the Admin was closed for it. The
         // known-good install is untouched (atomic placement), so bring
         // VIRULE back rather than leaving the user with nothing; Settings
-        // will still offer the update.
+        // will still offer the update. If even the relaunch fails, the
+        // recovery owns the failure surface; only a successful relaunch
+        // resolves the card into the update-failed outcome.
         log::client("admin: update failed after shutdown; relaunching the previous Admin");
-        if (native_feedback) result_card::update("Something went wrong.", "");
-        (void)open_installed_admin();
+        launch_admin_with_recovery();
+        if (native_feedback && result_card::is_working_visible()) {
+            result_card::update("Something went wrong.", "");
+        }
     }
     return state;
 }
@@ -1270,10 +1581,10 @@ inline void launch_after_update_handoff() {
                         version_is_upgrade(approved, installed);
     if (!update) {
         result_card::close();
-        (void)open_installed_admin();
+        launch_admin_with_recovery();
         return;
     }
-    if (launch_update_on_hold(approved)) {
+    if (launch_update_on_hold(approved, /*launch_context=*/true)) {
         // This exact update already failed at launch moments ago; the
         // relaunched Admin handing the launch straight back is the loop,
         // not a new user decision (the claim gate in update_status_json
@@ -1287,26 +1598,29 @@ inline void launch_after_update_handoff() {
                     " recently failed; launching current Admin without retrying");
         result_card::close();
         g_last_admin_launch_tick.store(0);
-        (void)open_installed_admin();
+        launch_admin_with_recovery();
         return;
     }
     const std::string state = run(false, /*native_feedback=*/true);
     if (state == "updated") {
-        clear_launch_update_hold();
-        // The Admin was not running, so run() left the launch to us.
-        (void)open_installed_admin();
-        result_card::close();
+        // The Admin was not running, so run() left the launch to us (the
+        // pipeline already cleared any failure hold on success). Watched +
+        // recovered: the user's launch gesture ends with a visible Admin
+        // or a visible Try again, never with nothing (audit M15).
+        launch_admin_with_recovery();
+        if (result_card::is_working_visible()) result_card::close();
     } else if (state == "busy") {
         // Another operation owns the lifecycle; its own feedback covers it.
         result_card::close();
     } else if (state != "installed") {
         // Never block a launch on a failed update, but remember the failed
         // transaction so the relaunched Admin's immediate re-handoff cannot
-        // start it again (the loop breaker above).
+        // start it again (the persisted loop breaker above; it also holds
+        // the launch path off this package across restarts).
         set_launch_update_hold(approved);
         log::client("admin: launch-time update did not complete; launching current Admin");
-        result_card::close();
-        (void)open_installed_admin();
+        if (result_card::is_working_visible()) result_card::close();
+        launch_admin_with_recovery();
     }
 }
 

@@ -381,8 +381,8 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     callbacks.admin_status_json = []() {
         return vclient::admin_install::status_json();
     };
-    callbacks.admin_update_status_json = []() {
-        return vclient::admin_install::update_status_json();
+    callbacks.admin_update_status_json = [](bool launch_context) {
+        return vclient::admin_install::update_status_json(launch_context);
     };
     callbacks.on_uninstall = [](bool delete_data) {
         begin_uninstall_async(delete_data);
@@ -401,19 +401,28 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     g_state.store(RunState::Serving);
     vclient::log::client(std::string("serving, version ") + VIRULE_CLIENT_VERSION_STRING);
 
-    // Update-residue reconciliation: an interrupted update (crash, power
-    // loss, a cancelled uninstall) must not strand Admin.previous /
-    // Admin.staging / admin-download.zip in an ambiguous state. A stranded
-    // known-good Admin.previous with no live Admin\ is restored.
-    vclient::admin_install::reconcile_startup_residue();
+    // THE STARTUP RECONCILIATION ORDER (P2 pass 2026-09-04, one contract,
+    // not five patches). Client startup and every Admin launch decision
+    // settle state in ONE fixed precedence:
+    //
+    //   1. explicit uninstall intent (already honored in wWinMain: a
+    //      latched machine never reaches serve());
+    //   2. this client's OWN self-update transaction (this very binary
+    //      must be settled before it makes decisions for anything else);
+    //   3. managed-Admin filesystem state: stale staging/download debris,
+    //      and 4. a stranded known-good Admin.previous restored (validated;
+    //      never arbitrary junk) when the live Admin\ is missing, so an
+    //      interrupted swap never forces a needless full re-download;
+    //   5. installed-release metadata reconciled (the authoritative
+    //      version record heals the state.json mirror, and vice versa);
+    //   6. the persisted launch-update failure hold loaded/expired;
+    //   7-8. only then do update-availability answers and launch/update
+    //      decisions get made (the bridge callbacks and check threads).
+    //
+    // The bridge listener is already up (a takeover/serve contract), so
+    // step 2 first waits for the listen state it needs.
 
-    // Version recovery (the false-"up to date" fix): if a managed Admin
-    // exists, its ACTUAL installed version is reconciled from the
-    // authoritative in-install metadata immediately, so a reinstalled or
-    // reset client never serves stale/empty version knowledge.
-    vclient::admin_install::reconcile_installed_version();
-
-    // CLIENT SELF-UPDATE housekeeping (managed installs only): bring any
+    // 2. CLIENT SELF-UPDATE housekeeping (managed installs only): bring any
     // interrupted self-update transaction to one deterministic state, then
     // heal the outward version mirrors (state.json installed_version, the
     // Apps & Features DisplayVersion) from this executable's own compiled
@@ -428,6 +437,23 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             vclient::bridge::g_listen_state.load() == 1);
         vclient::self_update::refresh_installed_identity();
     }
+
+    // 3-4. Managed-Admin residue: an interrupted update (crash, power
+    // loss, a cancelled uninstall, a kill between the two swap renames)
+    // must not strand Admin.previous / Admin.staging / admin-download.zip
+    // in an ambiguous state. A stranded VALIDATED known-good
+    // Admin.previous with no live Admin\ is restored locally.
+    vclient::admin_install::reconcile_startup_residue();
+
+    // 5. Version recovery (the false-"up to date" fix): if a managed Admin
+    // exists, its ACTUAL installed version is reconciled from the
+    // authoritative in-install metadata immediately, so a reinstalled or
+    // reset client never serves stale/empty version knowledge.
+    vclient::admin_install::reconcile_installed_version();
+
+    // 6. The persisted launch-update failure hold: loaded into this
+    // process, or cleared when expired/moot (audit M2).
+    vclient::admin_install::reconcile_launch_update_hold();
 
     // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
     // INSTALLING): one check at startup, then a quiet periodic recheck
@@ -569,8 +595,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring arg2 = (argc > 2) ? argv[2] : L"";
     bool no_register = false;
     bool delete_data_arg = false;
-    bool dev_unsigned = false;      // self-update signature gates only (dev)
-    std::wstring self_manifest_url; // self-update manifest seam (dev)
+    bool dev_unsigned = false;       // signature gates only (dev)
+    std::wstring self_manifest_url;  // self-update manifest seam (dev)
+    std::wstring admin_manifest_url; // Admin-manifest seam (dev)
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--no-register") no_register = true;
@@ -579,10 +606,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (arg.rfind(L"--self-manifest-url=", 0) == 0) {
             self_manifest_url = arg.substr(20);
         }
+        if (arg.rfind(L"--admin-manifest-url=", 0) == 0) {
+            admin_manifest_url = arg.substr(21);
+        }
     }
     LocalFree(argv);
     if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
-        arg1.rfind(L"--self-manifest-url=", 0) == 0) {
+        arg1.rfind(L"--self-manifest-url=", 0) == 0 ||
+        arg1.rfind(L"--admin-manifest-url=", 0) == 0) {
         arg1.clear();
     }
 
@@ -594,6 +625,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     vclient::self_update::g_dev_unsigned = dev_unsigned;
     vclient::self_update::g_manifest_override = self_manifest_url;
     vclient::self_update::g_no_register = no_register;
+    // The managed-Admin pipeline's own two dev seams (same posture:
+    // --dev-unsigned relaxes only Authenticode gates, the manifest
+    // override relaxes only host + repository pin).
+    vclient::admin_install::g_dev_unsigned = dev_unsigned;
+    vclient::admin_install::g_manifest_override = admin_manifest_url;
     {
         wchar_t self[MAX_PATH * 2] = {};
         const DWORD n = GetModuleFileNameW(nullptr, self,

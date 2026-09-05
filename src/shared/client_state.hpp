@@ -6,7 +6,10 @@
 //     "created_dev_machine_cred": true|false,   // uninstall provenance
 //     "installed_version": "x.y.z",             // the installed CLIENT
 //     "admin_version": "x.y.z-alpha.n",         // the managed Admin install
-//     "created_desktop_shortcut": true|false }  // uninstall provenance
+//     "created_desktop_shortcut": true|false,   // uninstall provenance
+//     "admin_hold_version": "x.y.z-alpha.n",    // launch-update failure hold
+//     "admin_hold_failed_utc": 1756944000,      //   when the failure happened
+//     "admin_hold_until_utc": 1756965600 }      //   launch retry-after expiry
 //
 // `created_dev_machine_cred` records that THIS product created the machine
 // identity file. A full VIRULE uninstall removes dev_machine.cred only when
@@ -23,6 +26,13 @@
 // `created_desktop_shortcut` records that THIS client created the desktop
 // shortcut to the installed Admin, so uninstall removes exactly what it
 // created and never a shortcut the user made themselves.
+//
+// The `admin_hold_*` triple is THE PERSISTED LAUNCH-UPDATE FAILURE HOLD
+// (audit M2, P2 pass 2026-09-04): a launch-time Admin update to
+// `admin_hold_version` failed at `admin_hold_failed_utc`, and launch-time
+// update claims for that exact version stay suppressed until
+// `admin_hold_until_utc`, across client restarts. Empty version = no hold.
+// admin_install.hpp owns every rule (set, clear, expiry, contexts).
 
 #include <filesystem>
 #include <fstream>
@@ -38,6 +48,9 @@ struct State {
     std::string installed_version;
     std::string admin_version;
     bool created_desktop_shortcut = false;
+    std::string admin_hold_version;      // "" = no launch-update hold
+    long long admin_hold_failed_utc = 0;
+    long long admin_hold_until_utc = 0;
 };
 
 inline State load() {
@@ -56,6 +69,14 @@ inline State load() {
                                     s.admin_version);
     s.created_desktop_shortcut =
         text.find("\"created_desktop_shortcut\":true") != std::string::npos;
+    (void)json_scan::find_string_in(text, 0, text.size(), "admin_hold_version",
+                                    s.admin_hold_version);
+    (void)json_scan::find_number_in(text, 0, text.size(),
+                                    "admin_hold_failed_utc",
+                                    s.admin_hold_failed_utc);
+    (void)json_scan::find_number_in(text, 0, text.size(),
+                                    "admin_hold_until_utc",
+                                    s.admin_hold_until_utc);
     return s;
 }
 
@@ -70,6 +91,10 @@ inline bool save(const State& s) {
     body += ",\"admin_version\":\"" + json_scan::json_escape(s.admin_version) + "\"";
     body += ",\"created_desktop_shortcut\":";
     body += s.created_desktop_shortcut ? "true" : "false";
+    body += ",\"admin_hold_version\":\"" +
+            json_scan::json_escape(s.admin_hold_version) + "\"";
+    body += ",\"admin_hold_failed_utc\":" + std::to_string(s.admin_hold_failed_utc);
+    body += ",\"admin_hold_until_utc\":" + std::to_string(s.admin_hold_until_utc);
     body += "}";
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     if (!out) return false;

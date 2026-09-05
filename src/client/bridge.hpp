@@ -149,11 +149,13 @@ struct Callbacks {
     // The Admin status block embedded in every status answer
     // ({"installed","version","running"}), or empty = "null".
     std::function<std::string()> admin_status_json;
-    // A local caller (the Admin's Settings page, through its host) asked
-    // whether an approved Admin update exists. Answers the FULL
-    // admin_update_status JSON message; may fetch the manifest (bounded)
-    // when the cached answer is stale.
-    std::function<std::string()> admin_update_status_json;
+    // A local caller (the Admin's Settings page through its host, or a
+    // managed virule.exe's update-on-launch check) asked whether an
+    // approved Admin update exists. Answers the FULL admin_update_status
+    // JSON message; may fetch the manifest (bounded) when the cached
+    // answer is stale. `launch_context` = the caller declared
+    // {"context":"launch"} (the persisted launch-retry hold applies).
+    std::function<std::string(bool launch_context)> admin_update_status_json;
     // A verified uninstall authorization arrived from a page. The flag is
     // the page's explicit Delete local data choice; false (the default)
     // preserves every piece of user-owned VIRULE data.
@@ -645,10 +647,19 @@ inline void handle_client(SOCKET client) {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             }
         } else if (type == "admin_update_check" && !is_page) {
-            // The Admin Settings row's availability question. Local-only:
+            // The Admin Settings row's availability question, and the
+            // managed virule.exe's update-on-launch question. Local-only:
             // virule.app pages read /client/admin-manifest.json themselves.
+            // {"context":"launch"} marks the launch cooperation; only that
+            // caller observes the long persisted launch-retry hold window
+            // (admin_install.hpp). No context (Settings, older Admins) =
+            // the short claim-suppression window only.
+            std::string context;
+            (void)js::find_string_in(payload, 0, payload.size(), "context",
+                                     context);
             const std::string answer = g_callbacks.admin_update_status_json
-                ? g_callbacks.admin_update_status_json() : std::string();
+                ? g_callbacks.admin_update_status_json(context == "launch")
+                : std::string();
             if (answer.empty()) {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             } else {

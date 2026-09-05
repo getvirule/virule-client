@@ -298,46 +298,10 @@ inline bool staged_binary_valid(const Txn& t, std::string& why) {
 
 // ---- the release manifest ----
 
-struct Url {
-    bool secure = true;
-    std::wstring host;
-    unsigned short port = 443;
-    std::wstring path = L"/";
-};
-
-inline bool parse_url(const std::wstring& s, Url& out) {
-    std::wstring rest;
-    if (s.rfind(L"https://", 0) == 0) {
-        out.secure = true;
-        out.port = 443;
-        rest = s.substr(8);
-    } else if (s.rfind(L"http://", 0) == 0) {
-        out.secure = false;
-        out.port = 80;
-        rest = s.substr(7);
-    } else {
-        return false;
-    }
-    const size_t slash = rest.find(L'/');
-    std::wstring authority = slash == std::wstring::npos ? rest : rest.substr(0, slash);
-    out.path = slash == std::wstring::npos ? L"/" : rest.substr(slash);
-    const size_t colon = authority.find(L':');
-    if (colon != std::wstring::npos) {
-        unsigned long port = 0;
-        for (size_t i = colon + 1; i < authority.size(); ++i) {
-            const wchar_t c = authority[i];
-            if (c < L'0' || c > L'9') return false;
-            port = port * 10 + (unsigned long)(c - L'0');
-            if (port > 65535) return false;
-        }
-        if (port == 0) return false;
-        out.port = (unsigned short)port;
-        authority = authority.substr(0, colon);
-    }
-    if (authority.empty()) return false;
-    out.host = authority;
-    return true;
-}
+// Url/parse_url moved to shared/http_client.hpp (the admin-manifest dev
+// seam uses the same parser); these aliases keep this file's call sites.
+using Url = http::Url;
+using http::parse_url;
 
 struct Manifest {
     std::string version;

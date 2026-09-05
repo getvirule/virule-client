@@ -212,6 +212,10 @@ inline bool wait_install_dir_processes_gone(unsigned long long wait_ms) {
 // retry), bring the managed tree back to ONE unambiguous known-good state:
 // a stranded Admin.previous with no live Admin\ is the known-good install
 // and is restored; staging and the download are debris.
+// DELIBERATELY UNVALIDATED here, unlike the startup restore in
+// admin_install.hpp (P2 pass 2026-09-04): everything this rename touches
+// is about to be REMOVED, so promoting even a damaged tree only gives the
+// removal one canonical location; nothing is ever launched from it.
 inline void reconcile_admin_update_residue() {
     std::error_code ec;
     const auto admin_dir = paths::admin_install_dir();

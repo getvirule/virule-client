@@ -229,7 +229,10 @@ async function freePort() {
 
 async function startClient(root, { expectServe = true } = {}) {
   await freePort();
-  clientProc = spawn(CLIENT_EXE, ["--no-register"], {
+  // --dev-unsigned: the P2 pass made the startup Admin.previous restore
+  // VALIDATED (structure always; Authenticode outside dev mode), and this
+  // harness's synthetic trees are unsigned stubs by design.
+  clientProc = spawn(CLIENT_EXE, ["--no-register", "--dev-unsigned"], {
     env: sandboxEnv(root), stdio: "ignore", detached: false,
   });
   const tries = expectServe ? 40 : 12;
@@ -555,8 +558,21 @@ async function main() {
       const root = path.join(SANDBOX, "e");
       const programs = path.join(root, "Programs", "VIRULE");
       const previous = path.join(programs, "Admin.previous");
-      fs.mkdirSync(previous, { recursive: true });
-      fs.writeFileSync(path.join(previous, "virule.exe"), "stub");
+      // The P2 pass validates a previous tree before promoting it: the
+      // fixture carries every pipeline-required component (structure) and
+      // the client runs --dev-unsigned (signatures relaxed, dev only).
+      for (const rel of [
+        "virule.exe",
+        ".resources\\admin\\ViruleAdminHost.exe",
+        ".resources\\bin\\Win32\\SidecarK32.dll",
+        ".resources\\bin\\Win32\\SidecarKHost.exe",
+        ".resources\\bin\\x64\\SidecarK64.dll",
+        ".resources\\bin\\x64\\SidecarKHost.exe",
+      ]) {
+        const p = path.join(previous, rel);
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, "stub");
+      }
       fs.writeFileSync(path.join(previous, "installed-release.json"), '{"version":"7.7.7-test"}');
       fs.mkdirSync(path.join(programs, "Admin.staging"), { recursive: true });
       fs.writeFileSync(path.join(programs, "Admin.staging", "junk.txt"), "debris");
