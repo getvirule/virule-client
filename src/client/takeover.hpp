@@ -97,6 +97,14 @@ inline std::atomic<bool> g_standalone_terminal{ false }; // watch concluded
 
 inline bool released() { return g_released.load(); }
 
+// A Setup takeover is in flight: one arrived and Setup has not yet been
+// released into the next surface. The client self-update's safe-point
+// check reads this so a binary swap never lands mid-handoff.
+inline bool takeover_in_flight() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return !g_op.empty() && !g_released.load();
+}
+
 inline void release() { g_released.store(true); }
 
 // Wait for the native card to actually exist before releasing Setup (the

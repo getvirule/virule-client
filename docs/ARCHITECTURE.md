@@ -179,6 +179,62 @@ different bytes, and verifies every public asset URL by re-downloading it.
 GitHub is a HOST, not a trust anchor: everything a user runs is still
 gated by the manifest hash plus the VIRULE Authenticode identity below.
 
+## Client self-update (v0.7.0)
+
+The client is the persistent machine manager and manages ITS OWN updates:
+a Client-only release reaches installed machines with no Setup rerun, no
+GitHub visit, no reinstall, and no Admin release. Virule-Setup.exe remains
+bootstrap/repair infrastructure (first install, missing/broken client).
+`src/client/self_update.hpp` is the whole implementation; managed installs
+only (a client running from anywhere but the installed path never
+self-updates).
+
+TRUST IS SETUP'S, REUSED EXACTLY: the LATEST getvirule/virule-client
+release's `manifest.json`, url pinned to that repository's
+`releases/download/` prefix, exact declared size, exact SHA-256 (never
+waived), Authenticode + `CN=Heath Michaels` - re-verified IN FULL by the
+helper immediately before the swap. Dev seams mirror Setup's:
+`--self-manifest-url=` relaxes only the repository pin, `--dev-unsigned`
+waives only the signature gates.
+
+CADENCE: one asynchronous check shortly after startup (never blocking the
+bridge) plus a quiet 6-hour recheck while serving; the freshness stamp is
+written before the attempt so a failing network cannot hammer. SemVer
+UPGRADE only: equal does nothing, an approved version lower than the
+running build never auto-downgrades (rollback stays an explicit act).
+
+DOWNLOAD FIRST, SWAP WHEN SAFE: the update is streamed to
+`virule-client.exe.update`, verified, and recorded in the explicit
+transaction `client\self_update.json` (`verified` -> `swapping` ->
+cleared, or `failed` with a 6-hour retry hold; never "file exists
+therefore maybe update"). The swap waits for a SAFE TAKEOVER POINT: no
+uninstall, no Admin install/update/launch handoff, no fresh QA
+redemption, no Setup takeover in flight, no native lifecycle card. Then
+the bridge drains (new lifecycle operations are refused for the final
+seconds), a %TEMP% copy of the signed client runs `--finish-self-update`,
+the old process exits, the helper renames live -> `.old` and staged ->
+live, starts the new client, and confirms the takeover by the bridge
+answering with the NEW version. Success removes every trace; any failure
+puts the known-good binary straight back, restarts it, and records the
+failure. A fresh `swapping` record belongs to the helper (a starting
+client leaves it alone for 10 minutes) so a rollback can never race a
+re-staged copy of itself into a loop.
+
+QUIET BY DESIGN: no card, no toast, no Admin modal - the restart fits
+inside the browser's 5-second disconnect hysteresis and open virule.app
+pages simply reconnect. EXPLICIT UNINSTALL ALWAYS WINS: under the durable
+intent latch nothing checks, stages, swaps, or resurrects, staged residue
+is discarded, and the helper stands down without starting anything.
+
+VERSION AUTHORITY: the executable's compiled version constant is the one
+truth. At startup a managed client heals the mirrors from it -
+state.json's `installed_version` and the Apps & Features `DisplayVersion`
+(only when the ViruleClient entry's own UninstallString names this
+executable). Setup, for its part, clears self-update residue whenever it
+installs (its install is the one client-acquisition transaction while it
+runs). Targeted regression suite: `tools/self_update_test.mjs` (`pre` =
+sandboxed lifecycle scenarios; `swap` = a real old->new binary swap).
+
 ## Install / uninstall
 
 Setup fetches the manifest, validates it structurally (version grammar, an

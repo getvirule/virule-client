@@ -91,6 +91,27 @@ inline std::filesystem::path installed_client_exe() {
     return d.empty() ? d : d / L"virule-client.exe";
 }
 
+// Client self-update staging, beside the installed exe on the same volume
+// so the swap is two atomic renames. `.update` is the verified staged new
+// client; `.old` exists only during a swap (the known-good binary the
+// helper restores on failure).
+inline std::filesystem::path client_update_staged_exe() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"virule-client.exe.update";
+}
+
+inline std::filesystem::path client_old_exe() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"virule-client.exe.old";
+}
+
+// The client self-update transaction record (client-owned state; removed
+// with the client state dir by uninstall).
+inline std::filesystem::path self_update_state_file() {
+    const auto r = client_state_dir();
+    return r.empty() ? r : r / L"self_update.json";
+}
+
 // The managed VIRULE Admin installation. ONLY this location counts as "Admin
 // installed": a development tree or a manually extracted copy elsewhere is
 // never reported or launched by the client.

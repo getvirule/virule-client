@@ -41,6 +41,7 @@
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
+#include "client/self_update.hpp"
 #include "client/takeover.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
@@ -93,6 +94,28 @@ bool forward_to_running_instance(const std::string& message) {
     std::string response;
     return vclient::bridge::loopback_roundtrip(
         vclient::bridge::kPort, nullptr, "\"virule_client\"", message, response);
+}
+
+// CLIENT SELF-UPDATE SAFE TAKEOVER POINT (owner spec 2026-09-04).
+// Downloading and verifying in advance is always fine; the actual binary
+// swap defers while ANY lifecycle transaction is live: an uninstall, an
+// Admin install/update/launch handoff, a QA credential provisioning that
+// just ran, a Setup takeover, or any native lifecycle card the swap's exit
+// would tear down. An idle client with only quiet page connections is the
+// normal swap moment (the browser's disconnect hysteresis masks the
+// restart).
+bool self_update_safe_point() {
+    namespace ai = vclient::admin_install;
+    if (vclient::bridge::g_uninstalling.load()) return false;
+    if (ai::g_busy.load()) return false;                       // Admin install/update
+    if (vclient::takeover::takeover_in_flight()) return false; // Setup handoff
+    if (vclient::result_card::is_visible()) return false;      // a native surface is live
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long qa = vclient::bridge::g_last_qa_tick.load();
+    if (qa != 0 && now - qa < 120000) return false;            // QA redemption settling
+    const unsigned long long launch = ai::g_last_admin_launch_tick.load();
+    if (launch != 0 && now - launch < 15000) return false;     // Admin launch in flight
+    return true;
 }
 
 // THE ORDERED UNINSTALL (owner corrective spec 2026-09-04). Explicit user
@@ -148,6 +171,9 @@ void run_uninstall_sequence(bool delete_data) {
         return;
     }
     vclient::uninstall::reconcile_admin_update_residue();
+    // A staged-but-uncommitted client self-update is discarded, never
+    // applied: uninstall wins over every pending update.
+    vclient::self_update::discard_pending();
 
     // 4. Admin first, gracefully (the update path's own machinery). A
     // refusal aborts the whole uninstall with nothing destroyed: the
@@ -387,19 +413,44 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
     // reset client never serves stale/empty version knowledge.
     vclient::admin_install::reconcile_installed_version();
 
+    // CLIENT SELF-UPDATE housekeeping (managed installs only): bring any
+    // interrupted self-update transaction to one deterministic state, then
+    // heal the outward version mirrors (state.json installed_version, the
+    // Apps & Features DisplayVersion) from this executable's own compiled
+    // version constant - the one authority. The short wait resolves the
+    // listener state first: a freshly swapped-in client clears the
+    // helper's rollback material only once it is demonstrably serving.
+    {
+        for (int i = 0; i < 30 && vclient::bridge::g_listen_state.load() == 0; ++i) {
+            Sleep(100);
+        }
+        vclient::self_update::reconcile_startup_residue(
+            vclient::bridge::g_listen_state.load() == 1);
+        vclient::self_update::refresh_installed_identity();
+    }
+
     // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
     // INSTALLING): one check at startup, then a quiet periodic recheck
     // while this process happens to be serving. Both no-op instantly when
     // no managed Admin install exists, so machines without one create no
     // background traffic. The thread is detached and dies with the process.
+    // The client's OWN self-update check rides the same quiet cadence
+    // (startup, then the 6-hour recheck) and never blocks the bridge: the
+    // listener is already up before this thread runs its first fetch.
+    // Checking (and even staging) is automatic and silent; the SWAP waits
+    // for the safe takeover point in the serve loop below.
     if (HANDLE h = CreateThread(nullptr, 0,
             [](LPVOID) -> DWORD {
                 vclient::admin_install::refresh_update_check(
                     vclient::admin_install::kUpdateCheckFreshMs);
+                vclient::self_update::refresh_check(
+                    vclient::self_update::kCheckFreshMs);
                 for (;;) {
                     Sleep(60000);
                     vclient::admin_install::refresh_update_check(
                         vclient::admin_install::kUpdateCheckPeriodMs);
+                    vclient::self_update::refresh_check(
+                        vclient::self_update::kCheckPeriodMs);
                 }
             },
             nullptr, 0, nullptr)) {
@@ -432,9 +483,39 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
         vclient::qa_flow::run(initial_qa_token);
     }
 
+    unsigned long long last_swap_attempt_tick = 0;
     for (;;) {
         Sleep(1000);
         if (g_exit_requested.load()) break;
+
+        // THE SELF-UPDATE SWAP MONITOR: a verified staged client waits
+        // here for the safe takeover point. UNINSTALL ALWAYS WINS: a
+        // standing uninstall intent discards the staged update instead of
+        // applying it. The drain flag closes the tiny race between the
+        // safety check and the exit: nothing new starts in a process that
+        // is about to hand its binary to the replacement helper.
+        if (vclient::self_update::g_swap_ready.load() &&
+            vclient::bridge::g_listen_state.load() == 1) {
+            const unsigned long long now = GetTickCount64();
+            if (now - last_swap_attempt_tick >= 15000) {
+                last_swap_attempt_tick = now;
+                if (vclient::lifecycle::uninstall_intent_active()) {
+                    vclient::log::client(
+                        "self-update: uninstall intent active; staged update discarded");
+                    vclient::self_update::discard_pending();
+                } else if (self_update_safe_point()) {
+                    vclient::bridge::g_self_update_draining.store(true);
+                    Sleep(250);
+                    if (self_update_safe_point() &&
+                        vclient::self_update::begin_swap()) {
+                        g_exit_requested.store(true);
+                        break; // drain and exit; the helper owns the swap
+                    }
+                    vclient::bridge::g_self_update_draining.store(false);
+                }
+            }
+        }
+
         if (vclient::bridge::g_listen_state.load() == 2) {
             // The port is genuinely unavailable (a foreign squatter; the
             // single-instance gate already ruled out a second client).
@@ -488,18 +569,58 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring arg2 = (argc > 2) ? argv[2] : L"";
     bool no_register = false;
     bool delete_data_arg = false;
+    bool dev_unsigned = false;      // self-update signature gates only (dev)
+    std::wstring self_manifest_url; // self-update manifest seam (dev)
     for (int i = 1; i < argc; ++i) {
-        if (std::wstring(argv[i]) == L"--no-register") no_register = true;
-        if (std::wstring(argv[i]) == L"--delete-data") delete_data_arg = true;
+        const std::wstring arg = argv[i];
+        if (arg == L"--no-register") no_register = true;
+        if (arg == L"--delete-data") delete_data_arg = true;
+        if (arg == L"--dev-unsigned") dev_unsigned = true;
+        if (arg.rfind(L"--self-manifest-url=", 0) == 0) {
+            self_manifest_url = arg.substr(20);
+        }
     }
     LocalFree(argv);
-    if (arg1 == L"--no-register") arg1.clear();
+    if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
+        arg1.rfind(L"--self-manifest-url=", 0) == 0) {
+        arg1.clear();
+    }
+
+    // Self-update run configuration. Self-update manages ONLY the managed
+    // installation: it is enabled exactly when this process IS
+    // %LOCALAPPDATA%\Programs\VIRULE\virule-client.exe (a development tree
+    // never self-updates). The %TEMP% helper mode below reads the same
+    // configuration.
+    vclient::self_update::g_dev_unsigned = dev_unsigned;
+    vclient::self_update::g_manifest_override = self_manifest_url;
+    vclient::self_update::g_no_register = no_register;
+    {
+        wchar_t self[MAX_PATH * 2] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, self,
+                                           (DWORD)(sizeof(self) / sizeof(self[0])));
+        std::wstring self_path = (n > 0 && n < sizeof(self) / sizeof(self[0]))
+            ? std::wstring(self, n) : std::wstring();
+        std::wstring installed = vclient::paths::installed_client_exe().wstring();
+        for (wchar_t& c : self_path) c = (wchar_t)towlower(c);
+        for (wchar_t& c : installed) c = (wchar_t)towlower(c);
+        vclient::self_update::g_enabled.store(
+            !installed.empty() && self_path == installed);
+    }
 
     // ---- helper mode (a %TEMP% copy finishing an uninstall) ----
     if (arg1 == L"--finish-uninstall") {
         unsigned long pid = 0;
         try { pid = std::stoul(arg2); } catch (...) {}
         return run_finish_uninstall(pid, delete_data_arg);
+    }
+
+    // ---- helper mode (a %TEMP% copy finishing a client self-update) ----
+    // Handles the uninstall-intent latch itself (a latched machine gets
+    // its staged update discarded and NO client started - uninstall wins).
+    if (arg1 == L"--finish-self-update") {
+        unsigned long pid = 0;
+        try { pid = std::stoul(arg2); } catch (...) {}
+        return vclient::self_update::run_finish_self_update(pid);
     }
 
     // ---- Windows-initiated uninstall (Apps & Features / command line) ----

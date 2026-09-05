@@ -504,6 +504,18 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // Setup just placed the approved client itself, so any client
+    // SELF-UPDATE residue (staged binary, swap leftovers, the transaction
+    // record) describes a world that no longer exists. Reconcile it away
+    // deterministically; Setup's own install is the one client-acquisition
+    // transaction while Setup runs.
+    std::filesystem::remove(vclient::paths::client_update_staged_exe(), ec);
+    ec.clear();
+    std::filesystem::remove(vclient::paths::client_old_exe(), ec);
+    ec.clear();
+    std::filesystem::remove(vclient::paths::self_update_state_file(), ec);
+    ec.clear();
+
     // 6. Per-user registration: virule:// and the uninstall entry. The
     // installed client is the canonical virule:// handler; the VIRULE Admin
     // defers to it rather than taking the scheme back.

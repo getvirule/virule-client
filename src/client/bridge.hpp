@@ -184,6 +184,14 @@ inline Callbacks g_callbacks;
 // returns the client to normal service.
 inline std::atomic<bool> g_uninstalling{ false };
 
+// CLIENT SELF-UPDATE DRAIN: the client is seconds from exiting so the
+// replacement helper can swap its binary. New lifecycle operations are
+// refused during this brief window (the caller retries against the new
+// client after the swap; the browser's disconnect hysteresis masks the
+// restart). Deliberately NOT surfaced in status: routine self-update is
+// quiet plumbing, never a rendered state.
+inline std::atomic<bool> g_self_update_draining{ false };
+
 // Activity clock for the idle-exit policy: any accepted connection or
 // handled message refreshes it.
 inline std::atomic<unsigned long long> g_last_activity_tick{ 0 };
@@ -593,6 +601,15 @@ inline void handle_client(SOCKET client) {
             // ORDERED TEARDOWN: once an explicit uninstall has begun, no
             // lifecycle operation is accepted any more (owner precedence
             // rule 2026-09-04). The status answer carries the truth.
+            if (!reply(0x1, "{\"type\":\"error\"}")) return;
+        } else if (g_self_update_draining.load() &&
+                   (type == "admin_install" || type == "admin_launch" ||
+                    type == "admin_open" || type == "qa_accept" ||
+                    type == "qa_verify_url" || type == "setup_takeover" ||
+                    type == "uninstall" || type == "uninstall_local")) {
+            // SELF-UPDATE DRAIN: this process exits within moments so its
+            // binary can be swapped; nothing new may start in it. The
+            // freshly swapped client accepts the retry seconds later.
             if (!reply(0x1, "{\"type\":\"error\"}")) return;
         } else if (type == "admin_install") {
             // The verified staged Admin install/update. The pipeline itself
