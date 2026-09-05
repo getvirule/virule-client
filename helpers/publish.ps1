@@ -77,20 +77,32 @@ function Invoke-Gh([string[]]$GhArgs, [switch]$AllowFail) {
 
 # Downloads one published release asset to a temp file; $null when the
 # asset does not exist on the release.
+function Remove-TempDir([string]$dir) {
+    # The repo lives under Dropbox: its sync client briefly holds freshly
+    # written files, so a one-shot Remove-Item loses the race. Bounded
+    # retries; a stubborn leftover under build\publish is never a reason
+    # to fail a publish that already verified.
+    for ($i = 0; $i -lt 10; $i++) {
+        try { Remove-Item $dir -Recurse -Force -ErrorAction Stop; return } catch {}
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Host "--    note: temp dir left behind (Dropbox lock): $dir"
+}
+
 function Get-RemoteAssetHash([string]$tag, [string]$asset) {
     $tmpDir = Join-Path $stageDir ("remote_" + [IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Force $tmpDir | Out-Null
     $r = Invoke-Gh @('release', 'download', $tag, '-R', $ghRepo, '--pattern', $asset, '--dir', $tmpDir) -AllowFail
     $file = Join-Path $tmpDir $asset
     if ($r.Code -ne 0 -or -not (Test-Path $file)) {
-        Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-TempDir $tmpDir
         if ($r.Code -ne 0 -and $r.Out -notmatch 'no assets|not found|release not found') {
             Fail "could not probe remote asset ${asset}:`n$($r.Out)"
         }
         return $null
     }
     $h = Sha256 $file
-    Remove-Item $tmpDir -Recurse -Force
+    Remove-TempDir $tmpDir
     return $h
 }
 
@@ -104,7 +116,7 @@ function Verify-PublicAsset([string]$url, [string]$expectedSha, [string]$label) 
         Fail "$label not downloadable from $url ($($_.Exception.Message))"
     }
     $h = Sha256 $tmp
-    Remove-Item $tmp -Force
+    Remove-TempDir $tmp
     if ($h -ne $expectedSha) { Fail "$url served wrong bytes (got=$h expected=$expectedSha)" }
     Write-Host "OK:   verified $label at $url"
 }
