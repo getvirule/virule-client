@@ -45,6 +45,8 @@
 #include <mutex>
 #include <string>
 
+#include "shared/environment.hpp"
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -68,7 +70,7 @@ constexpr UINT kMsgClose = WM_APP + 2;
 
 // The one URL the Ready card's explicit action opens. Compile-time
 // constant; the card never opens anything else.
-constexpr wchar_t kSiteUrl[] = L"https://virule.app/";
+constexpr const wchar_t* kSiteUrl = env::kSiteUrl;
 
 enum class Mode { Result, Working, Ready, Action };
 

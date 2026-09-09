@@ -23,8 +23,8 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <OutDir>$(SolutionDir)build\Release\x64\</OutDir>
-    <IntDir>$(SolutionDir)build\obj\client\x64\</IntDir>
+    <OutDir>$(SolutionDir)build\Release\x64\$(ViruleOutLeaf)</OutDir>
+    <IntDir>$(SolutionDir)build\obj\client\x64\$(ViruleOutLeaf)</IntDir>
     <TargetName>virule-client</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">

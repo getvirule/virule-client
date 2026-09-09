@@ -68,6 +68,7 @@
 #include "client/admin_install.hpp" // version_is_upgrade, grammar helpers
 #include "client/bridge.hpp"
 #include "shared/client_state.hpp"
+#include "shared/environment.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/lifecycle_intent.hpp"
@@ -91,12 +92,11 @@
 
 namespace vclient::self_update {
 
-// The client release manifest: identical source and pin to Virule-Setup.
-constexpr wchar_t kManifestHost[] = L"github.com";
-constexpr wchar_t kManifestPath[] =
-    L"/getvirule/virule-client/releases/latest/download/manifest.json";
-constexpr char kClientUrlPrefix[] =
-    "https://github.com/getvirule/virule-client/releases/download/";
+// The client release manifest: identical source and pin to Virule-Setup,
+// both taken from the ONE environment seam (shared/environment.hpp).
+constexpr const wchar_t* kManifestHost = env::kClientManifestHost;
+constexpr const wchar_t* kManifestPath = env::kClientManifestPath;
+constexpr const char* kClientUrlPrefix = env::kClientUrlPrefix;
 constexpr size_t kMaxManifestBytes = 16 * 1024;
 constexpr size_t kMaxClientBytes = 64 * 1024 * 1024;
 
@@ -283,7 +283,10 @@ inline bool staged_binary_valid(const Txn& t, std::string& why) {
         why = "staged sha256 mismatch";
         return false;
     }
-    if (!g_dev_unsigned) {
+    // Staging artifacts are never signed (env::kRequireAuthenticode), so a
+    // staging build skips these two gates and only these two. The sha256
+    // pin above still holds byte for byte in both environments.
+    if (env::kRequireAuthenticode && !g_dev_unsigned) {
         if (!verify_binary::authenticode_valid(staged)) {
             why = "staged Authenticode verification failed";
             return false;

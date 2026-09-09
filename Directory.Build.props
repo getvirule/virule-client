@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  THE STAGING BUILD SEAM, part 1 of 2 (see Directory.Build.targets).
+
+  Imported automatically by MSBuild at the TOP of every project under this
+  directory, before the project sets its own OutDir/IntDir. That ordering is
+  the point: $(ViruleOutLeaf) has to exist before the project uses it, or
+  $(TargetPath) and $(TargetDir) would be computed from the production path
+  while the linker wrote somewhere else.
+
+  With VIRULE_ENV unset (every normal and every release build) the leaf is
+  EMPTY and every output path is character-for-character what it was before
+  this file existed.
+-->
+<Project>
+  <PropertyGroup>
+    <ViruleOutLeaf></ViruleOutLeaf>
+    <ViruleOutLeaf Condition="'$(VIRULE_ENV)' == 'Staging'">staging\</ViruleOutLeaf>
+  </PropertyGroup>
+</Project>

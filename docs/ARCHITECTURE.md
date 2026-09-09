@@ -1,6 +1,11 @@
 # VIRULE Client architecture (Phase 2)
 
-Current state only. When a change makes something here untrue, REPLACE it.
+Current state only. When a change makes something here untrue, REPLACE it,
+and advance the last-verified stamp.
+
+Last verified 2026-09-05, against client v0.7.4. The compiled constant in
+`src/shared/version.h` is the version authority; a version tag below marks
+when a contract was introduced, never the current release.
 
 ## The bridge (transport + discovery)
 
@@ -53,17 +58,28 @@ in both components).
 | page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
-| local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale |
+| local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below |
+| local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch |
+| local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
 
-Client pushes: `{"type":"qa_result","token","state"}` and
-`{"type":"admin_result","state","version"}` to every connected page.
-The status answer's `"admin"` block is
-`{"installed":bool,"version":"...","running":bool}` - the managed
-installation only (below); a development tree is never reported, and an
-EMPTY version with installed:true means genuinely unknown (never to be
-rendered as a currency claim).
+Client pushes to every connected page: `{"type":"qa_result","token","state"}`,
+`{"type":"admin_result","state","version"}`,
+`{"type":"uninstall_state","state":"removing"|"failed"}` (the ordered
+teardown's transitions; success has no push by construction - the client
+exits and the helper owns the visible outcome), and, the P1 lifecycle
+status push (v0.6.3), UNSOLICITED `status` frames whenever the lifecycle
+core changes (the admin block or the `uninstalling` flag): a 1 s watcher
+while pages are connected plus immediate pushes at operation boundaries
+(update start/end, Admin launch, teardown start), so open virule.app tabs
+converge in about a second instead of their 15 s poll, which stays as the
+convergence backstop. Local control connections never receive pushes.
+The status answer carries `"uninstalling":bool` and the `"admin"` block
+`{"installed":bool,"version":"...","running":bool,"updating":bool}` - the
+managed installation only (below); a development tree is never reported,
+and an EMPTY version with installed:true means genuinely unknown (never
+to be rendered as a currency claim).
 Everything else answers `{"type":"error"}`. Frames over 4 KB, unmasked
 client frames, and malformed handshakes drop the connection.
 
@@ -138,7 +154,15 @@ OWNERSHIP: registration is per-user (`HKCU\Software\Classes\virule`), the
 same registry shape in both components. When the client is INSTALLED it is
 the canonical handler, because it is the process the browser's bridge is
 waiting for. The client self-heals its registration on every run
-(`--no-register` skips this for development). The Admin no longer takes
+(`--no-register` skips this for development), with ONE guard: every
+machine-registration WRITE (protocol registration, Setup's install-time
+registration, self-update's ARP healing) refuses while
+`paths::environment_redirected()` answers true, i.e. while the
+env-resolved `%LOCALAPPDATA%` is not the OS-known per-user folder, so a
+sandboxed harness run can never capture the real machine's registration.
+The check fails open on a shell API failure (a real install never loses
+its registration to a hiccup) and removal paths are deliberately
+unguarded. The Admin no longer takes
 the scheme back on every GUI launch: it prefers the installed client, heals
 a registration that names neither, and registers itself only when no client
 is installed. Both still handle `qa/verify` identically, so QA works
@@ -151,6 +175,102 @@ browser's bridge finds it. It reads no QA state at all, test mode included.
 Single instance: `Local\ViruleClient.Singleton` mutex; a second launch
 forwards its URL (or a wake) to the running instance over the bridge and
 exits.
+
+## Environments (production and staging)
+
+VIRULE has exactly TWO environments. There is ONE implementation of the
+client: an environment is a set of constants, never a second code path.
+The install pipeline, the download caps, the exact-size and exact-SHA-256
+gates, the zip-slip guards, the atomic placement and the whole bridge
+protocol are byte-identical in both.
+
+**`virule/core/launch_policy.hpp` is THE seam** (vendored byte-identical
+under `third_party/`, shared with the Admin). It is the only place in any
+C++ component where either environment is named:
+
+| Constant | Production | Staging |
+|---|---|---|
+| `kEmbargoApiHost` | `api.virule.app` | the staging Worker host |
+| `kSiteUrlW` | `https://virule.app/` | `https://virule-api-staging.heath-michaels9441.workers.dev/` |
+| `kSiteOrigins` | `virule.app` + `www.virule.app` | the staging site |
+| `kAdminManifestHostW` | `virule.app` | the staging Worker host |
+| `kAdminPackageUrlPrefix` | `getvirule/virule-overlay-releases` | `getvirule/virule-staging-releases` |
+| `kClientManifestPathW` | `getvirule/virule-client` `releases/latest/download/manifest.json` | `getvirule/virule-staging-releases` `releases/download/client-staging/manifest.json` |
+| `kClientUrlPrefix` | `getvirule/virule-client` | `getvirule/virule-staging-releases` |
+| `kRequireAuthenticode` | `true` | `false` |
+| `kViruleEmbargoPublicKeyHex` | the production key | a SEPARATE staging key |
+
+Staging has its OWN embargo keypair, so the staging Worker's
+`uninstall-auth` and QA credential signatures verify in staging and
+nowhere else.
+
+`src/shared/environment.hpp` is a VIEW over that seam, not a second source
+of truth: it re-exports those constants under the names the client's call
+sites use and adds the one genuinely client-specific value, the LOCAL
+DEVELOPMENT origins (the vite dev server for the site and `wrangler dev`
+for the QA page, neither of which exists for the Admin). Its
+`origin_allowed()` defers to `launch_policy::is_site_origin()` rather than
+repeating a site URL, so the client's bridge and the Admin's QA bridge can
+never disagree about which pages they answer.
+
+That sharing is the point rather than tidiness: the Admin host's client
+self-heal (`admin_host.cpp`, `client_health`) reads the SAME client-release
+constants this client's Setup and self-update read. When each carried its
+own copy, a staging Admin could have silently repaired itself back to the
+production client.
+
+**Production is the default and cannot be reached by accident.** With no
+macro defined every constant is exactly what it has always been.
+`VIRULE_ENV_STAGING` is added only by an explicit staging build:
+
+```
+helpers\build.ps1 -Stage all -Environment Staging
+```
+
+which `Directory.Build.props` / `.targets` turn into the macro plus a
+separate `build\Release\x64\staging\` output leaf, so a staging binary and
+a production binary are never the same file and a staging build can never
+overwrite a signed production artifact.
+
+**Why staging may run unsigned.** Staging exists to exercise the product
+end to end without consuming manual Microsoft Artifact Signing capacity.
+The relaxation is deliberately narrow and structural:
+
+- it lives in ONE constant, `kRequireAuthenticode`;
+- that constant is `true` in every build that does not define
+  `VIRULE_ENV_STAGING`, so a production binary contains no reachable path
+  that skips the signature gates;
+- a staging build only ever downloads from the staging release repository
+  and the staging Worker, neither of which holds a production artifact;
+- the exact-size and exact-SHA-256 gates are NOT relaxed. A staging
+  package is still pinned byte for byte by its manifest.
+
+The origin allowlists are environment-scoped rather than merged, and they
+do not overlap: a staging client does not answer virule.app, and a
+production client does not answer the staging site. That is what stops a
+page in one environment from ever driving an install in the other.
+
+**Staging distribution** uses FIXED tags on `getvirule/virule-staging-releases`
+rather than a `latest` pointer, because that repository also carries the
+staging Admin packages and "latest" there would mean whichever release was
+cut last:
+
+| Tag | Assets |
+|---|---|
+| `client-staging` | `Virule-Setup.exe`, `virule-client.exe`, `manifest.json` |
+| `admin-staging` | `Virule-v<version>-staging.zip` |
+
+`helpers/publish_staging_client.ps1` is the only writer of the first, and
+it is the mirror image of `publish.ps1`: where the production publisher
+refuses anything unsigned, the staging publisher refuses anything that is
+not a STAGING build (it reads the compiled-in staging host out of the
+bytes) and refuses to touch a production repository or tag. Staging assets
+are always replaced with `--clobber`; nothing in the world pins them.
+
+The whole staging environment is built and deployed by one script,
+`v2_mvp\helpers\release_staging.ps1`, which also proves it did not touch a
+signed production artifact and re-reads the production manifest afterwards.
+`tools/staging_env_test.mjs` is the end-to-end proof.
 
 ## Distribution (GitHub Releases, getvirule/virule-client)
 
@@ -318,26 +438,38 @@ the client, Setup:
    a window open forever; they are failure handling, never the path.
 
 The client releases Setup (`src/client/takeover.hpp`) only once the next
-feedback surface is demonstrably in place (lifecycle continuity pass,
-2026-09-03, v0.6.0):
+feedback surface is demonstrably in place. THE SINGLE AUTHORITATIVE
+DECISION (v0.6.5, superseding the earlier page-alive step-aside
+branches): every Setup takeover terminates in exactly ONE of two native
+surfaces, and Setup is never released into neither.
 
-- QA_ACCEPT: the branded native continuation card "Finishing up…" ALWAYS
-  shows before Setup may close (the user watching the native flow never
-  has to hunt for the browser), then resolves to "You're all set." and
-  closes itself; a live page still receives the result push and reaches
-  its own success state in parallel.
-- INSTALL_ADMIN: a live page owns the install UX (Setup releases on its
-  acknowledgement); with the browser gone the client runs the install
-  behind a branded "Installing…"/"Updating…" card and launches the Admin
-  at completion.
-- no envelope: the standalone completion card.
+- PENDING INTENT EXISTS -> the branded native continuation card
+  "Finishing up…", UNCONDITIONALLY; a live page renders its own progress
+  IN PARALLEL, never instead. A QA_ACCEPT continuation resolves to
+  "You're all set." and closes itself while a live page still receives
+  the result push. An INSTALL_ADMIN takeover holds the card through
+  "Installing…"/"Updating…" until the installation completes and the
+  Admin launches; envelope-driven and page-driven installs converge on
+  the ONE `g_busy` operation whichever starts first, and an
+  already-current installed Admin short-circuits to open (never
+  re-downloads the package).
+- NO PENDING INTENT (the bounded watch expires with no operation; a
+  merely-connected idle page is NOT an operation and does not suppress
+  this) -> the standalone branded "VIRULE is ready" card with the ONE
+  explicit `[ Continue ]` action. Only that click opens a browser
+  (virule.app, in the Windows default); the homepage's continuous
+  detection then resolves the machine's real state. The card is TERMINAL
+  but REVOCABLE: a browser-owned operation arriving late (a
+  closed/throttled tab delivering its durable intent) supersedes it, and
+  a mid-watch arrival is instead converted live into the continuation so
+  Ready never flashes first.
 
-A Setup run with NO envelope (standalone / stale download) has no
-recoverable intent and none is invented: after a short watch for a live
-page or native QA progress, the client shows the branded "VIRULE is
-ready" card with the ONE explicit `[ Continue ]` action. Only that click
-opens a browser (virule.app, in the Windows default). The homepage's
-continuous detection then resolves the machine's real state.
+THE LATE-ENVELOPE UPGRADE KEEPS A LIVE WORKING CARD (v0.7.4 dead-air
+fix): the standalone->operation upgrade closes only a non-Working card;
+a visible "Finishing up…" card is ADOPTED, never destroyed and reshown,
+and the next-surface-visible gate accepts only a genuinely visible
+Working card (`is_working_visible`), so Setup can never be released
+against a dying window.
 
 `result_card.hpp` is the ONE client lifecycle surface: the bare Result
 mode is the unchanged QA-doctrine card (no brand mark), while Working /
@@ -355,6 +487,23 @@ user-initiated launch of an out-of-date managed Admin is handed over by
 virule.exe as the local-only `admin_launch` bridge message: the client
 updates first (same card) and launches only the new Admin; a failed update
 never blocks the launch.
+
+LAUNCH-TIME LOOP BREAKER, PERSISTED (P2 hardening, v0.7.2): a failed
+launch-time transaction records ONE hold in state.json
+(`admin_hold_version`, `failed_utc`, `until_utc`) that survives client
+restarts, read as TWO windows: 90 s of claim suppression for every
+`admin_update_check` caller (the loop breaker), and a 6 h launch-retry
+window for callers declaring `{"context":"launch"}` (the virule.exe
+launch check), so a persistently failing package is never re-downloaded
+on every launch while Settings and virule.app keep seeing the update.
+The hold is cleared by any successful install/update and by startup
+housekeeping (expired, moot, malformed, future-stamped). WATCHED
+RELAUNCH (P2): every update-path Admin launch is watched (a
+CreateProcess failure or an early exit with no managed process is a
+concrete failure); one automatic retry after 2 s, then the client-owned
+"Something went wrong." + Try again card. Try again retries ONLY the
+launch; an intact installation is never re-downloaded for a launch
+problem, and dismissal ends the recovery with everything preserved.
 
 ## Browser-owned pending intent
 
@@ -402,6 +551,41 @@ outside every inventory root and can never be touched. A full VIRULE
 uninstall and removing an individual future game are SEPARATE actions
 forever; this inventory must never grow a recursive game-library delete.
 
+### The durable intent latch and the ordered teardown (P0, 2026-09-04)
+
+EXPLICIT USER UNINSTALL OUTRANKS EVERY AUTOMATIC RECOVERY (the locked
+precedence): once removal begins VIRULE may not repair, reinstall,
+re-register or relaunch itself. THE DURABLE INTENT LATCH is the registry
+value `HKCU\Software\VIRULE\Lifecycle` / `UninstallInProgress`
+(REG_DWORD 1, plus an `UninstallStartedUtc` inspection stamp;
+`src/shared/lifecycle_intent.hpp`): written BEFORE any teardown,
+surviving process exits and partial failure, cleared LAST after a fully
+successful removal, or by an explicit Virule-Setup install (newer
+explicit intent in the opposite direction; also the stale-latch recovery
+path). The key path and value name are a CROSS-REPO CONTRACT: the VIRULE
+Admin (admin_host `client_health`, virule.exe's launch cooperation)
+reads the same location with its own copy of the check. Every
+resurrection path on both sides honors it - self-heal, repair, on-demand
+client start, protocol re-registration, update, managed launch - and
+stands down while it is set; a freshly started client refuses to serve
+at all while latched, and self-update discards staged residue under it.
+
+THE ORDER IS THE CONTRACT: intent latch -> the bridge refuses new
+lifecycle operations (status carries `"uninstalling":true`;
+`uninstall_state` removing/failed pushed to pages) -> an in-flight Admin
+update is CANCELLED back to known-good (stage-boundary checks plus an
+abortable download; uninstall wins, never drained) -> update residue
+reconciled -> the Admin closed GRACEFULLY (a refusal aborts with NOTHING
+destroyed, failure push, latch kept) -> the client exits -> the VISIBLE
+`%TEMP%` helper (branded "Removing VIRULE…" card; log in
+`%TEMP%\virule-uninstall.log`) waits for every install-dir process,
+removes FILES (bounded retries per tree), then REGISTRATIONS LAST
+(`virule://` only while it points into the removed tree, then the ARP
+entry), verifies, clears the latch LAST, and shows "VIRULE has been
+uninstalled." (plus "Your local data was kept." in the default mode). A
+failed removal keeps the latch AND the registrations
+(Windows-recoverable) and offers Try again on the card.
+
 ## The managed VIRULE Admin installation (Phase 2)
 
 The client owns exactly one Admin install location:
@@ -418,7 +602,10 @@ decides which Admin release is approved; the package bytes live on the
 `getvirule/virule-overlay-releases` GitHub Release
 (`Virule-v<version>.zip`, the folder contents at the zip root, generated
 and verified by `helpers/publish_admin.ps1`). The manifest url is pinned
-to that repository's `releases/download/` prefix.
+to that repository's `releases/download/` prefix. Dev seams mirror
+Setup's: `--admin-manifest-url=` points the approved-manifest fetch
+elsewhere and relaxes only the repository pin; `--dev-unsigned` waives
+only the signature gates.
 
 THE VERIFIED STAGED PIPELINE (install and update are the same path; an
 update never touches the live install file-by-file): fetch manifest ->
@@ -431,6 +618,18 @@ SidecarKHost.exe) -> atomic placement. A fresh install is ONE directory
 rename; an update renames live -> `Admin.previous`, staging -> `Admin`,
 and a failed swap renames the previous install straight back, so a
 known-good install always survives.
+
+STARTUP RESIDUE RECONCILIATION (uninstall corrective pass, hardened by
+the P2 pass): once at client startup, before any operation can be in
+flight, an interrupted update cannot strand the managed tree. A missing
+live `Admin\` with a surviving `Admin.previous` is restored locally ONLY
+when the previous tree passes the pipeline's own bar (well-formed
+install metadata plus a valid VIRULE signature on every required
+component; `--dev-unsigned` relaxes only the signature half); a tree
+that fails validation is never promoted and never deleted here. Stale
+staging and stale downloads are always debris. The uninstall-path
+restore stays unvalidated on purpose: everything it touches is about to
+be removed.
 
 THE INSTALLED VERSION IS AUTHORITATIVE IN-INSTALL METADATA (the
 false-"up to date" fix, 2026-09-03): the pipeline writes

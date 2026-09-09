@@ -65,6 +65,7 @@
 #include "client/bridge.hpp"
 #include "client/result_card.hpp"
 #include "shared/client_state.hpp"
+#include "shared/environment.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
@@ -92,23 +93,31 @@
 
 namespace vclient::admin_install {
 
-// The approved Admin manifest: virule.app decides which release is
-// approved; GitHub only stores the bytes.
-constexpr wchar_t kManifestHost[] = L"virule.app";
-constexpr wchar_t kManifestPath[] = L"/client/admin-manifest.json";
+// The approved Admin manifest: the environment's own site decides which
+// release is approved; GitHub only stores the bytes. Both values come from
+// the ONE environment seam (shared/environment.hpp), so production and
+// staging differ by configuration and by nothing else.
+constexpr const wchar_t* kManifestHost = env::kAdminManifestHost;
+constexpr const wchar_t* kManifestPath = env::kAdminManifestPath;
 constexpr size_t kMaxManifestBytes = 16 * 1024;
 
 // The prefix every manifest package url must carry: a DIRECT versioned
-// release-asset URL of the Admin release repository, nothing else.
-constexpr char kPackageUrlPrefix[] =
-    "https://github.com/getvirule/virule-overlay-releases/releases/download/";
+// release-asset URL of this environment's Admin release repository,
+// nothing else.
+constexpr const char* kPackageUrlPrefix = env::kAdminPackageUrlPrefix;
 
 // Hard ceiling on the declared package size (the manifest's own size is the
 // operative cap; this bounds the manifest itself).
 constexpr unsigned long long kMaxPackageBytes = 2ull * 1024ull * 1024ull * 1024ull;
 
-// The identity every VIRULE-owned staged binary must be signed with.
-constexpr wchar_t kExpectedSigner[] = L"CN=Heath Michaels";
+// The identity every VIRULE-owned staged binary must be signed with, and
+// whether a signature is required at all. Both come from the environment
+// seam: production always requires one, and a STAGING build (which alone
+// defines VIRULE_ENV_STAGING) does not, because staging artifacts are
+// deliberately never signed. The exact-size and exact-SHA-256 gates below
+// are NOT relaxed in either environment.
+constexpr const wchar_t* kExpectedSigner = env::kExpectedSigner;
+constexpr bool kRequireAuthenticode = env::kRequireAuthenticode;
 
 // ---- development seams (set once by main.cpp before serving) ----
 // The same two seams the client self-update has: --dev-unsigned relaxes
@@ -276,7 +285,7 @@ inline bool previous_install_restorable(const std::filesystem::path& previous,
             why = "required component missing: " + p.filename().string();
             return false;
         }
-        if (!g_dev_unsigned &&
+        if (kRequireAuthenticode && !g_dev_unsigned &&
             (!verify_binary::authenticode_valid(p) ||
              !verify_binary::signed_by(p, kExpectedSigner))) {
             why = "signature verification failed: " + p.filename().string();
@@ -1319,7 +1328,7 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
             broadcast_result("failed", "");
             return "failed";
         }
-        if (!g_dev_unsigned &&
+        if (kRequireAuthenticode && !g_dev_unsigned &&
             (!verify_binary::authenticode_valid(p) ||
              !verify_binary::signed_by(p, kExpectedSigner))) {
             log::client("admin: staged binary failed signature verification: " +

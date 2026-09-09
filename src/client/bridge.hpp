@@ -85,6 +85,7 @@
 #include <string>
 #include <vector>
 
+#include "shared/environment.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 #include "shared/protocol_reg.hpp"
@@ -113,19 +114,12 @@ constexpr unsigned short kPort = 47612;
 constexpr size_t kMaxHandshakeBytes = 8192;
 constexpr size_t kMaxFrameBytes = 4096;
 
-// Accepted browser origins. Production first; the rest are the explicit
-// local development origins (vite dev server for the site, wrangler dev
-// for the QA page). Never '*', never a wildcard.
-inline const char* kAllowedOrigins[] = {
-    "https://virule.app",
-    "https://www.virule.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "https://localhost:8788",
-    "https://127.0.0.1:8788",
-};
+// Accepted browser origins live in the ONE environment seam
+// (shared/environment.hpp -> virule/core/launch_policy.hpp): this
+// environment's site, plus the explicit local development origins. Never
+// '*', never a wildcard. The environments' site lists do not overlap, so a
+// production client does not answer the staging site and a staging client
+// does not answer virule.app.
 
 // What the serving process wires in.
 struct Callbacks {
@@ -441,10 +435,7 @@ inline std::string header_value(const std::string& text, const std::string& name
 }
 
 inline bool origin_allowed(const std::string& origin) {
-    for (const char* allowed : kAllowedOrigins) {
-        if (origin == allowed) return true;
-    }
-    return false;
+    return env::origin_allowed(origin);
 }
 
 // The uninstall authorization: a fresh service-signed statement that a

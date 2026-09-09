@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  THE STAGING BUILD SEAM, part 2 of 2 (see Directory.Build.props).
+
+  Imported automatically by MSBuild at the END of every project under this
+  directory, which is where a preprocessor definition can be appended to
+  whatever the project already declared. It does NOTHING unless VIRULE_ENV
+  is passed as "Staging":
+
+      msbuild client\virule_client.vcxproj /p:VIRULE_ENV=Staging ...
+
+  A staging build differs from a production build in exactly two mechanical
+  ways, both of them here and in Directory.Build.props:
+
+    1. VIRULE_ENV_STAGING is defined, which selects the staging half of
+       src\shared\environment.hpp and of virule\core\launch_policy.hpp.
+       Those two headers are the only places an environment is ever named.
+    2. Objects and binaries go to a separate `staging\` leaf, so a staging
+       binary can never be mistaken for, overwrite, or be published as a
+       production one, and switching between the two needs no clean.
+-->
+<Project>
+
+  <ItemDefinitionGroup Condition="'$(VIRULE_ENV)' == 'Staging'">
+    <ClCompile>
+      <PreprocessorDefinitions>VIRULE_ENV_STAGING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <Target Name="ViruleEnvironmentBanner" BeforeTargets="ClCompile"
+          Condition="'$(VIRULE_ENV)' == 'Staging'">
+    <Message Importance="high" Text="VIRULE ENVIRONMENT: STAGING  (output: $(OutDir))" />
+  </Target>
+
+</Project>

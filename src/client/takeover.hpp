@@ -64,6 +64,7 @@
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
+#include "shared/environment.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 
@@ -219,7 +220,9 @@ inline void run_admin(bool shortcut) {
         }
         result_card::close();
     } else {
-        result_card::update("Something went wrong.", "Try again at virule.app.");
+        result_card::update("Something went wrong.",
+                            std::string("Try again at ") +
+                                env::kSiteDisplayName + ".");
         result_card::wait_closed();
     }
     release();

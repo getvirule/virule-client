@@ -57,6 +57,7 @@
 #include "setup/handoff_listener.hpp"
 #include "setup/setup_window.hpp"
 #include "shared/client_state.hpp"
+#include "shared/environment.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/lifecycle_intent.hpp"
@@ -90,18 +91,23 @@ namespace {
 // versioned asset URL. GitHub serves release assets through an
 // https -> https redirect to its CDN, which WinHTTP's default redirect
 // policy follows.
-constexpr wchar_t kManifestUrl[] =
-    L"https://github.com/getvirule/virule-client/releases/latest/download/manifest.json";
+// Both the manifest pointer and the url pin come from the ONE environment
+// seam (shared/environment.hpp): production reads its repository's LATEST
+// release, staging reads a fixed tag in the staging release repository.
+constexpr const wchar_t* kManifestUrl = vclient::env::kClientManifestUrl;
 
-// The prefix every manifest client url must carry in production: a DIRECT
-// versioned release-asset URL of this repository, nothing else.
-constexpr char kClientUrlPrefix[] =
-    "https://github.com/getvirule/virule-client/releases/download/";
+// The prefix every manifest client url must carry: a DIRECT versioned
+// release-asset URL of this environment's client repository, nothing else.
+constexpr const char* kClientUrlPrefix = vclient::env::kClientUrlPrefix;
 
-// The identity every downloaded client must be signed with. Public
-// certificate subject material, not a secret; authenticode_valid remains
-// the trust decision and this pins WHO signed on top of it.
-constexpr wchar_t kExpectedSigner[] = L"CN=Heath Michaels";
+// The identity every downloaded client must be signed with, and whether a
+// signature is required at all. Public certificate subject material, not a
+// secret; authenticode_valid remains the trust decision and this pins WHO
+// signed on top of it. A STAGING build requires neither, because staging
+// artifacts are deliberately never signed; the manifest SHA-256 pin is
+// unchanged in both environments.
+constexpr const wchar_t* kExpectedSigner = vclient::env::kExpectedSigner;
+constexpr bool kRequireAuthenticode = vclient::env::kRequireAuthenticode;
 
 constexpr size_t kMaxManifestBytes = 16 * 1024;
 constexpr size_t kMaxClientBytes = 64 * 1024 * 1024;
@@ -463,7 +469,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         "staged write failed");
         }
     }
-    if (!vclient::verify_binary::authenticode_valid(staged)) {
+    if (!kRequireAuthenticode) {
+        vclient::log::setup("staging build: Authenticode gates are not applied");
+    } else if (!vclient::verify_binary::authenticode_valid(staged)) {
         if (allow_unsigned) {
             vclient::log::setup("payload is unsigned; proceeding (--dev-unsigned)");
         } else {

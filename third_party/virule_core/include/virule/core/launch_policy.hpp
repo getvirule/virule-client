@@ -156,9 +156,141 @@ inline bool is_public_key_hex(const std::string& s) {
 // a build made after registration existed).
 inline constexpr const char* kKeyEmbargoCertificate = "embargo_certificate";
 
+// ------------------------------------------------ THE ENVIRONMENT SEAM ----
+// VIRULE has exactly TWO environments, and THIS BLOCK IS THE ONLY PLACE IN
+// ANY C++ COMPONENT WHERE EITHER ONE IS NAMED. Nothing else in v2_mvp or in
+// virule-client may hardcode a VIRULE host, site URL, release repository or
+// signature policy: every such value is one of the constants below, so the
+// complete answer to "where does this build talk to?" is readable in one
+// screen and cannot silently diverge between two call sites.
+//
+// This header is vendored BYTE-IDENTICAL into
+// virule-client\third_party\virule_core\include\virule\core\launch_policy.hpp.
+// Keep the two copies in sync; they are one file with two homes.
+//
+// PRODUCTION IS THE DEFAULT, AND IT IS THE DEFAULT BY ABSENCE. With no macro
+// defined every constant below is byte-identical to what it has always been,
+// so an ordinary build has no way to reach staging and contains no code path
+// that behaves differently. VIRULE_ENV_STAGING is set ONLY by an explicit
+// staging build (`VIRULE_ENV=Staging`, wired in Directory.Build.targets),
+// which also writes to a separate output tree, so a staging binary and a
+// production binary are never the same file.
+//
+// Everything downstream (paths, grammar, verification, every call site) is
+// identical in both environments: the environment is configuration, never a
+// second implementation.
+//
+// WHY STAGING MAY RUN UNSIGNED. Staging exists to exercise the product end
+// to end without consuming manual Microsoft Artifact Signing capacity. The
+// relaxation is ONE constant, kRequireAuthenticode; it is `true` in every
+// build that does not define VIRULE_ENV_STAGING, and the exact-size and
+// exact-SHA-256 gates are NOT relaxed in either environment. A staging build
+// also only ever downloads from the staging release repository and the
+// staging Worker, neither of which holds a production artifact.
+#if defined(VIRULE_ENV_STAGING)
+
+// ------------------------------------------------------------ STAGING ----
+// One hostname in the staging Cloudflare account serves the staging website,
+// the `/qa/*` and `/client/*` browser surfaces and the same `/v1` contract,
+// so the whole staging journey is same-origin exactly as production's is.
+inline constexpr bool kIsStagingBuild = true;
+
+inline constexpr const char*    kEmbargoApiHost  = "virule-api-staging.heath-michaels9441.workers.dev";
+inline constexpr const wchar_t* kEmbargoApiHostW = L"virule-api-staging.heath-michaels9441.workers.dev";
+
+// The website. kSiteOrigins is the ORIGIN ALLOWLIST every loopback bridge
+// checks (the client's on 47612, the Admin's QA bridge on 47611). The two
+// environments' lists do not overlap, which is what stops a page in one
+// environment from ever driving an install in the other.
+inline constexpr const char* kSiteOrigins[] = {
+    "https://virule-api-staging.heath-michaels9441.workers.dev",
+};
+inline constexpr const wchar_t* kSiteUrlW =
+    L"https://virule-api-staging.heath-michaels9441.workers.dev/";
+inline constexpr const wchar_t* kSiteTermsUrlW =
+    L"https://virule-api-staging.heath-michaels9441.workers.dev/terms/";
+inline constexpr const wchar_t* kSitePrivacyUrlW =
+    L"https://virule-api-staging.heath-michaels9441.workers.dev/privacy/";
+// The site as it is SPOKEN in product copy ("Try again at ..."), never a URL
+// the user is expected to type.
+inline constexpr const char* kSiteDisplayName = "the VIRULE staging site";
+
+// The approved Admin manifest: the environment's own site decides which
+// release is approved; GitHub only stores the bytes.
+inline constexpr const wchar_t* kAdminManifestHostW =
+    L"virule-api-staging.heath-michaels9441.workers.dev";
+inline constexpr const wchar_t* kAdminManifestPathW = L"/client/admin-manifest.json";
+inline constexpr const char* kAdminPackageUrlPrefix =
+    "https://github.com/getvirule/virule-staging-releases/releases/download/";
+
+// The VIRULE Client's own release. Production follows its repository's
+// mutable "latest" pointer; staging follows a FIXED tag, because the staging
+// release repository also carries the Admin packages and "latest" there would
+// mean whichever release happened to be cut last.
+inline constexpr const wchar_t* kClientManifestHostW = L"github.com";
+inline constexpr const wchar_t* kClientManifestPathW =
+    L"/getvirule/virule-staging-releases/releases/download/client-staging/manifest.json";
+inline constexpr const wchar_t* kClientManifestUrlW =
+    L"https://github.com/getvirule/virule-staging-releases/releases/download/client-staging/manifest.json";
+inline constexpr const char* kClientUrlPrefix =
+    "https://github.com/getvirule/virule-staging-releases/releases/download/";
+
+// Staging artifacts are deliberately never signed. THE ONE RELAXATION.
+inline constexpr bool kRequireAuthenticode = false;
+
+#else
+
+// --------------------------------------------------------- PRODUCTION ----
+inline constexpr bool kIsStagingBuild = false;
+
 // Versioned API surface. Wide variants for the WinHTTP callers.
-inline constexpr const char*    kEmbargoApiHost       = "api.virule.app";
-inline constexpr const wchar_t* kEmbargoApiHostW      = L"api.virule.app";
+inline constexpr const char*    kEmbargoApiHost  = "api.virule.app";
+inline constexpr const wchar_t* kEmbargoApiHostW = L"api.virule.app";
+
+inline constexpr const char* kSiteOrigins[] = {
+    "https://virule.app",
+    "https://www.virule.app",
+};
+inline constexpr const wchar_t* kSiteUrlW        = L"https://virule.app/";
+inline constexpr const wchar_t* kSiteTermsUrlW   = L"https://virule.app/terms/";
+inline constexpr const wchar_t* kSitePrivacyUrlW = L"https://virule.app/privacy/";
+inline constexpr const char* kSiteDisplayName    = "virule.app";
+
+inline constexpr const wchar_t* kAdminManifestHostW = L"virule.app";
+inline constexpr const wchar_t* kAdminManifestPathW = L"/client/admin-manifest.json";
+inline constexpr const char* kAdminPackageUrlPrefix =
+    "https://github.com/getvirule/virule-overlay-releases/releases/download/";
+
+inline constexpr const wchar_t* kClientManifestHostW = L"github.com";
+inline constexpr const wchar_t* kClientManifestPathW =
+    L"/getvirule/virule-client/releases/latest/download/manifest.json";
+inline constexpr const wchar_t* kClientManifestUrlW =
+    L"https://github.com/getvirule/virule-client/releases/latest/download/manifest.json";
+inline constexpr const char* kClientUrlPrefix =
+    "https://github.com/getvirule/virule-client/releases/download/";
+
+inline constexpr bool kRequireAuthenticode = true;
+
+#endif
+
+// The identity every VIRULE-signed binary must carry. ENVIRONMENT
+// INDEPENDENT: staging does not RELAX the identity, it stops requiring a
+// signature at all (kRequireAuthenticode above), so there is no second
+// identity anywhere that could ever be accepted in production.
+inline constexpr const wchar_t* kExpectedSignerW = L"CN=Heath Michaels";
+
+// Is this origin the site THIS BUILD belongs to? Every loopback bridge's
+// origin check resolves through here, so the client's bridge and the Admin's
+// QA bridge can never disagree about which pages they answer.
+inline bool is_site_origin(const std::string& origin) {
+    for (const char* allowed : kSiteOrigins) {
+        if (origin == allowed) return true;
+    }
+    return false;
+}
+
+// The versioned paths are contract, not environment: both deployments run
+// the same Worker source and serve exactly these.
 inline constexpr const wchar_t* kEmbargoRegisterPathW = L"/v1/embargo/register";
 inline constexpr const wchar_t* kEmbargoStatusPathW   = L"/v1/embargo/status";
 inline constexpr const wchar_t* kEmbargoReleasePathW  = L"/v1/embargo/release";
@@ -170,8 +302,16 @@ inline constexpr const wchar_t* kEmbargoSchedulePathW     = L"/v1/embargo/schedu
 
 // VIRULE's Press Embargo PUBLIC verification key (raw Ed25519, hex).
 // Public by design; the private half exists only inside the hosted service.
+// Staging carries its OWN keypair (regenerated 2026-09-06 when staging moved
+// Cloudflare accounts), so the production private key exists on exactly one
+// Worker and a staging signature verifies nowhere but staging.
+#if defined(VIRULE_ENV_STAGING)
+inline constexpr const char* kViruleEmbargoPublicKeyHex =
+    "13d5379c752210233590f308b6e4826f9ca5ee1bfeb489d8594b51c6641a5681";
+#else
 inline constexpr const char* kViruleEmbargoPublicKeyHex =
     "6e7b1142a6913f202667430c3af50a76ba460f3a784558577cbe4eef3fa4df0b";
+#endif
 
 // 32 lowercase hex characters: the shape of game_uuid / build_uuid.
 inline bool is_uuid_hex32(const std::string& s) {
