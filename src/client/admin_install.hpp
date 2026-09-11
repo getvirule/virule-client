@@ -142,8 +142,8 @@ inline const wchar_t* kRequiredSigned[] = {
     L".resources\\bin\\x64\\SidecarKHost.exe",
 };
 
-// ONE install/update at a time; the flag also keeps the idle-exit policy
-// from ending the process mid-operation after the browser closes.
+// ONE install/update at a time; the flag also holds the client self-update
+// swap and the Setup continuation card off a running operation.
 inline std::atomic<bool> g_busy{ false };
 
 // UNINSTALL WINS (owner decision 2026-09-04): an explicit uninstall that
@@ -404,17 +404,58 @@ inline std::string status_json() {
 
 // ---- open ----
 
+// The managed Admin directory as a lower-cased, backslash-terminated
+// prefix; empty when no install location is known. Every window proof in
+// this file matches process images against it: ONLY a process running out
+// of the managed directory counts as VIRULE's.
+inline std::wstring managed_admin_prefix() {
+    const auto dir = paths::admin_install_dir();
+    if (dir.empty()) return {};
+    std::wstring prefix = dir.wstring();
+    if (prefix.empty()) return {};
+    if (prefix.back() != L'\\') prefix += L'\\';
+    for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
+    return prefix;
+}
+
+// The lower-cased full image path of the process owning hwnd; empty when
+// it cannot be read (no window, no process, no access).
+inline std::wstring window_process_image(HWND hwnd) {
+    if (hwnd == nullptr) return {};
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) return {};
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return {};
+    wchar_t image[MAX_PATH * 2] = {};
+    DWORD n = (DWORD)(sizeof(image) / sizeof(image[0]));
+    const bool got = QueryFullProcessImageNameW(proc, 0, image, &n) != 0;
+    CloseHandle(proc);
+    if (!got) return {};
+    std::wstring path(image, n);
+    for (wchar_t& c : path) c = (wchar_t)towlower(c);
+    return path;
+}
+
+// True when hwnd belongs to a process running out of the managed Admin
+// directory (virule.exe, ViruleAdminHost.exe, ...). Says nothing about
+// visibility or z-order; callers add the question they need.
+inline bool is_managed_admin_window(HWND hwnd, const std::wstring& prefix) {
+    if (hwnd == nullptr || prefix.empty()) return false;
+    const std::wstring image = window_process_image(hwnd);
+    return !image.empty() && image.rfind(prefix, 0) == 0;
+}
+
 // The running managed Admin's top-level window, or nullptr. The Admin's
 // main window is a CEF Views window (Chromium's own class), so the stable
 // match is: a visible, unowned top-level window whose owning process runs
-// out of the managed Admin directory.
+// out of the managed Admin directory. virule.exe's startup splash matches
+// too (it is a VIRULE surface). VISIBLE HERE MEANS THE WINDOW FLAG ONLY:
+// this proves a surface exists, never that the user can see it (another
+// window may cover it). The retirement below asks that second question.
 inline HWND find_running_admin_window() {
-    const auto dir = paths::admin_install_dir();
-    if (dir.empty()) return nullptr;
-    std::wstring prefix = dir.wstring();
+    const std::wstring prefix = managed_admin_prefix();
     if (prefix.empty()) return nullptr;
-    if (prefix.back() != L'\\') prefix += L'\\';
-    for (wchar_t& c : prefix) c = (wchar_t)towlower(c);
 
     struct Ctx { const std::wstring* prefix; HWND found; };
     Ctx ctx{ &prefix, nullptr };
@@ -423,20 +464,45 @@ inline HWND find_running_admin_window() {
             auto* ctx = (Ctx*)lp;
             if (!IsWindowVisible(hwnd)) return TRUE;
             if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            if (pid == 0) return TRUE;
-            HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                      FALSE, pid);
-            if (!proc) return TRUE;
-            wchar_t image[MAX_PATH * 2] = {};
-            DWORD n = (DWORD)(sizeof(image) / sizeof(image[0]));
-            const bool got = QueryFullProcessImageNameW(proc, 0, image, &n) != 0;
-            CloseHandle(proc);
-            if (!got) return TRUE;
-            std::wstring path(image, n);
-            for (wchar_t& c : path) c = (wchar_t)towlower(c);
-            if (path.rfind(*ctx->prefix, 0) != 0) return TRUE;
+            if (!is_managed_admin_window(hwnd, *ctx->prefix)) return TRUE;
+            ctx->found = hwnd;
+            return FALSE;
+        },
+        (LPARAM)&ctx);
+    return ctx.found;
+}
+
+// THE REAL ADMIN WINDOW, as distinct from virule.exe's startup splash: a
+// visible, unowned top-level window titled "VIRULE Admin" that is not a
+// "#32770" dialog (the host's error boxes share the caption) and whose
+// process is ViruleAdminHost.exe inside the managed directory. The same
+// match virule.exe uses to focus a running Admin (v2_mvp cli/main.cpp
+// find_admin_window), plus this client's managed-directory rule.
+constexpr wchar_t kAdminWindowTitle[] = L"VIRULE Admin";
+
+inline HWND find_real_admin_window() {
+    const std::wstring prefix = managed_admin_prefix();
+    if (prefix.empty()) return nullptr;
+
+    struct Ctx { const std::wstring* prefix; HWND found; };
+    Ctx ctx{ &prefix, nullptr };
+    EnumWindows(
+        [](HWND hwnd, LPARAM lp) -> BOOL {
+            auto* ctx = (Ctx*)lp;
+            if (!IsWindowVisible(hwnd)) return TRUE;
+            if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+            wchar_t title[64] = {};
+            GetWindowTextW(hwnd, title, 64);
+            if (wcscmp(title, kAdminWindowTitle) != 0) return TRUE;
+            wchar_t cls[64] = {};
+            GetClassNameW(hwnd, cls, 64);
+            if (wcscmp(cls, L"#32770") == 0) return TRUE;
+            const std::wstring image = window_process_image(hwnd);
+            if (image.empty() || image.rfind(*ctx->prefix, 0) != 0) return TRUE;
+            const size_t slash = image.find_last_of(L'\\');
+            const std::wstring base =
+                slash == std::wstring::npos ? image : image.substr(slash + 1);
+            if (base != L"viruleadminhost.exe") return TRUE;
             ctx->found = hwnd;
             return FALSE;
         },
@@ -450,6 +516,179 @@ inline void focus_running_admin() {
     if (hwnd == nullptr) return;
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
     SetForegroundWindow(hwnd);
+}
+
+// THE LAST HOP'S PROOF (dead-air fix 2026-09-10). Every handoff in this
+// client retires its surface only once the NEXT surface is demonstrably
+// visible; the final hop, the Admin launch, used to retire the card on
+// process existence (CreateProcess returned, or the 8 s launch watch
+// passed), which on a slow machine left the user looking at nothing for
+// the Admin's whole startup. This waits, bounded, for a managed-Admin
+// top-level window to be VISIBLE: virule.exe's own startup splash or the
+// Admin window itself, whichever paints first (both are VIRULE surfaces,
+// and the splash hands over to the Admin window on its own). True = one
+// is visible. False = no managed process is running at all (the launch
+// failed; its own recovery owns the surface, and there is nothing to wait
+// for), or the bound expired with a live process and still no window
+// (the card closes anyway: a launch that has run this long with nothing
+// on screen is the launch recovery's problem, never a reason to hold a
+// card forever). The bound is a success-side wait and deliberately
+// separate from launch_admin_watched's 8 s FAILURE detector: lengthening
+// that one would only delay real failure recovery.
+constexpr unsigned long long kAdminWindowWaitMs = 90ull * 1000ull;
+
+inline bool wait_for_admin_window(unsigned long long wait_ms = kAdminWindowWaitMs) {
+    const ULONGLONG deadline = GetTickCount64() + wait_ms;
+    for (;;) {
+        if (find_running_admin_window() != nullptr) return true;
+        if (!admin_running()) return false;
+        if (GetTickCount64() >= deadline) {
+            log::client("admin: no visible window after the bounded wait; retiring the card");
+            return false;
+        }
+        bridge::touch_activity();
+        Sleep(250);
+    }
+}
+
+// ---- retiring a card into the Admin surface (splash-handoff fix, 2026-09-10) ----
+//
+// WHAT WENT WRONG. wait_for_admin_window proves the next surface EXISTS
+// (WS_VISIBLE). It cannot prove the user SEES it, and on the install path
+// the act of closing the card is what hid it: the card is the FOREGROUND
+// window, virule.exe's splash is a non-activating tool window at the same
+// rectangle, and destroying the active card makes Windows activate the
+// previous window, the browser, which is raised above the splash. The user
+// saw "Finishing up…", then the browser, then the Admin: dead air for the
+// Admin's whole first-run startup (audit
+// SPLASH_HANDOFF_AND_PERMISSION_COPY_AUDIT_2026-09-10, scenario card-wait).
+//
+// THE RULE. A VIRULE surface never retires merely because its successor
+// has WS_VISIBLE. The successor must actually be presented to the user at
+// the retiring surface's position, or the current surface stays until a
+// later successor genuinely is. So, in order:
+//   1. the next surface exists (wait_for_admin_window, unchanged);
+//   2. while the card still exists and still owns the foreground, hand the
+//      foreground to that surface (SetForegroundWindow; the client IS the
+//      foreground process, so Windows permits it);
+//   3. confirm the handoff by what is presented: the card no longer owns
+//      the foreground, AND GetForegroundWindow is a managed-directory
+//      window or the root window under the card's centre belongs to a
+//      managed-directory process. Short and bounded, never a fixed delay:
+//      it returns the instant that holds;
+//   4. only then close the card. Destroying a no-longer-active window
+//      transfers activation to nothing, so the splash stays on top;
+//   5. if the handoff is refused (some machine's foreground lock), the card
+//      does NOT close: "Finishing up…" holds until the REAL Admin window is
+//      visible (the splash is skipped, never shown behind the browser),
+//      hands the foreground to it the same way, then closes. The bound
+//      stays the existing 90 s from entry; a launch whose managed process
+//      dies still releases the card to the recovery exactly as before.
+//
+// Is the handoff confirmed: "would the user still see VIRULE here if the
+// card vanished right now". Two conditions, both required:
+//   - the card no longer owns the foreground. Destroying the ACTIVE window
+//     is what re-activates another one (the browser) above the splash, so
+//     while the card is still active no presentation check can be trusted
+//     (on Windows 10 the splash lands above the card, so WindowFromPoint
+//     already answers "splash" before the transfer; closing then would
+//     still bring the browser up);
+//   - a managed-directory window is what is presented: it is the
+//     foreground window, or it is the root window under the card's centre.
+// Occlusion-aware, so it answers what the user sees, not what exists.
+inline bool admin_surface_presented_at(HWND card, const std::wstring& prefix) {
+    HWND fg = GetForegroundWindow();
+    if (card != nullptr && fg == card) return false;
+    if (is_managed_admin_window(fg, prefix)) return true;
+    RECT rc{};
+    if (card == nullptr || !GetWindowRect(card, &rc)) return false;
+    const POINT centre{ (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2 };
+    HWND at = WindowFromPoint(centre);
+    if (at == nullptr) return false;
+    if (HWND root = GetAncestor(at, GA_ROOT)) at = root;
+    return is_managed_admin_window(at, prefix);
+}
+
+// Hand the foreground from the card to `next` and confirm it. Activation
+// lands asynchronously (the harness measured SetForegroundWindow returning
+// 1 with the foreground still on the card, and the switch a few ms later),
+// so the call is re-issued while the short confirmation window runs and
+// the card still owns the foreground. True the moment a VIRULE surface is
+// confirmed presented; false when the bound passes without it.
+constexpr unsigned long long kForegroundHandoffConfirmMs = 1500;
+
+inline bool hand_foreground_to(HWND card, HWND next, const std::wstring& prefix) {
+    const ULONGLONG deadline = GetTickCount64() + kForegroundHandoffConfirmMs;
+    ULONGLONG next_attempt = 0;
+    for (;;) {
+        if (next == nullptr || !IsWindow(next)) return false;
+        if (admin_surface_presented_at(card, prefix)) return true;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return false;
+        if (now >= next_attempt && card != nullptr && GetForegroundWindow() == card) {
+            if (IsIconic(next)) ShowWindow(next, SW_RESTORE);
+            SetForegroundWindow(next);
+            next_attempt = now + 250;
+        }
+        Sleep(30);
+    }
+}
+
+// THE ONE RETIREMENT PATH for every client card that ends in an Admin
+// launch (takeover continuations, the "Updating…" cards of Settings and
+// the launch handoff). Replaces every `wait_for_admin_window(); close();`
+// pair. No-op with no card on screen. True = the card retired into a
+// confirmed VIRULE surface; false = it closed for one of the pre-existing
+// reasons (no managed process, bound expired) or nothing was there.
+inline bool retire_card_into_admin_surface() {
+    if (!result_card::is_visible()) return false;
+    const ULONGLONG deadline = GetTickCount64() + kAdminWindowWaitMs;
+
+    // 1. The next surface exists.
+    if (!wait_for_admin_window()) {
+        // No managed process at all (the launch failed; its recovery owns
+        // the surface), or the bound expired with a live process and no
+        // window: exactly as before, the card closes.
+        result_card::close();
+        return false;
+    }
+    HWND card = result_card::hwnd();
+    if (card == nullptr) return false;
+    const std::wstring prefix = managed_admin_prefix();
+
+    // 2 + 3 + 4. Hand the foreground over, confirm what is presented, close.
+    if (hand_foreground_to(card, find_running_admin_window(), prefix)) {
+        log::client("admin: next VIRULE surface confirmed on top; retiring the card");
+        result_card::close();
+        return true;
+    }
+
+    // 5. Refused: hold this card until the REAL Admin window is visible.
+    log::client("admin: foreground handoff to the next surface was not confirmed; "
+                "holding the card until the Admin window is visible");
+    for (;;) {
+        if (!result_card::is_visible()) return false;
+        if (HWND admin = find_real_admin_window()) {
+            const bool ok = hand_foreground_to(card, admin, prefix);
+            log::client(ok ? "admin: Admin window confirmed on top; retiring the card"
+                           : "admin: Admin window visible; retiring the card without a "
+                             "confirmed foreground handoff");
+            result_card::close();
+            return ok;
+        }
+        if (!admin_running()) {
+            log::client("admin: no managed process while holding the card; retiring it");
+            result_card::close();
+            return false;
+        }
+        if (GetTickCount64() >= deadline) {
+            log::client("admin: no Admin window after the bounded hold; retiring the card");
+            result_card::close();
+            return false;
+        }
+        bridge::touch_activity();
+        Sleep(250);
+    }
 }
 
 // GRACEFUL shutdown of the running managed Admin for an update: WM_CLOSE
@@ -532,9 +771,19 @@ inline bool open_installed_admin() {
 // launch (the installed Admin is intact and is never re-downloaded for a
 // launch problem).
 
-// One watched launch attempt. True = the Admin demonstrably came up (its
-// process is alive past the watch window, or a managed-directory process
-// is running). False = the launch concretely failed; `why` names it.
+// One watched launch attempt. True = the Admin demonstrably came up (a
+// managed-Admin top-level window is visible, its process is alive past
+// the watch window, or a managed-directory process is running). False =
+// the launch concretely failed; `why` names it.
+//
+// The 8 s watch is a FAILURE detector (audit M15), not a success delay:
+// a visible VIRULE surface (virule.exe's startup splash or the Admin
+// window) is positive proof the launch succeeded, so the watch ends the
+// moment one appears (audit 2026-09-10: it used to run its full 8 s in
+// front of an already-open Admin, holding "Finishing up..." for the
+// remainder). A launch that produces no window still burns the full 8 s
+// exactly as before, and "exited before the Admin appeared" still requires
+// the process to die with no window.
 inline bool launch_admin_watched(std::string& why) {
     why.clear();
     if (!admin_installed()) {
@@ -578,6 +827,7 @@ inline bool launch_admin_watched(std::string& why) {
             }
             break;
         }
+        if (find_running_admin_window() != nullptr) break; // demonstrably up
         if (GetTickCount64() >= deadline) break; // still alive: healthy
         bridge::touch_activity();
     }
@@ -1509,19 +1759,21 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
         // A fresh install opens the Admin automatically; the Admin window
         // is the next feedback surface. The launch is WATCHED (audit M15):
         // a launch that concretely fails earns one bounded retry and then
-        // the client-owned Try again card instead of silence.
+        // the client-owned Try again card instead of silence. The card
+        // retires only into a CONFIRMED Admin surface
+        // (retire_card_into_admin_surface).
         launch_admin_with_recovery();
         if (native_feedback && result_card::is_working_visible()) {
-            result_card::close();
+            retire_card_into_admin_surface();
         }
     } else if (state == "updated") {
         if (closed_admin_for_update) {
             // Relaunch the Admin the client closed (the user never reopens
             // VIRULE by hand), watched + recovered, then retire the card:
-            // next owner first.
+            // next owner first, and genuinely PRESENTED first.
             launch_admin_with_recovery();
             if (native_feedback && result_card::is_working_visible()) {
-                result_card::close();
+                retire_card_into_admin_surface();
             }
         }
         // An update of an Admin that was already closed leaves the user
@@ -1589,8 +1841,11 @@ inline void launch_after_update_handoff() {
     const bool update = !approved.empty() && !installed.empty() &&
                         version_is_upgrade(approved, installed);
     if (!update) {
-        result_card::close();
+        // Next surface first: the card holds until the Admin surface is
+        // confirmed presented (a concrete launch failure resolves this
+        // very card into Try again inside the recovery).
         launch_admin_with_recovery();
+        retire_card_into_admin_surface();
         return;
     }
     if (launch_update_on_hold(approved, /*launch_context=*/true)) {
@@ -1605,9 +1860,9 @@ inline void launch_after_update_handoff() {
         // visible Admin, always.
         log::client("admin: launch-time update for " + approved +
                     " recently failed; launching current Admin without retrying");
-        result_card::close();
         g_last_admin_launch_tick.store(0);
         launch_admin_with_recovery();
+        retire_card_into_admin_surface();
         return;
     }
     const std::string state = run(false, /*native_feedback=*/true);
@@ -1615,9 +1870,10 @@ inline void launch_after_update_handoff() {
         // The Admin was not running, so run() left the launch to us (the
         // pipeline already cleared any failure hold on success). Watched +
         // recovered: the user's launch gesture ends with a visible Admin
-        // or a visible Try again, never with nothing (audit M15).
+        // or a visible Try again, never with nothing (audit M15), and the
+        // card stays until that Admin surface is confirmed presented.
         launch_admin_with_recovery();
-        if (result_card::is_working_visible()) result_card::close();
+        retire_card_into_admin_surface();
     } else if (state == "busy") {
         // Another operation owns the lifecycle; its own feedback covers it.
         result_card::close();
@@ -1628,8 +1884,8 @@ inline void launch_after_update_handoff() {
         // the launch path off this package across restarts).
         set_launch_update_hold(approved);
         log::client("admin: launch-time update did not complete; launching current Admin");
-        if (result_card::is_working_visible()) result_card::close();
         launch_admin_with_recovery();
+        retire_card_into_admin_surface();
     }
 }
 

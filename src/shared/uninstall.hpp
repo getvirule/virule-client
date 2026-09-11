@@ -33,6 +33,8 @@
 //     provenance OR a stored target inside the managed install tree
 //     (never a VIRULE-named shortcut pointing elsewhere)
 //   - virule:// ONLY while it points into the removed tree
+//   - the per-user login start (HKCU Run value "VIRULE",
+//     shared/login_start.hpp) ONLY while it points into the removed tree
 //   - the HKCU uninstall entry
 //   - %LOCALAPPDATA%\VIRULE\ itself only if left empty
 //   PRESERVED: virule.db, workspace\, logs\, backup.json, security\
@@ -74,6 +76,7 @@
 
 #include "shared/client_state.hpp"
 #include "shared/logging.hpp"
+#include "shared/login_start.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
 
@@ -388,10 +391,18 @@ inline bool remove_files(bool delete_data) {
     return program_gone && state_gone && data_gone;
 }
 
-// REGISTRATIONS LAST (the audit's H1 fix): virule:// and the Apps &
-// Features entry are removed only after remove_files() succeeded, so a
-// locked or failing removal always keeps a Windows-visible retry path.
+// REGISTRATIONS LAST (the audit's H1 fix): virule://, the login start and
+// the Apps & Features entry are removed only after remove_files()
+// succeeded, so a locked or failing removal always keeps a Windows-visible
+// retry path.
 inline void remove_registrations(const std::wstring& installed_exe) {
+    // The per-user login start, while it points into the removed tree
+    // (the same rule as virule:// below); a same-named entry pointing
+    // elsewhere is not ours and stays.
+    if (login_start::registered_under(paths::install_dir().wstring())) {
+        login_start::unregister_login_start();
+    }
+
     // virule:// while it points anywhere into the removed tree: the
     // installed client (the canonical handler) or the managed Admin's
     // virule.exe (which held the scheme on client-less machines). A

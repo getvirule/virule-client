@@ -17,6 +17,16 @@
 // so the ownership handoff Setup -> Client -> Admin reads as one
 // continuous VIRULE, never as unrelated windows.
 //
+// THE TRANSITIONAL FAMILY GRAMMAR (owner law 2026-09-10; docs/UIUX.md):
+// Setup's "Setting up VIRULE…", virule.exe's "Loading…" splash and every
+// branded card here are ONE component changing state. Fixed geometry,
+// identical across all three: a 340 x 176 card, the 44 px V mark at
+// y = 30, the status line in the 94..118 band (13 px REGULAR weight, the
+// word color; never semibold or bold), and the 168 x 3 indeterminate bar
+// at y = 136 BELOW the status. A different status string never moves
+// anything; only the Ready / Action cards are taller (192) for their
+// button. Change one of the three surfaces and change the other two.
+//
 // Three modes:
 //
 //   Result   the final outcome. Click / Escape / Enter dismiss; it
@@ -67,6 +77,13 @@ constexpr UINT kTimerClose = 1;
 constexpr UINT kTimerAnim = 2;
 constexpr UINT kMsgRefresh = WM_APP + 1;
 constexpr UINT kMsgClose = WM_APP + 2;
+
+// How long a Result card stays before dismissing itself. The default
+// serves every result (QA outcomes, "Something went wrong." results); a
+// caller with a terminal confirmation that needs less time asks for it
+// explicitly through update() (the uninstall helper's completion card,
+// 5 s, audit 2026-09-10). Never shortened globally.
+constexpr DWORD kResultLifeMs = 10000;
 
 // The one URL the Ready card's explicit action opens. Compile-time
 // constant; the card never opens anything else.
@@ -124,6 +141,7 @@ inline std::wstring g_primary;
 inline std::wstring g_secondary;
 inline std::wstring g_action_label;  // Action mode; under g_text_mutex
 inline std::atomic<bool> g_action_clicked{ false };
+inline std::atomic<DWORD> g_result_life_ms{ kResultLifeMs };
 inline RECT g_button{};          // Ready/Action modes; window thread only
 
 inline int qsc(int v) { return MulDiv(v, (int)g_dpi, 96); }
@@ -176,9 +194,10 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
         SelectObject(mem, old_f);
         DeleteObject(f);
     }
-    // Headline: one line, word color, fixed band so every state aligns.
+    // Status line: one line, word color, REGULAR weight, fixed band so
+    // every state (and every surface of the family) aligns.
     {
-        HFONT f = make_font(13, FW_SEMIBOLD);
+        HFONT f = make_font(13, FW_NORMAL);
         HGDIOBJ old_f = SelectObject(mem, f);
         SetTextColor(mem, g_pal.word);
         RECT tr{ qsc(26), qsc(94), w - qsc(26), qsc(118) };
@@ -348,7 +367,7 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Working never auto-closes; update() arms the timer when the
         // outcome lands.
         if ((Mode)g_mode.load() == Mode::Result) {
-            SetTimer(hwnd, kTimerClose, 10000, nullptr);
+            SetTimer(hwnd, kTimerClose, g_result_life_ms.load(), nullptr);
         } else if ((Mode)g_mode.load() == Mode::Ready ||
                    (Mode)g_mode.load() == Mode::Action) {
             SetTimer(hwnd, kTimerClose, 120000, nullptr);
@@ -368,7 +387,7 @@ inline LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if ((Mode)g_mode.load() == Mode::Result) {
             // A Working card just received its outcome: dismissible now,
             // and it dismisses itself like any result.
-            SetTimer(hwnd, kTimerClose, 10000, nullptr);
+            SetTimer(hwnd, kTimerClose, g_result_life_ms.load(), nullptr);
         } else if ((Mode)g_mode.load() == Mode::Action) {
             // A Working card resolved into a recoverable failure: the
             // retry action stays available for a real while, still bounded.
@@ -527,6 +546,7 @@ inline void start_thread(Mode mode, bool branded,
     g_branded.store(branded);
     g_phase.store(0);
     g_action_clicked.store(false);
+    g_result_life_ms.store(kResultLifeMs);
     g_thread = CreateThread(nullptr, 0, thread_main, nullptr, 0, nullptr);
 }
 
@@ -553,14 +573,18 @@ inline void show_ready() {
 
 // Turn the visible card into a Result with new copy (a Working card's
 // outcome landing). Keeps the card's visual voice (a branded lifecycle
-// card resolves branded). Safe from any thread.
+// card resolves branded). Safe from any thread. `life_ms` is how long the
+// result stays before dismissing itself; only a terminal confirmation
+// that needs less than the default asks for it.
 inline void update(const std::string& primary_utf8,
-                   const std::string& secondary_utf8) {
+                   const std::string& secondary_utf8,
+                   DWORD life_ms = kResultLifeMs) {
     {
         std::lock_guard<std::mutex> lock(g_text_mutex);
         g_primary = widen_utf8(primary_utf8);
         g_secondary = widen_utf8(secondary_utf8);
     }
+    g_result_life_ms.store(life_ms);
     g_mode.store((int)Mode::Result);
     if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
 }
@@ -599,6 +623,10 @@ inline bool take_action_clicked() { return g_action_clicked.exchange(false); }
 // True once the window actually exists on screen (the ownership invariant
 // waits on this before releasing the previous surface).
 inline bool is_visible() { return g_hwnd.load() != nullptr; }
+
+// The card's window, or nullptr. The Admin-launch retirement reads it to
+// prove what is presented at the card's own position before closing it.
+inline HWND hwnd() { return g_hwnd.load(); }
 
 // A lifecycle Working card is on screen and still unresolved (its outcome
 // should land on it rather than on a second surface).

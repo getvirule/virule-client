@@ -11,7 +11,7 @@ Two Windows executables, one repository:
 
 | Executable | Role |
 |---|---|
-| `virule-client.exe` | Persistent per-user client: loopback bridge (`ws://127.0.0.1:47612/v1`), `virule://` handler, QA tester credential writer, full VIRULE uninstall. Single-instance, on-demand (no service, no login task), idle-exits after 20 minutes with no connections. |
+| `virule-client.exe` | Persistent per-user client: loopback bridge (`ws://127.0.0.1:47612/v1`), `virule://` handler, QA tester credential writer, full VIRULE uninstall. Single-instance and RESIDENT: an installed client stays running (idle at zero cost) so the bridge is always there; a per-user Run value starts it at login and Windows Error Reporting restarts it after a crash (no service, no scheduled task); `virule://open` is only the fallback wake. |
 | `Virule-Setup.exe` | Disposable installer: fetches the latest GitHub Release's `manifest.json`, downloads the approved SIGNED client release and verifies it (manifest SHA-256 + Authenticode + the VIRULE signing identity), installs to `%LOCALAPPDATA%\Programs\VIRULE`, registers `virule://` and the uninstall entry per-user (HKCU, no elevation), starts the client, hands the browser back, exits. ONE small native card ("Setting up VIRULE..." / "Setup is complete."); no wizard, no pages, no choices. Embeds NO client payload. |
 
 Full design: `docs/ARCHITECTURE.md`.

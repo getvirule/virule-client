@@ -85,10 +85,16 @@ namespace vclient::takeover {
 // before the no-intent conclusion becomes terminal.
 constexpr unsigned long long kStandaloneGraceMs = 10000;
 
-// A held operation never holds the continuation card forever: the Admin
-// package is large, but a whole multiple of the page's own install
-// timeout still bounds it.
-constexpr unsigned long long kContinuationHoldMs = 15ull * 60ull * 1000ull;
+// A held operation never holds the continuation card forever, but the
+// bound must never fire on a HEALTHY slow install: the Admin package is
+// ~308 MiB, and the HTTP layer already ends a dead transfer on its 60 s
+// per-read timeout (which clears g_busy) long before any wall-clock
+// bound could. A MATCHED PAIR with the site's ADMIN_INSTALLING_TIMEOUT_MS
+// (v1_mvp_site App.tsx): both are 45 minutes, so the native card and the
+// page never outlive each other, and 45 minutes is a ~1 Mbit/s floor for
+// the current package (15 minutes was ~3.5 Mbit/s and expired mid-download
+// on a slow link). Raise both together or neither.
+constexpr unsigned long long kContinuationHoldMs = 45ull * 60ull * 1000ull;
 
 inline std::atomic<bool> g_released{ false };
 inline std::mutex g_mutex;
@@ -193,9 +199,15 @@ inline void run_admin(bool shortcut) {
         const std::string installed = admin_install::authoritative_admin_version();
         if (!approved.empty() && !installed.empty() &&
             !admin_install::version_is_upgrade(approved, installed)) {
+            // THE LAST HOP IS PROVEN LIKE EVERY OTHER (dead-air fix
+            // 2026-09-10): the launch is watched (audit M15's bounded
+            // recovery, which resolves THIS card into Try again on a
+            // concrete failure), and the card retires only into a
+            // CONFIRMED VIRULE surface (the foreground handed to it, the
+            // presentation verified), never on a window merely existing.
             log::client("takeover: Admin already current; opening it");
-            (void)admin_install::open_installed_admin();
-            result_card::close();
+            admin_install::launch_admin_with_recovery();
+            admin_install::retire_card_into_admin_surface();
             release();
             return;
         }
@@ -203,22 +215,28 @@ inline void run_admin(bool shortcut) {
 
     const std::string state = admin_install::run(shortcut);
     if (state == "installed") {
-        // The fresh install launched the Admin: the Admin window IS the
-        // feedback now.
-        result_card::close();
+        // The fresh install launched the Admin (watched + recovered inside
+        // run()); this card is the feedback until that surface is
+        // confirmed presented (Finishing up -> Loading -> Admin, never a
+        // browser in between).
+        admin_install::retire_card_into_admin_surface();
     } else if (state == "updated") {
-        // The intent was "get VIRULE onto this machine": open it.
-        (void)admin_install::open_installed_admin();
-        result_card::close();
+        // The intent was "get VIRULE onto this machine": open it, watched,
+        // and hold the card until its surface is confirmed presented.
+        admin_install::launch_admin_with_recovery();
+        admin_install::retire_card_into_admin_surface();
     } else if (state == "busy") {
         // The page's own admin_install won the start race; ONE operation
         // runs either way, and this card holds until it finishes (a fresh
-        // install launches the Admin itself at completion).
+        // install launches the Admin itself at completion) and, when it
+        // launched one, until that Admin is visible (an update that left
+        // a closed Admin closed has no window to wait for and returns at
+        // once).
         const ULONGLONG deadline = GetTickCount64() + kContinuationHoldMs;
         while (admin_install::g_busy.load() && GetTickCount64() < deadline) {
             Sleep(300);
         }
-        result_card::close();
+        admin_install::retire_card_into_admin_surface();
     } else {
         result_card::update("Something went wrong.",
                             std::string("Try again at ") +
@@ -246,7 +264,9 @@ inline void run_admin_continuation() {
     while (admin_install::g_busy.load() && GetTickCount64() < deadline) {
         Sleep(300);
     }
-    result_card::close();
+    // Same last-hop proof as run_admin: a launched Admin's surface must be
+    // confirmed presented before this one goes.
+    admin_install::retire_card_into_admin_surface();
     release();
 }
 

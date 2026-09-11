@@ -13,7 +13,7 @@
 // list, no license page, no technical terminology, no user choices of any
 // kind. Three states:
 //
-//   Working    "Setting up VIRULE..."   + a subtle indeterminate bar
+//   Working    "Setting up VIRULE…"     + a subtle indeterminate bar
 //   Complete   "Setup is complete." briefly, then the window closes itself
 //   Failed     one short human sentence; the technical reason goes to the
 //              log, never here
@@ -22,9 +22,16 @@
 // shows, the client has already confirmed the next feedback surface (a
 // live virule.app page, or a client-owned native card) is visible, so
 // there is nothing to tell the user to do, and "return to your browser"
-// would be wrong when no browser was involved at all. Layout is fixed: the
-// status line sits at the same coordinates in every state, so moving
-// between them never shifts anything.
+// would be wrong when no browser was involved at all.
+//
+// THE TRANSITIONAL FAMILY GRAMMAR (owner law 2026-09-10; docs/UIUX.md):
+// this card, the client's branded lifecycle cards (result_card.hpp) and
+// virule.exe's "Loading…" splash are ONE component changing state and
+// share one fixed geometry: 340 x 176, the 44 px V mark at y = 30, the
+// status line in the 94..118 band (13 px REGULAR, the word color), and
+// the 168 x 3 indeterminate bar at y = 136 BELOW the status. The status
+// line sits at the same coordinates in every state, so moving between
+// them never shifts anything. Change one surface, change all three.
 
 #include <atomic>
 #include <mutex>
@@ -95,7 +102,7 @@ inline Palette g_pal{};
 inline std::atomic<int> g_stage{ (int)Stage::Working };
 inline std::atomic<int> g_phase{ 0 }; // indeterminate bar position, 0..999
 inline std::mutex g_line_mutex;
-inline std::wstring g_line = L"Setting up VIRULE...";
+inline std::wstring g_line = L"Setting up VIRULE\u2026";
 
 inline int sc(int v) { return MulDiv(v, (int)g_dpi, 96); }
 
@@ -164,12 +171,13 @@ inline void paint(HWND hwnd) {
 
     // The subtle activity treatment: one thin indeterminate bar, the same
     // language the browser's "Installing VIRULE..." view uses. It exists
-    // only while work is happening; no invented percentages, ever.
+    // only while work is happening; no invented percentages, ever. It sits
+    // BELOW the status line (family order: mark, status, bar).
     if ((Stage)g_stage.load() == Stage::Working) {
         const int bar_w = sc(168);
         const int bar_h = sc(3);
         const int bar_x = (w - bar_w) / 2;
-        const int bar_y = sc(100);
+        const int bar_y = sc(136);
         {
             HBRUSH b = CreateSolidBrush(g_pal.line);
             RECT track{ bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
@@ -193,50 +201,29 @@ inline void paint(HWND hwnd) {
         }
     }
 
-    // The status line. Fixed top edge in EVERY state, so the states never
-    // shift each other; up to two lines for a failure sentence. When the
-    // copy carries a '\n' (the completion state), the FIRST line is the
-    // primary statement and paints in the word color; the rest stays muted.
+    // The status line: the family's 94..118 band, 13 px REGULAR in the
+    // word color, ABOVE the bar. Fixed in EVERY state, so the states never
+    // shift each other. Working and Complete are one line; a failure
+    // sentence may wrap onto a second line from the same top edge (the
+    // bar is absent in that state, so the band may extend downward).
     {
         const std::wstring line = current_line();
-        const size_t nl = line.find(L'\n');
-        const std::wstring first =
-            nl == std::wstring::npos ? line : line.substr(0, nl);
-        const std::wstring rest =
-            nl == std::wstring::npos ? L"" : line.substr(nl + 1);
-        RECT tr{ sc(26), sc(122), w - sc(26), h - sc(14) };
-        if (rest.empty()) {
-            HFONT f = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                  CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-            HGDIOBJ old_f = SelectObject(mem, f);
-            SetTextColor(mem, g_pal.muted);
-            DrawTextW(mem, first.c_str(), (int)first.size(), &tr,
+        HFONT f = CreateFontW(-sc(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+        HGDIOBJ old_f = SelectObject(mem, f);
+        SetTextColor(mem, g_pal.word);
+        if ((Stage)g_stage.load() == Stage::Failed) {
+            RECT tr{ sc(26), sc(94), w - sc(26), h - sc(14) };
+            DrawTextW(mem, line.c_str(), (int)line.size(), &tr,
                       DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-            SelectObject(mem, old_f);
-            DeleteObject(f);
         } else {
-            HFONT f1 = CreateFontW(-sc(12), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-            HGDIOBJ old_f = SelectObject(mem, f1);
-            SetTextColor(mem, g_pal.word);
-            RECT r1{ tr.left, tr.top, tr.right, tr.top + sc(18) };
-            DrawTextW(mem, first.c_str(), (int)first.size(), &r1,
-                      DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(mem, old_f);
-            DeleteObject(f1);
-            HFONT f2 = CreateFontW(-sc(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                   CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-            HGDIOBJ old_f2 = SelectObject(mem, f2);
-            SetTextColor(mem, g_pal.muted);
-            RECT r2{ tr.left, tr.top + sc(20), tr.right, tr.bottom };
-            DrawTextW(mem, rest.c_str(), (int)rest.size(), &r2,
-                      DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
-            SelectObject(mem, old_f2);
-            DeleteObject(f2);
+            RECT tr{ sc(26), sc(94), w - sc(26), sc(118) };
+            DrawTextW(mem, line.c_str(), (int)line.size(), &tr,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
+        SelectObject(mem, old_f);
+        DeleteObject(f);
     }
 
     BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);

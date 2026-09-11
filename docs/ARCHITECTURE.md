@@ -3,7 +3,7 @@
 Current state only. When a change makes something here untrue, REPLACE it,
 and advance the last-verified stamp.
 
-Last verified 2026-09-05, against client v0.7.4. The compiled constant in
+Last verified 2026-09-10, against client v0.8.3. The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
 
@@ -32,6 +32,40 @@ verification (virule:// + /qa/link polling is the bridge-free path). Do
 not paper over a denial with flags or lesser transports; the permission
 prompt IS the standards path, and local origins (wrangler dev, vite) are
 exempt, which is why development never sees it.
+
+DENIED IS A STATE, NOT AN ABSENCE (site, 2026-09-10). A denied permission
+blocks the bridge (47612) AND the Setup handoff channel (47613) alike, so
+an INSTALL_ADMIN intent has no delivery route and re-offering the
+installer only loops (Setup -> "VIRULE is ready" -> Get VIRULE -> Download
+-> Setup, with Admin never installed). The homepage keeps the ONE
+PermissionStatus from its query, treats `denied` as its own connection
+state (`blocked`: a recovery view replaces Get VIRULE and the whole
+install path), and reconnects the instant `onchange` reports `granted`,
+so allowing the site in site settings resumes the pending intent with no
+reload and no reinstall. A denied origin is never re-prompted by
+Chromium, and a failed socket carries no reason, so the Permissions API
+is the only observer of this state.
+
+PROMPT IS A STATE TOO, AND IT COMES FIRST (site, owner spec 2026-09-10).
+With the permission unanswered (`prompt`), Get VIRULE records the intent,
+makes the ONE loopback attempt that raises the browser's prompt (the
+socket stays parked behind it) and waits on the pending copy, "Your
+browser will ask you for permission." with its one recovery line ("Accept
+to continue setup. If you don't see a prompt, refresh your browser and
+try again."; the intent survives the refresh in localStorage and Get
+VIRULE re-raises the ask): no `virule://open`, no timer toward
+Download, no Setup, no "absent" conclusion, for as long as the answer is
+`prompt` (a dismissed prompt is asked again on a slow cadence; the
+browser turns repeated dismissals into a denial by itself). Allow -> the
+bridge is tried at once; a client answering proceeds from its real
+status; no client -> only now does `virule://open` wake one and the
+bounded wake wait run, and only its expiry offers Download. The order is
+therefore always permission resolution -> client detection -> fallback
+wake -> installer offer, so a fresh install can no longer reach Setup
+(and the standalone "VIRULE is ready" card) merely because the user has
+not answered the browser yet. Browsers whose query rejects (no such
+permission; Firefox today) keep the direct no-gate path. Proof:
+`v1_mvp_site/tools/permission_state_test.mjs`.
 
 Origin policy: browser connections must present one of the explicit
 allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
@@ -66,9 +100,10 @@ in both components).
 
 Client pushes to every connected page: `{"type":"qa_result","token","state"}`,
 `{"type":"admin_result","state","version"}`,
-`{"type":"uninstall_state","state":"removing"|"failed"}` (the ordered
-teardown's transitions; success has no push by construction - the client
-exits and the helper owns the visible outcome), and, the P1 lifecycle
+`{"type":"uninstall_state","state":"removing"|"failed"|"complete"}` (the
+ordered teardown's transitions; `complete` (v0.8.2) is the POSITIVE
+terminal signal sent once the removal is committed, see "Uninstall"), and,
+the P1 lifecycle
 status push (v0.6.3), UNSOLICITED `status` frames whenever the lifecycle
 core changes (the admin block or the `uninstalling` flag): a 1 s watcher
 while pages are connected plus immediate pushes at operation boundaries
@@ -175,6 +210,39 @@ browser's bridge finds it. It reads no QA state at all, test mode included.
 Single instance: `Local\ViruleClient.Singleton` mutex; a second launch
 forwards its URL (or a wake) to the running instance over the bridge and
 exits.
+
+RESIDENT (v0.8.0, 2026-09-10; replaces the original 20-minute idle exit):
+an installed client stays running, so `127.0.0.1:47612` is normally
+always available to the browser and an installed VIRULE is discoverable
+from a cold boot with no click. Idle costs nothing: every background
+thread sleeps, no connected page means no status pushes, and the update
+checks are one manifest fetch per 6 hours (client self-update and the
+managed-Admin check ride the same cadence). Two small PER-USER mechanisms
+give the residency, no service and no scheduled task:
+
+- the login start, `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  value `VIRULE` = the managed `virule-client.exe`
+  (`src/shared/login_start.hpp`): written by Virule-Setup at install time
+  and healed by the client on every run, managed installs only, under the
+  machine-registration guard; removed by the uninstall inventory with the
+  other registrations, LAST, and only while it points into the removed
+  tree;
+- Windows Error Reporting's application restart
+  (`RegisterApplicationRestart`, armed in `serve()` for managed installs):
+  a client that dies on an unhandled exception (or that WER judges hung)
+  after running at least 60 s is relaunched with `--restarted` plus its
+  development seams; only patch/reboot relaunches are opted out. A clean
+  exit is never restarted, so Setup's shutdown, the self-update swap and
+  an uninstall are unaffected, and the uninstall-intent gate at the top of
+  `wWinMain` still wins over a restart that races a removal.
+
+The client leaves only on request: Setup's `shutdown`, the self-update
+swap, an uninstall, or a port it can never own. `virule://open` remains the
+FALLBACK wake for whatever is left (a client ended by hand before the next
+login), never the normal path to discovery; while the Admin runs, its
+`client_health` monitor is the in-session watchdog for that case. The
+single-instance mutex makes a login start racing a `virule://` launch
+harmless (the second forwards and exits).
 
 ## Environments (production and staging)
 
@@ -449,10 +517,69 @@ surfaces, and Setup is never released into neither.
   "You're all set." and closes itself while a live page still receives
   the result push. An INSTALL_ADMIN takeover holds the card through
   "Installing…"/"Updating…" until the installation completes and the
-  Admin launches; envelope-driven and page-driven installs converge on
-  the ONE `g_busy` operation whichever starts first, and an
-  already-current installed Admin short-circuits to open (never
+  launched Admin is VISIBLE; envelope-driven and page-driven installs
+  converge on the ONE `g_busy` operation whichever starts first, and an
+  already-current installed Admin short-circuits to a watched open (never
   re-downloads the package).
+
+THE LAST HOP IS PROVEN LIKE EVERY OTHER, BY WHAT THE USER SEES (v0.8.0
+dead-air fix, corrected v0.8.3, 2026-09-10): every card that ends in an
+Admin launch (the takeover continuations, the Settings/launch-handoff
+"Updating…" card) retires through ONE helper,
+`admin_install::retire_card_into_admin_surface`, and nowhere else. The
+rule it enforces: A VIRULE SURFACE MUST NOT RETIRE MERELY BECAUSE ITS
+SUCCESSOR HWND HAS `WS_VISIBLE`. The successor must actually be presented
+to the user at the retiring surface's position, or the current surface
+stays until a later successor genuinely is. In order:
+
+1. `wait_for_admin_window` (unchanged, 90 s bound) proves the next
+   surface EXISTS: a visible, unowned top-level window of a
+   managed-directory process, virule.exe's startup splash or the Admin
+   window, whichever paints first. `WS_VISIBLE` proves existence only.
+2. While the card still exists and still owns the foreground, the client
+   hands the foreground to that surface (`SetForegroundWindow`; the
+   client is the foreground process, so Windows permits it).
+3. The handoff is confirmed by presentation, not by the flag:
+   `GetForegroundWindow()` is a managed-directory window, or the root of
+   `WindowFromPoint(card centre)` belongs to a managed-directory process.
+   A short bounded confirmation (1.5 s ceiling), never a fixed delay: it
+   returns the instant either holds.
+4. Only then does the card close. Destroying a window that is no longer
+   active transfers activation to nothing, so the splash stays on top.
+5. If the handoff is refused, the card does NOT close: "Finishing up…"
+   holds until the REAL Admin window is visible (title "VIRULE Admin",
+   image ViruleAdminHost.exe in the managed directory, never a dialog),
+   hands the foreground to it the same way, then closes. That path is
+   Finishing up -> Admin with the splash skipped, never Finishing up ->
+   browser -> Admin. The 90 s bound runs from the helper's entry; a
+   managed process that dies still releases the card to the recovery.
+
+Why the flag was never enough (audit
+`SPLASH_HANDOFF_AND_PERMISSION_COPY_AUDIT_2026-09-10.md`): the card is
+the FOREGROUND window and the splash is a non-activating tool window at
+the same rectangle. Closing the active card made Windows activate the
+previous window, the browser, which was raised above the splash; the
+splash then sat "visible" behind the browser for the Admin's whole
+first-run startup. v0.8.1/0.8.2 retired the card on the splash's flag
+~0.5 s after launch and therefore showed exactly that. The act of
+retiring changes the z-order, so no flag read before the close can be
+sufficient unless the foreground has already moved to the successor.
+
+It used to retire on process existence (CreateProcess returning, or the
+8 s launch watch passing), which on a slow machine was the Admin's whole
+startup of dead air. A concrete launch failure is still audit M15's 8 s
+watch plus its recovery card, and a live process with no window after
+the bound simply releases the card. The 8 s watch itself
+(`launch_admin_watched`) ends early on the existence proof (2026-09-10):
+it is a failure detector, and a visible managed-Admin window leaves
+nothing to detect. A launch with no window still burns the full watch
+exactly as before. virule.exe's splash is unchanged: it never steals
+focus on a normal launch; the client, already holding the foreground,
+gives it away. The takeover's `busy` hold and the site's
+`adminInstalling` timeout are a MATCHED PAIR at 45 minutes (~1 Mbit/s
+floor for the ~308 MiB package; the HTTP layer's 60 s per-read timeout
+ends a dead transfer long before either fires); raise both together or
+neither.
 - NO PENDING INTENT (the bounded watch expires with no operation; a
   merely-connected idle page is NOT an operation and does not suppress
   this) -> the standalone branded "VIRULE is ready" card with the ONE
@@ -473,10 +600,21 @@ against a dying window.
 
 `result_card.hpp` is the ONE client lifecycle surface: the bare Result
 mode is the unchanged QA-doctrine card (no brand mark), while Working /
-Ready / resolved lifecycle Results wear the Setup card's branded grammar
-(V mark, spaced wordmark, indeterminate bar or action button). It is
+Ready / resolved lifecycle Results wear the branded grammar (V mark,
+status line, indeterminate bar or action button; no wordmark). It is
 reusable across the persistent client process, and both executables embed
 the official VIRULE application icon (`assets/ViruleAppIcon.ico`).
+
+THE TRANSITIONAL FAMILY IS ONE COMPONENT (owner law 2026-09-10,
+`docs/UIUX.md` product-wide law 2): Virule-Setup's card
+(`setup_window.hpp`), every branded client card here and virule.exe's
+"Loading…" startup splash (`v2_mvp/src/cli/main.cpp`) share one fixed
+geometry: a 340 x 176 card, the 44 px V mark at y = 30, the status line
+in the 94..118 band (13 px REGULAR weight, the word color; never
+semibold/bold), and the 168 x 3 indeterminate bar at y = 136 BELOW the
+status (mark, status, bar). Only the Ready / Action cards are taller
+(192) for their button. A status change never moves anything; change one
+surface and change all three.
 
 The same lifecycle grammar carries the Admin update: a Settings-initiated
 update shows the Admin's "Shutting down VIRULE" overlay, the client closes
@@ -582,7 +720,23 @@ destroyed, failure push, latch kept) -> the client exits -> the VISIBLE
 removes FILES (bounded retries per tree), then REGISTRATIONS LAST
 (`virule://` only while it points into the removed tree, then the ARP
 entry), verifies, clears the latch LAST, and shows "VIRULE has been
-uninstalled." (plus "Your local data was kept." in the default mode). A
+uninstalled." (plus "Your local data was kept." in the default mode) for
+5 s (dismissible; the only result card with a shorter life than the 10 s
+default, scoped through `result_card::update(..., life_ms)`).
+
+THE SITE'S NORMAL SIGNAL IS POSITIVE (v0.8.2, 2026-09-10): between
+starting the helper and exiting, the client pushes `uninstall_state
+"complete"` to every connected page over the bridge connection it
+already holds (the accept listener is closed by then; page connections
+stay open). "Complete" means COMMITTED: every step that can run while
+the client lives has run and the helper is running, so the only work
+left is deleting the client executable itself and the helper's own
+cleanup. The page leaves "Removing VIRULE…" for Get VIRULE at once and
+closes its socket; the client waits for its page connections to go (that
+close IS the delivery acknowledgement; no new message type) or 1.5 s,
+whichever is first, then exits (`bridge::wait_pages_closed`). The site's
+15 s bridge-absence window (`REMOVAL_ABSENCE_CONFIRM_MS`) remains ONLY as
+the fallback for a client that died mid-teardown without sending it. A
 failed removal keeps the latch AND the registrations
 (Windows-recoverable) and offers Try again on the card.
 
@@ -660,10 +814,11 @@ version (client startup, a quiet 6-hour recheck while serving, and a
 while a managed install exists. Checking is automatic; INSTALLING is
 always user-initiated (Admin Settings > GENERAL > Update, or virule.app's
 Update VIRULE). The Admin host owns no manifest logic: it asks over a
-local control connection, starting the on-demand client when needed.
+local control connection, starting the (resident) client if it is not
+serving, which is the in-session recovery for a client ended by hand.
 
 Once accepted, the operation finishes even if every page closes
-(`g_busy` also holds off the idle-exit policy), and a FRESH install
+(`g_busy` also holds off the client self-update swap), and a FRESH install
 launches the installed Admin automatically at the end. The desktop
 shortcut (`VIRULE.lnk`, target = the managed `virule.exe`) is created
 when the browser's intent asked for one, and its provenance is recorded

@@ -9,7 +9,9 @@
 // user choice of any kind.
 //
 // Per-user throughout: %LOCALAPPDATA%\Programs\VIRULE, HKCU registration.
-// No elevation, no machine-wide state, no service, no login task.
+// No elevation, no machine-wide state, no service, no scheduled task. The
+// one login-time item is the per-user Run value (shared/login_start.hpp)
+// that keeps the installed client resident (client residency, 2026-09-10).
 //
 // VISIBLE SURFACE (setup_window.hpp): one small native card, "Setting up
 // VIRULE..." until the client acknowledges ownership, then a brief
@@ -62,6 +64,7 @@
 #include "shared/json_scan.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
+#include "shared/login_start.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
 #include "shared/uninstall.hpp"  // register_uninstall_entry
@@ -535,6 +538,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     vclient::protocol_reg::register_protocol(target.wstring());
     vclient::uninstall::register_uninstall_entry(
         target.wstring(), widen(manifest.version));
+    // Client residency: the per-user login start (the client heals it on
+    // every run as well; same guard).
+    vclient::login_start::register_login_start(target.wstring());
 
     // An EXPLICIT install supersedes any standing uninstall intent (the
     // durable latch a failed or interrupted uninstall leaves behind so

@@ -17,8 +17,9 @@
 //
 //   Starting      argument parsing, single-instance resolution
 //   Serving       bridge listening; virule:// launches are forwarded here
-//   Draining      idle timeout reached or shutdown requested; the
-//                 listener closes and the process exits cleanly
+//   Draining      shutdown requested (Setup replacing the exe, the
+//                 self-update swap, a port this process can never own);
+//                 the listener closes and the process exits cleanly
 //   Uninstalling  a verified uninstall began; the %TEMP% helper takes
 //                 over after this process exits
 //
@@ -27,11 +28,19 @@
 // loopback bridge and exits immediately. Two launches can never produce
 // two active clients or two listeners.
 //
-// ON DEMAND: no service, no login task. The client runs when Setup, a
-// virule:// launch, or the user starts it, and exits on its own after
-// kIdleExitMs with no bridge connection and no work. The browser's
-// deterministic wake path (the protocol preflight) covers every later
-// visit.
+// RESIDENT (2026-09-10; replaces the original 20-minute idle exit): an
+// installed client stays running, so 127.0.0.1:47612 is normally always
+// there for the browser. Idle costs nothing: every background thread
+// sleeps, no connected page means no pushes, and the update checks are
+// one manifest fetch per 6 hours. It comes back after login/reboot
+// through a per-user Run value (shared/login_start.hpp) and after a
+// crash through Windows Error Reporting's application restart
+// (RegisterApplicationRestart in serve()); both are managed-install only,
+// no service and no scheduled task. It leaves only on request: Setup's
+// shutdown, the self-update swap, an uninstall, or a port it can never
+// own. virule:// remains the fallback wake for whatever is left (a client
+// ended by hand), never the normal path to discovery; the Admin's
+// client_health monitor is the in-session watchdog for that case.
 
 #include <atomic>
 #include <string>
@@ -47,6 +56,7 @@
 #include "shared/client_state.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
+#include "shared/login_start.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
 #include "shared/uninstall.hpp"
@@ -72,10 +82,6 @@ namespace {
 enum class RunState { Starting, Serving, Draining, Uninstalling };
 std::atomic<RunState> g_state{ RunState::Starting };
 std::atomic<bool> g_exit_requested{ false };
-
-// Idle-exit policy: with no open bridge connection and no activity for
-// this long, the process leaves. virule:// wakes it again deterministically.
-constexpr unsigned long long kIdleExitMs = 20ull * 60ull * 1000ull;
 
 std::string narrow(const std::wstring& w) {
     if (w.empty()) return "";
@@ -130,9 +136,15 @@ bool self_update_safe_point() {
 //      Admin-directory process is gone (never partially uninstall under a
 //      live Admin; a refusal aborts with visible feedback and changes
 //      nothing);
-//   5. exit and hand the removal to the visible %TEMP% helper, which
-//      removes files, removes registrations LAST, verifies, clears the
-//      intent latch LAST and shows the terminal outcome.
+//   5. hand the removal to the visible %TEMP% helper, which removes
+//      files, removes registrations LAST, verifies, clears the intent
+//      latch LAST and shows the terminal outcome;
+//   6. tell every connected page the removal is COMMITTED (uninstall_state
+//      "complete", 2026-09-10): the helper is running and the only work
+//      left is deleting this executable, so the site may leave "Removing
+//      VIRULE…" now instead of counting out its absence window (that
+//      window stays as the fallback for a client that dies before this
+//      step); give the message a bounded moment to land, then exit.
 //
 // Never deletes anything in-process. `delete_data` is the explicit
 // destructive option; the default preserves every piece of user-owned
@@ -192,9 +204,10 @@ void run_uninstall_sequence(bool delete_data) {
         vclient::log::client("uninstall: the Admin closed");
     }
 
-    // 5. Helper handoff. The listener closes so the freed port and the
-    // dying socket read as removal in progress; the helper (a %TEMP% copy
-    // of this exe) owns the visible surface from here.
+    // 5. Helper handoff. The listener closes so the freed port reads as
+    // removal in progress (existing page connections stay open for the
+    // terminal message below); the helper (a %TEMP% copy of this exe)
+    // owns the visible surface from here.
     vclient::bridge::stop_listening();
     if (!vclient::uninstall::spawn_uninstall_helper(delete_data)) {
         vclient::log::client("uninstall: helper could not be started; nothing removed");
@@ -204,6 +217,19 @@ void run_uninstall_sequence(bool delete_data) {
         vclient::bridge::g_uninstalling.store(false);
         g_state.store(RunState::Serving);
         return;
+    }
+
+    // 6. THE POSITIVE TERMINAL SIGNAL. The removal is committed: the
+    // helper is running and will finish with or without this process, and
+    // the only remaining work is the unavoidable deletion of this very
+    // executable plus the helper's own cleanup. Tell the connected pages
+    // over the bridge they already hold, let the message land (the site
+    // closes its socket on receipt; 1.5 s is the bound), then leave.
+    if (vclient::bridge::broadcast_uninstall_state("complete")) {
+        vclient::log::client("uninstall: committed; complete pushed to pages");
+        vclient::bridge::wait_pages_closed(1500);
+    } else {
+        vclient::log::client("uninstall: committed; no page connected");
     }
     ExitProcess(0);
 }
@@ -270,8 +296,13 @@ int run_finish_uninstall(unsigned long parent_pid, bool delete_data) {
                 if (clean) {
                     vclient::lifecycle::clear_uninstall_intent();
                     un::temp_log("helper: uninstall complete; intent cleared");
+                    // The completion confirmation stays 5 s (audit
+                    // 2026-09-10; every other result keeps the default
+                    // life). Still click/Escape/Enter dismissible; the
+                    // wait below returns whenever the card goes.
                     rc::update("VIRULE has been uninstalled.",
-                               delete_data ? "" : "Your local data was kept.");
+                               delete_data ? "" : "Your local data was kept.",
+                               /*life_ms=*/5000);
                     rc::wait_closed(12000);
                     un::schedule_self_delete();
                     return 0;
@@ -302,13 +333,35 @@ int run_finish_uninstall(unsigned long parent_pid, bool delete_data) {
     }
 }
 
-void serve(const std::string& initial_qa_token, bool register_protocol) {
+void serve(const std::string& initial_qa_token, bool register_protocol,
+           const std::wstring& restart_args) {
     // Self-heal the pieces an installed client owns. Registration mirrors
     // the Admin's behavior: whichever VIRULE component ran last holds
     // virule://, and both handle qa/verify identically. (--no-register is
     // a development seam so a directly-run build does not take over a
     // machine's real registration.)
     if (register_protocol) vclient::protocol_reg::register_protocol();
+
+    // RESIDENCY (2026-09-10), managed installs only, the same guard and the
+    // same self-heal posture as virule:// above: the per-user login start,
+    // so the client is back after every login and reboot, and Windows
+    // Error Reporting's application restart, so a crash brings it straight
+    // back. WER restarts a process that has run for at least 60 s and died
+    // on an unhandled exception, or that WER judged hung (never a clean
+    // exit, so an uninstall, the self-update swap and Setup's shutdown are
+    // never restarted); only patch/reboot relaunches are opted out. The
+    // uninstall-intent gate in wWinMain still wins over a restart that
+    // races a removal. No service, no scheduled task.
+    if (register_protocol && vclient::self_update::g_enabled.load()) {
+        vclient::login_start::register_login_start(
+            vclient::paths::installed_client_exe().wstring());
+        const HRESULT hr = RegisterApplicationRestart(
+            restart_args.empty() ? nullptr : restart_args.c_str(),
+            RESTART_NO_PATCH | RESTART_NO_REBOOT);
+        vclient::log::client(SUCCEEDED(hr)
+            ? "residency: login start registered; crash restart armed"
+            : "residency: login start registered; crash restart unavailable");
+    }
 
     vclient::bridge::Callbacks callbacks;
     callbacks.on_qa_accept = [](const std::string& token) {
@@ -549,14 +602,9 @@ void serve(const std::string& initial_qa_token, bool register_protocol) {
             vclient::log::client("no listener could be established; exiting");
             break;
         }
-        if (vclient::bridge::g_open_connections.load() == 0 &&
-            !vclient::admin_install::g_busy.load()) {
-            const unsigned long long last = vclient::bridge::g_last_activity_tick.load();
-            if (last != 0 && GetTickCount64() - last > kIdleExitMs) {
-                vclient::log::client("idle; exiting");
-                break;
-            }
-        }
+        // No idle exit: the client is RESIDENT (see the header). With no
+        // page connected and no operation running this loop is the whole
+        // cost of staying alive: one wake-up a second.
     }
     g_state.store(RunState::Draining);
     vclient::bridge::stop_listening();
@@ -596,6 +644,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     bool no_register = false;
     bool delete_data_arg = false;
     bool dev_unsigned = false;       // signature gates only (dev)
+    bool restarted = false;          // relaunched by WER after a crash
     std::wstring self_manifest_url;  // self-update manifest seam (dev)
     std::wstring admin_manifest_url; // Admin-manifest seam (dev)
     for (int i = 1; i < argc; ++i) {
@@ -603,6 +652,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (arg == L"--no-register") no_register = true;
         if (arg == L"--delete-data") delete_data_arg = true;
         if (arg == L"--dev-unsigned") dev_unsigned = true;
+        if (arg == L"--restarted") restarted = true;
         if (arg.rfind(L"--self-manifest-url=", 0) == 0) {
             self_manifest_url = arg.substr(20);
         }
@@ -612,9 +662,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     LocalFree(argv);
     if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
+        arg1 == L"--restarted" ||
         arg1.rfind(L"--self-manifest-url=", 0) == 0 ||
         arg1.rfind(L"--admin-manifest-url=", 0) == 0) {
         arg1.clear();
+    }
+
+    // The command line Windows Error Reporting relaunches this process
+    // with after a crash (serve() registers it): the marker, plus every
+    // development seam this run carries, so a restarted client keeps the
+    // posture it was started with.
+    std::wstring restart_args = L"--restarted";
+    if (no_register) restart_args += L" --no-register";
+    if (dev_unsigned) restart_args += L" --dev-unsigned";
+    if (!self_manifest_url.empty()) {
+        restart_args += L" --self-manifest-url=" + self_manifest_url;
+    }
+    if (!admin_manifest_url.empty()) {
+        restart_args += L" --admin-manifest-url=" + admin_manifest_url;
     }
 
     // Self-update run configuration. Self-update manages ONLY the managed
@@ -779,7 +844,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 0;
     }
 
-    serve(qa_token, !no_register);
+    if (restarted) {
+        vclient::log::client("residency: restarted by Windows after an unexpected exit");
+    }
+    serve(qa_token, !no_register, restart_args);
 
     ReleaseMutex(mutex);
     CloseHandle(mutex);

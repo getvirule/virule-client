@@ -359,12 +359,27 @@ inline void push_lifecycle_status(bool force = false) {
 
 // Push one uninstall lifecycle transition to every connected page:
 // "removing" when the ordered teardown begins, "failed" when it stops
-// before any destruction (the Admin refused to close). Success has no
-// push by construction (the client exits and the helper owns the visible
-// outcome); the site reads sustained bridge absence as completion.
+// before any destruction (the Admin refused to close), and "complete"
+// (2026-09-10) once the removal is COMMITTED: every step that can run
+// while this process lives has run and the %TEMP% helper has been
+// started, so the only work left is deleting this very executable and
+// the helper's own cleanup. The page resolves on "complete" at once; its
+// 15 s bridge-absence window remains only as the fallback for a client
+// that died mid-teardown without sending it.
 inline bool broadcast_uninstall_state(const std::string& state) {
     return broadcast_to_pages("{\"type\":\"uninstall_state\",\"state\":\"" +
                               state + "\"}");
+}
+
+// Give a just-broadcast terminal message a short, bounded chance to reach
+// its pages before this process exits: the site closes its socket the
+// moment it has consumed "complete", so every page connection going away
+// IS the delivery acknowledgement (no new message type). A page that
+// never closes (an older page that does not know the state) only costs
+// the bound.
+inline void wait_pages_closed(unsigned long long bound_ms) {
+    const ULONGLONG deadline = GetTickCount64() + bound_ms;
+    while (open_page_count() > 0 && GetTickCount64() < deadline) Sleep(50);
 }
 
 inline std::string b64(const unsigned char* data, size_t n) {
