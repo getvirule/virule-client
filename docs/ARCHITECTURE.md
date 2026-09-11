@@ -364,6 +364,13 @@ The manifest is minimal and secret-free:
 takes no whitespace). `helpers/publish.ps1` is the only writer: it refuses
 unsigned artifacts, refuses to overwrite a published version with
 different bytes, and verifies every public asset URL by re-downloading it.
+Since 2026-09-11 it is driven by the product-wide promotion
+(`v2_mvp\helpers\release-production.bat`, `release_promote.ps1`): the
+client ships only when `src\shared\version.h` is above the live manifest
+AND this repository's HEAD is clean, pushed, and the commit staging was
+built from and QA approved; the promotion builds Production, signs both
+artifacts, runs this publisher, then re-downloads the published Setup and
+checks its signature. A commit or push here deploys nothing.
 GitHub is a HOST, not a trust anchor: everything a user runs is still
 gated by the manifest hash plus the VIRULE Authenticode identity below.
 
