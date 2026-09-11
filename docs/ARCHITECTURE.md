@@ -20,18 +20,32 @@ The port binds 127.0.0.1 ONLY. If 47612 is held by a foreign process the
 client logs it and exits; there is no fallback port and no remote exposure
 of any kind.
 
-LOCAL NETWORK ACCESS (verified in Edge, 2026-09-02): current Chromium
-gates a public https origin's loopback sockets behind the
-`local-network-access` permission - the first attempt shows a browser
-permission prompt in headed browsing and fails with
-ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS when denied. The virule.app
-pages therefore probe quietly only while the permission is already
-granted (Permissions API query), attempt ungated only after an explicit
-user action (ACCEPT), and never depend on the bridge to complete QA
-verification (virule:// + /qa/link polling is the bridge-free path). Do
-not paper over a denial with flags or lesser transports; the permission
-prompt IS the standards path, and local origins (wrangler dev, vite) are
-exempt, which is why development never sees it.
+LOCAL NETWORK ACCESS (verified in Edge, 2026-09-02; browser facts
+re-verified HEADED with fresh profiles in Edge 152 and Firefox 154,
+2026-09-11): browsers gate a public https origin's loopback sockets
+behind a permission prompt, "Access other apps and services on this
+device" in both; a denied request fails (Chromium:
+ERR_BLOCKED_BY_LOCAL_NETWORK_ACCESS_CHECKS). The Permissions API name is
+`loopback-network`: both browsers answer it, it turns `granted` on Allow
+and `denied` on Block, and it persists across reloads and browser
+restarts (Firefox: when "Remember my choice for this site" was ticked; a
+one-time Allow lasts the session). Chromium still answers the older
+`local-network-access` in step with it; Firefox REJECTS that name.
+Chromium raises its prompt for the attempt itself, even with nothing
+listening on the port; Firefox raises it only once a connection reaches
+a LISTENING port (a refused port fails in ~2 s with no prompt). The
+virule.app pages therefore probe quietly ONLY while the permission
+positively answers `granted` (`loopback-network`, or
+`local-network-access` where only that name is known): a rejected
+query, a missing Permissions API, `prompt` and `denied` are all NOT
+granted. Reading a rejected name as "no gate" is exactly what prompted
+every Firefox visitor on page load before 2026-09-11. Ungated attempts
+happen only after an explicit user action (Get VIRULE, ACCEPT), and the
+pages never depend on the bridge to complete QA verification (virule://
++ /qa/link polling is the bridge-free path). Do not paper over a denial
+with flags or lesser transports; the permission prompt IS the standards
+path, and local origins (wrangler dev, vite) are exempt, which is why
+development never sees it.
 
 DENIED IS A STATE, NOT AN ABSENCE (site, 2026-09-10). A denied permission
 blocks the bridge (47612) AND the Setup handoff channel (47613) alike, so
@@ -39,8 +53,10 @@ an INSTALL_ADMIN intent has no delivery route and re-offering the
 installer only loops (Setup -> "VIRULE is ready" -> Get VIRULE -> Download
 -> Setup, with Admin never installed). The homepage keeps the ONE
 PermissionStatus from its query, treats `denied` as its own connection
-state (`blocked`: a recovery view replaces Get VIRULE and the whole
-install path), and reconnects the instant `onchange` reports `granted`,
+state (`blocked`: once the user has clicked Get VIRULE, a recovery view
+replaces the whole install path; before the click a denied browser sees
+Get VIRULE like every browser that has not granted access), and
+reconnects the instant `onchange` reports `granted`,
 so allowing the site in site settings resumes the pending intent with no
 reload and no reinstall. A denied origin is never re-prompted by
 Chromium, and a failed socket carries no reason, so the Permissions API
@@ -63,9 +79,16 @@ bounded wake wait run, and only its expiry offers Download. The order is
 therefore always permission resolution -> client detection -> fallback
 wake -> installer offer, so a fresh install can no longer reach Setup
 (and the standalone "VIRULE is ready" card) merely because the user has
-not answered the browser yet. Browsers whose query rejects (no such
-permission; Firefox today) keep the direct no-gate path. Proof:
-`v1_mvp_site/tools/permission_state_test.mjs`.
+not answered the browser yet. Firefox exception, from its prompt model:
+a Get VIRULE attempt REFUSED within 4 s while the answer is still
+`prompt` means nothing is listening and Firefox will not ask yet, so the
+flow continues to the wake, the bounded wait and the installer offer, and
+Firefox asks once Setup (47613) or the client (47612) listens; an attempt
+that parks (a listener, so the prompt is up) keeps the wait. A browser
+that answers neither name takes the direct path on the click (Checking
+this PC + wake). Proof: `v1_mvp_site/tools/permission_state_test.mjs` and
+`probe_gate_test.mjs` (browser models emulated; the prompt itself is
+verified only headed).
 
 Origin policy: browser connections must present one of the explicit
 allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
