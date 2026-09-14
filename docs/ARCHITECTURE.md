@@ -636,7 +636,7 @@ reusable across the persistent client process, and both executables embed
 the official VIRULE application icon (`assets/ViruleAppIcon.ico`).
 
 THE TRANSITIONAL FAMILY IS ONE COMPONENT (owner law 2026-09-10,
-`docs/UIUX.md` product-wide law 2): Virule-Setup's card
+`VIRULE/docs/specs/UIUX.md` product-wide law 2): Virule-Setup's card
 (`setup_window.hpp`), every branded client card here and virule.exe's
 "Loading…" startup splash (`v2_mvp/src/cli/main.cpp`) share one fixed
 geometry: a 340 x 176 card, the 44 px V mark at y = 30, the status line
