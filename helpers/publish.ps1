@@ -198,8 +198,29 @@ if ($remoteSetup -eq $setupSha) {
 Verify-PublicAsset "$publicBase/$tag/virule-client.exe" $clientSha 'virule-client.exe'
 Verify-PublicAsset "$publicBase/$tag/manifest.json" $manifestSha 'manifest.json'
 Verify-PublicAsset "$publicBase/$tag/Virule-Setup.exe" $setupSha 'Virule-Setup.exe'
-# The pointer Setup actually follows: the LATEST release's manifest.
-Verify-PublicAsset "https://github.com/$ghRepo/releases/latest/download/manifest.json" $manifestSha 'latest manifest pointer'
+# The pointer Setup actually follows: the LATEST release's manifest. GitHub
+# moves 'latest' eventually, not atomically: twice on 2026-09-16 the pointer
+# still served the previous release for about a minute after the versioned
+# assets above had been byte-verified, and a single read failed the whole
+# publish after everything was already live. Bounded retries (12 x 10 s)
+# absorb that propagation; a pointer that never converges still fails.
+$pointerUrl = "https://github.com/$ghRepo/releases/latest/download/manifest.json"
+$pointerOk = $false
+for ($attempt = 1; $attempt -le 12 -and -not $pointerOk; $attempt++) {
+    $tmpPtr = Join-Path $stageDir ("verify_" + [IO.Path]::GetRandomFileName())
+    $got = ''
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -UseBasicParsing -Uri ($pointerUrl + '?t=' + [guid]::NewGuid().ToString('N')) -OutFile $tmpPtr | Out-Null
+        $got = Sha256 $tmpPtr
+    } catch { $got = '' }
+    Remove-TempDir $tmpPtr
+    if ($got -eq $manifestSha) { $pointerOk = $true; break }
+    Write-Host ("--    latest manifest pointer not yet the new release (attempt {0}/12); waiting 10 s" -f $attempt)
+    Start-Sleep -Seconds 10
+}
+if (-not $pointerOk) { Fail "$pointerUrl never served the new manifest (expected=$manifestSha) after 12 attempts" }
+Write-Host "OK:   verified latest manifest pointer at $pointerUrl"
 
 Write-Host ''
 Write-Host 'SUCCESS: GitHub release published and verified.' -ForegroundColor Green
