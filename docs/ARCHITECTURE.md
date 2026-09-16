@@ -478,7 +478,7 @@ repository pin.
 Setup used to run and vanish with no window: technically correct (the
 browser owns the flow) and, in practice, untrustworthy. It now shows ONE
 small card in VIRULE's native visual language (the Admin splash grammar:
-rounded card, yellow V mark, spaced wordmark, one muted line), and nothing
+square-cornered card, yellow V mark, spaced wordmark, one muted line), and nothing
 more. NOT A WIZARD: no pages, no Next/Back, no destination picker, no
 component list, no license page and no user choice of any kind.
 
@@ -826,6 +826,14 @@ genuinely unknown reports an EMPTY version, and nothing anywhere turns
 unknown into "up to date" or "update available": both claims require a
 real comparison of two known versions. The Admin binaries are never
 probed for a version.
+
+THE PACKAGE CARRIES THE OUTREACH PROVIDER CONFIGURATION (2026-09-16):
+`outreach_providers.json` at the package root is the owner's registered
+Google and Microsoft application configuration, the reason Connect in the
+Admin is a sign-in and nothing more. `publish_admin.ps1` refuses to
+package or publish a tree without it, the staged tree is refused without
+it (`kRequiredFiles`, existence only: it is data, not a signed binary),
+and every update re-places it with the rest of the tree.
 
 THE CLIENT OWNS THE UPDATE LIFECYCLE (owner spec 2026-09-03). An update
 that finds the Admin running no longer refuses: after a ~4 s grace (the

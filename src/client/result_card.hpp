@@ -266,7 +266,7 @@ inline void paint_branded(HDC mem, int w, int h, Mode mode,
             HBRUSH b = CreateSolidBrush(g_pal.accent);
             HGDIOBJ old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
             HGDIOBJ old_br = SelectObject(mem, b);
-            RoundRect(mem, bx, by, bx + bw, by + bh, qsc(8), qsc(8));
+            Rectangle(mem, bx, by, bx + bw, by + bh); // square button (owner ruling 2026-09-16)
             SelectObject(mem, old_br);
             SelectObject(mem, old_pen);
             DeleteObject(b);
@@ -337,7 +337,7 @@ inline void paint(HWND hwnd) {
         HPEN pen = CreatePen(PS_SOLID, 1, g_pal.line);
         HGDIOBJ old_pen = SelectObject(mem, pen);
         HGDIOBJ old_br = SelectObject(mem, GetStockObject(HOLLOW_BRUSH));
-        RoundRect(mem, 0, 0, w - 1, h - 1, qsc(14), qsc(14));
+        Rectangle(mem, 0, 0, w - 1, h - 1); // square card outline (owner ruling 2026-09-16)
         SelectObject(mem, old_br);
         SelectObject(mem, old_pen);
         DeleteObject(pen);
@@ -486,7 +486,7 @@ inline DWORD WINAPI thread_main(LPVOID) {
     HWND hwnd = CreateWindowExW(0, kClassName, L"VIRULE", WS_POPUP,
                                 x, y, w, h, nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 0;
-    SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, qsc(14), qsc(14)), TRUE);
+    // Square corners (owner ruling 2026-09-16, STYLE_GUIDE 6.1 / 21): no window region, the popup is its own rectangle.
     g_hwnd.store(hwnd);
     // This card is the handoff's next feedback surface, so it must reach
     // the FOREGROUND even though this process was spawned from the

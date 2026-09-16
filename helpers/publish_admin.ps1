@@ -185,6 +185,26 @@ if ($staging) {
     }
 }
 
+# ---- 1b. the Outreach provider configuration ----
+# Connect Google / Connect Microsoft work in an installed Admin only because
+# the package carries the owner's registered application configuration at
+# its root (mail_provider.cpp reads <root>\outreach_providers.json). A user
+# signs in; nothing is ever configured by hand. publish_release.bat stages
+# the file from the owner's security folder; this gate refuses to package,
+# validate or publish a tree where it is missing or incomplete for EITHER
+# provider, for production and staging alike. The check is the pure, tested
+# function in v2_mvp\helpers\outreach_providers_check.ps1.
+$providersCheck = Join-Path $v2Root 'helpers\outreach_providers_check.ps1'
+if (-not (Test-Path $providersCheck)) { Fail "missing $providersCheck" }
+. $providersCheck
+$providersProblems = @(Get-OutreachProviderConfigProblems (Join-Path $publishDir 'outreach_providers.json'))
+if ($providersProblems.Count -gt 0) {
+    Fail ("the package would ship without a working Outreach provider configuration (Connect Google / Connect Microsoft would fail as an application error):`n  " +
+          ($providersProblems -join "`n  ") +
+          "`n  Regenerate it with v2_mvp\helpers\make_outreach_providers.ps1 and stage the publish tree again.")
+}
+Write-Host 'OK:   outreach_providers.json complete (google + microsoft)'
+
 # ---- 2. the package: folder CONTENTS at the zip root ----
 $expected = $ExpectedSha256.ToLowerInvariant()
 New-Item -ItemType Directory -Force $stageDir | Out-Null
@@ -220,9 +240,11 @@ if ($expected -ne '') {
 $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
 try {
     $rootExe = $zip.Entries | Where-Object { $_.FullName -eq 'virule.exe' }
+    $rootCfg = $zip.Entries | Where-Object { $_.FullName -eq 'outreach_providers.json' }
     $entryCount = $zip.Entries.Count
 } finally { $zip.Dispose() }
 if (-not $rootExe) { Fail 'packaged zip does not carry virule.exe at its root' }
+if (-not $rootCfg) { Fail 'packaged zip does not carry outreach_providers.json at its root' }
 
 $zipSha  = Sha256 $zipPath
 $zipSize = (Get-Item $zipPath).Length

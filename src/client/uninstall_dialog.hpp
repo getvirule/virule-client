@@ -110,7 +110,7 @@ inline void paint(HWND hwnd) {
         HPEN pen = CreatePen(PS_SOLID, 1, g_pal.line);
         HGDIOBJ old_pen = SelectObject(mem, pen);
         HGDIOBJ old_br = SelectObject(mem, GetStockObject(HOLLOW_BRUSH));
-        RoundRect(mem, 0, 0, w - 1, h - 1, usc(14), usc(14));
+        Rectangle(mem, 0, 0, w - 1, h - 1); // square card outline (owner ruling 2026-09-16)
         SelectObject(mem, old_br);
         SelectObject(mem, old_pen);
         DeleteObject(pen);
@@ -156,8 +156,8 @@ inline void paint(HWND hwnd) {
             HBRUSH b = CreateSolidBrush(g_pal.accent);
             HGDIOBJ old_pen = SelectObject(mem, GetStockObject(NULL_PEN));
             HGDIOBJ old_br = SelectObject(mem, b);
-            RoundRect(mem, box_rc.left, box_rc.top, box_rc.right + 1,
-                      box_rc.bottom + 1, usc(4), usc(4));
+            Rectangle(mem, box_rc.left, box_rc.top, box_rc.right + 1,
+                      box_rc.bottom + 1); // square checkbox (owner ruling 2026-09-16)
             SelectObject(mem, old_br);
             SelectObject(mem, old_pen);
             DeleteObject(b);
@@ -173,8 +173,8 @@ inline void paint(HWND hwnd) {
             HPEN pen = CreatePen(PS_SOLID, 1, g_pal.line);
             HGDIOBJ old_pen = SelectObject(mem, pen);
             HGDIOBJ old_br = SelectObject(mem, GetStockObject(HOLLOW_BRUSH));
-            RoundRect(mem, box_rc.left, box_rc.top, box_rc.right,
-                      box_rc.bottom, usc(4), usc(4));
+            Rectangle(mem, box_rc.left, box_rc.top, box_rc.right,
+                      box_rc.bottom); // square checkbox (owner ruling 2026-09-16)
             SelectObject(mem, old_br);
             SelectObject(mem, old_pen);
             DeleteObject(pen);
@@ -225,7 +225,7 @@ inline void paint(HWND hwnd) {
             HPEN pen = CreatePen(PS_SOLID, 1, g_pal.accent);
             HGDIOBJ old_pen = SelectObject(mem, pen);
             HGDIOBJ old_br = SelectObject(mem, GetStockObject(HOLLOW_BRUSH));
-            RoundRect(mem, r.left, r.top, r.right, r.bottom, usc(8), usc(8));
+            Rectangle(mem, r.left, r.top, r.right, r.bottom); // square button (owner ruling 2026-09-16)
             SelectObject(mem, old_br);
             SelectObject(mem, old_pen);
             DeleteObject(pen);
@@ -339,7 +339,7 @@ inline bool run(bool& delete_data_out) {
         UnregisterClassW(kClassName, inst);
         return false;
     }
-    SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, usc(14), usc(14)), TRUE);
+    // Square corners (owner ruling 2026-09-16, STYLE_GUIDE 6.1 / 21): no window region, the popup is its own rectangle.
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     UpdateWindow(hwnd);

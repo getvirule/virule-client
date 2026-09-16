@@ -142,6 +142,18 @@ inline const wchar_t* kRequiredSigned[] = {
     L".resources\\bin\\x64\\SidecarKHost.exe",
 };
 
+// Every unsigned file the package must also carry. outreach_providers.json
+// is the owner's registered Google and Microsoft application configuration:
+// an installed Admin connects a mailbox by signing in, and only because this
+// file sits beside virule.exe (mail_provider.cpp, source 2). A package
+// without it is broken (Connect would fail as an application error), so it
+// is refused exactly like a missing signed component, and every update
+// re-places it with the rest of the tree, which is how it survives the
+// Admin swap. Existence only: it is data, not a signed binary.
+inline const wchar_t* kRequiredFiles[] = {
+    L"outreach_providers.json",
+};
+
 // ONE install/update at a time; the flag also holds the client self-update
 // swap and the Setup continuation card off a running operation.
 inline std::atomic<bool> g_busy{ false };
@@ -1588,7 +1600,18 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
             return "failed";
         }
     }
-    log::client("admin: staged tree verified (Authenticode + signer identity)");
+    for (const wchar_t* rel : kRequiredFiles) {
+        const auto p = staging / rel;
+        ec.clear();
+        if (!std::filesystem::exists(p, ec) || ec) {
+            log::client("admin: required file missing in package: " +
+                        p.filename().string());
+            cleanup_staging();
+            broadcast_result("failed", "");
+            return "failed";
+        }
+    }
+    log::client("admin: staged tree verified (Authenticode + signer identity + required files)");
 
     // 6b. The installed-version metadata rides the staging tree, so the
     // atomic placement below makes version and binaries inseparable (the
