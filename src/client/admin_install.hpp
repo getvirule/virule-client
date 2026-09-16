@@ -56,6 +56,7 @@
 // install over, the client finishes on its own and the Admin still opens.
 
 #include <atomic>
+#include <functional>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -157,6 +158,16 @@ inline const wchar_t* kRequiredFiles[] = {
 // ONE install/update at a time; the flag also holds the client self-update
 // swap and the Setup continuation card off a running operation.
 inline std::atomic<bool> g_busy{ false };
+
+// ONE UPDATE ACTION CONVERGES BOTH (owner spec 2026-09-16, v0.8.5): every
+// user-initiated Admin install / update / launch handoff also forces the
+// client's OWN self-update check right away, instead of leaving the client
+// to its 6-hour timer while the Admin moves. main.cpp installs the hook
+// (self_update.hpp sits above this header in the include graph); it runs
+// the check on its own thread, and the swap itself still waits for the
+// safe takeover point after this operation, so nothing here changes the
+// Admin update's timing or feedback.
+inline std::function<void()> g_on_user_operation;
 
 // UNINSTALL WINS (owner decision 2026-09-04): an explicit uninstall that
 // finds an update in flight cancels it back to a known-good filesystem
@@ -1747,6 +1758,7 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
     const bool was_installed = admin_installed();
     log::client(std::string("admin: ") + (was_installed ? "update" : "install") +
                 " requested" + (shortcut ? " (desktop shortcut)" : ""));
+    if (g_on_user_operation) g_on_user_operation(); // the client checks itself too
 
     // THE CLIENT OWNS THE SHUTDOWN (owner spec 2026-09-03). A running
     // Admin is closed GRACEFULLY for the update: the initiating surface

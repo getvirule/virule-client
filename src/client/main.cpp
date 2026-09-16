@@ -690,6 +690,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     vclient::self_update::g_dev_unsigned = dev_unsigned;
     vclient::self_update::g_manifest_override = self_manifest_url;
     vclient::self_update::g_no_register = no_register;
+    // ONE UPDATE ACTION CONVERGES BOTH (owner spec 2026-09-16): a
+    // user-initiated Admin install / update / launch handoff forces the
+    // client's own self-update check now (its own thread; the download
+    // never delays the Admin work). The staged client swaps at the safe
+    // takeover point once the Admin operation is over, exactly as a timer
+    // check would.
+    vclient::admin_install::g_on_user_operation = [] {
+        if (HANDLE t = CreateThread(nullptr, 0,
+                [](LPVOID) -> DWORD {
+                    vclient::self_update::refresh_check(0);
+                    return 0;
+                },
+                nullptr, 0, nullptr)) {
+            CloseHandle(t);
+        }
+    };
     // The managed-Admin pipeline's own two dev seams (same posture:
     // --dev-unsigned relaxes only Authenticode gates, the manifest
     // override relaxes only host + repository pin).

@@ -466,6 +466,8 @@ inline bool stage_update(const Manifest& m) {
 // Refresh the approved-client knowledge when the cache is older than
 // `fresh_ms`, and stage a genuine UPGRADE (SemVer ordering; equal does
 // nothing, an approved version LOWER than this build never downgrades).
+inline std::atomic<bool> g_check_in_flight{ false };
+
 inline void refresh_check(unsigned long long fresh_ms) {
     if (!g_enabled.load()) return;
     if (bridge::g_uninstalling.load()) return;
@@ -475,6 +477,10 @@ inline void refresh_check(unsigned long long fresh_ms) {
         if (g_check_tick != 0 && now - g_check_tick < fresh_ms) return;
         g_check_tick = now;
     }
+    // A forced check (a user-initiated Admin operation, fresh_ms = 0) can
+    // coincide with the timer's; one fetch and one staging at a time.
+    if (g_check_in_flight.exchange(true)) return;
+    struct Clear { ~Clear() { g_check_in_flight.store(false); } } clear_on_exit;
     if (lifecycle::uninstall_intent_active()) return;
 
     Manifest m;

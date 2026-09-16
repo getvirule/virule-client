@@ -855,6 +855,15 @@ Update VIRULE). The Admin host owns no manifest logic: it asks over a
 local control connection, starting the (resident) client if it is not
 serving, which is the in-session recovery for a client ended by hand.
 
+ONE UPDATE ACTION CONVERGES BOTH (owner spec 2026-09-16, v0.8.5): every
+user-initiated Admin install, update or launch handoff also forces the
+client's OWN self-update check at once (`admin_install::g_on_user_operation`,
+installed by `main.cpp`, running `self_update::refresh_check(0)` on its own
+thread), so the client never waits for its 6-hour timer while the Admin
+moves. The staged client still swaps only at the safe takeover point after
+the Admin operation, so the Admin update's timing and feedback are
+unchanged. One check runs at a time (`g_check_in_flight`).
+
 Once accepted, the operation finishes even if every page closes
 (`g_busy` also holds off the client self-update swap), and a FRESH install
 launches the installed Admin automatically at the end. The desktop
