@@ -111,6 +111,71 @@ function Invoke-Gh([string[]]$GhArgs, [switch]$AllowFail) {
 
 function Sha256([string]$path) { (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant() }
 
+# What GitHub reports about one asset on a release: present, and its size.
+function Get-ReleaseAssetInfo([string]$Tag, [string]$Repo, [string]$Name) {
+    $r = @{ Present = $false; Size = [long]0 }
+    $v = Invoke-Gh @('release', 'view', $Tag, '-R', $Repo, '--json', 'assets') -AllowFail
+    if ($v.Code -ne 0) { return $r }
+    try { $rel = $v.Out | ConvertFrom-Json } catch { return $r }
+    $pa = $rel.PSObject.Properties['assets']
+    if ($null -eq $pa -or $null -eq $pa.Value) { return $r }
+    foreach ($a in @($pa.Value)) {
+        if ([string]$a.name -eq $Name) { $r.Present = $true; $r.Size = [long]$a.size; break }
+    }
+    return $r
+}
+
+# Upload a release asset with BOUNDED RETRY. A large GitHub asset upload fails
+# transiently (2026-09-17: a 308 MB upload failed repeatedly with HTTP 500 while
+# a manual upload of the same file succeeded). A failed upload is an UPLOAD
+# problem: the fix is to retry the upload, never to rebuild, re-sign or
+# re-package. This:
+#   - checks first whether the asset is already there with the expected size
+#     (a previous attempt or a resume) and, if so, uploads nothing;
+#   - removes a partial/mismatched leftover from an interrupted attempt before
+#     retrying (for a versioned production tag; staging clobbers in place);
+#   - retries with backoff on any failure;
+#   - verifies GitHub reports the expected size after a reported success.
+# Byte verification against the public URL is done by the caller (step 5), on
+# every path. Returns when the asset is present at the expected size; Fails
+# after the last attempt WITHOUT touching any earlier stage.
+function Publish-AssetWithRetry([string]$Tag, [string]$Repo, [string]$ZipPath, [string]$Name,
+                                [long]$ExpectedSize, [switch]$Clobber) {
+    $maxAttempts = 5
+    $delays = @(5, 15, 45, 90, 120)
+    $mb = [math]::Round($ExpectedSize / 1MB)
+    for ($i = 1; $i -le $maxAttempts; $i++) {
+        $info = Get-ReleaseAssetInfo $Tag $Repo $Name
+        if ($info.Present -and $info.Size -eq $ExpectedSize) {
+            Write-Host ("OK:   asset already present at the expected size ({0} bytes); not re-uploading" -f $info.Size)
+            return
+        }
+        if ($info.Present -and $info.Size -ne $ExpectedSize -and -not $Clobber) {
+            Write-Host ("--    removing a partial/mismatched asset from an interrupted attempt (size {0}, expected {1})" -f $info.Size, $ExpectedSize)
+            $null = Invoke-Gh @('release', 'delete-asset', $Tag, $Name, '-R', $Repo, '--yes') -AllowFail
+        }
+        $ghArgs = @('release', 'upload', $Tag, '-R', $Repo, $ZipPath)
+        if ($Clobber) { $ghArgs += '--clobber' }
+        Write-Host ("--    uploading {0} (attempt {1} of {2}, {3} MB)" -f $Name, $i, $maxAttempts, $mb)
+        $up = Invoke-Gh $ghArgs -AllowFail
+        if ($up.Code -eq 0) {
+            $post = Get-ReleaseAssetInfo $Tag $Repo $Name
+            if ($post.Present -and $post.Size -eq $ExpectedSize) { Write-Host 'OK:   uploaded and size-verified against GitHub'; return }
+            Write-Host ("--    upload reported success but GitHub shows size {0}, expected {1}; retrying" -f $post.Size, $ExpectedSize)
+        } else {
+            Write-Host ("--    upload attempt {0} failed (gh exit {1}); GitHub asset-upload errors are transient" -f $i, $up.Code)
+        }
+        if ($i -lt $maxAttempts) {
+            $d = $delays[[Math]::Min($i - 1, $delays.Count - 1)]
+            Write-Host ("--    backing off {0}s before the next attempt" -f $d)
+            Start-Sleep -Seconds $d
+        }
+    }
+    Fail ("the package upload did not succeed after $maxAttempts attempts. This is an UPLOAD failure only: " +
+          "the release object and every earlier stage (build, sign, package) are intact. Re-run to resume the " +
+          "upload; nothing is rebuilt, re-signed or re-packaged.")
+}
+
 # ---- 1. the publish folder and its signatures ----
 if (-not (Test-Path (Join-Path $publishDir 'virule.exe'))) {
     Fail "publish folder has no virule.exe: $publishDir"
@@ -282,9 +347,7 @@ if ($staging) {
     } else {
         Write-Host "OK:   staging release $tag already exists"
     }
-    Write-Host "--    uploading $zipName ($([math]::Round($zipSize / 1MB)) MB)"
-    $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $zipPath, '--clobber')
-    Write-Host 'OK:   uploaded'
+    Publish-AssetWithRetry $tag $ghRepo $zipPath $zipName $zipSize -Clobber
 } elseif ($view.Code -ne 0) {
     Write-Host "--    creating prerelease $tag"
     $notes = @"
@@ -331,9 +394,11 @@ if ($staging) {
               "(remote=$remoteSha local=$zipSha). Publish the next alpha instead.")
     }
 } else {
-    Write-Host "--    uploading $zipName ($([math]::Round($zipSize / 1MB)) MB)"
-    $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $zipPath)
-    Write-Host 'OK:   uploaded'
+    # A versioned production asset is immutable once published; the retry helper
+    # only ever removes a PARTIAL leftover from an interrupted attempt (wrong
+    # size), never a correctly published one, and the immutability check above
+    # already refused a mismatching complete asset.
+    Publish-AssetWithRetry $tag $ghRepo $zipPath $zipName $zipSize
 }
 
 # ---- 5. verify what the world will actually download ----
