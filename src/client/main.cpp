@@ -437,6 +437,9 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     callbacks.admin_update_status_json = [](bool launch_context) {
         return vclient::admin_install::update_status_json(launch_context);
     };
+    callbacks.update_health_json = []() {
+        return vclient::admin_install::update_health_json();
+    };
     callbacks.on_uninstall = [](bool delete_data) {
         begin_uninstall_async(delete_data);
     };
@@ -510,9 +513,10 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
 
     // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
     // INSTALLING): one check at startup, then a quiet periodic recheck
-    // while this process happens to be serving. Both no-op instantly when
-    // no managed Admin install exists, so machines without one create no
-    // background traffic. The thread is detached and dies with the process.
+    // while this process happens to be serving. The scheduled Admin check
+    // is ALSO this installation's check-in (owner spec 2026-10-01), so it
+    // runs with or without a managed Admin; without one the manifest answer
+    // is simply unused. The thread is detached and dies with the process.
     // The client's OWN self-update check rides the same quiet cadence
     // (startup, then the 6-hour recheck) and never blocks the bridge: the
     // listener is already up before this thread runs its first fetch.
@@ -520,14 +524,16 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // for the safe takeover point in the serve loop below.
     if (HANDLE h = CreateThread(nullptr, 0,
             [](LPVOID) -> DWORD {
+                // `true` = scheduled: only these checks count toward the
+                // update-connectivity record (shared/update_health.hpp).
                 vclient::admin_install::refresh_update_check(
-                    vclient::admin_install::kUpdateCheckFreshMs);
+                    vclient::admin_install::kUpdateCheckFreshMs, true);
                 vclient::self_update::refresh_check(
                     vclient::self_update::kCheckFreshMs);
                 for (;;) {
                     Sleep(60000);
                     vclient::admin_install::refresh_update_check(
-                        vclient::admin_install::kUpdateCheckPeriodMs);
+                        vclient::admin_install::kUpdateCheckPeriodMs, true);
                     vclient::self_update::refresh_check(
                         vclient::self_update::kCheckPeriodMs);
                 }

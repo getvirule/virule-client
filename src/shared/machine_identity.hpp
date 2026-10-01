@@ -253,6 +253,14 @@ inline std::string public_key_hex() {
     return c.public_key_hex;
 }
 
+// The credential's 32-hex install id, or "" when no usable identity exists.
+inline std::string install_id() {
+    std::lock_guard<std::mutex> lock(mutex());
+    dmp::CredentialFields c{};
+    if (!load_usable(c, nullptr)) return "";
+    return c.install_id;
+}
+
 // Detached Ed25519 signature over `message`, 128 lowercase hex (the wire
 // form the VIRULE API's signature grammar uses). "" on failure.
 inline std::string sign_hex(const std::string& message) {

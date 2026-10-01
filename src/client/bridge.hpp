@@ -51,6 +51,7 @@
 //                    {"type":"admin_install"}          (Admin Settings Update)
 //                    {"type":"admin_launch"}           (managed launch handoff)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
+//                    {"type":"update_health"}          (Admin notice query)
 //                    {"type":"setup_takeover",...}     (Setup envelope transfer)
 //                    {"type":"setup_wait"}             (Setup release poll)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
@@ -64,6 +65,7 @@
 //                    {"type":"accepted"}
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
 //                    {"type":"admin_update_status","installed",...,"update"}
+//                    {"type":"update_health","blocked":true|false}
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"admin_result","state":...,"version":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
@@ -150,6 +152,10 @@ struct Callbacks {
     // answer is stale. `launch_context` = the caller declared
     // {"context":"launch"} (the persisted launch-retry hold applies).
     std::function<std::string(bool launch_context)> admin_update_status_json;
+    // A local caller (the Admin host) asked whether the update service has
+    // been unreachable long enough to tell the user. Answers the FULL
+    // update_health JSON message from the persisted record; never fetches.
+    std::function<std::string()> update_health_json;
     // A verified uninstall authorization arrived from a page. The flag is
     // the page's explicit Delete local data choice; false (the default)
     // preserves every piece of user-owned VIRULE data.
@@ -665,6 +671,18 @@ inline void handle_client(SOCKET client) {
                                      context);
             const std::string answer = g_callbacks.admin_update_status_json
                 ? g_callbacks.admin_update_status_json(context == "launch")
+                : std::string();
+            if (answer.empty()) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            } else {
+                if (!reply(0x1, answer)) return;
+            }
+        } else if (type == "update_health" && !is_page) {
+            // The Admin's passive update-connectivity notice. Local-only
+            // and read-only: it reports the persisted record and makes no
+            // request (shared/update_health.hpp).
+            const std::string answer = g_callbacks.update_health_json
+                ? g_callbacks.update_health_json()
                 : std::string();
             if (answer.empty()) {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;

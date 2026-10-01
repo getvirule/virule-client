@@ -70,8 +70,13 @@
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
+#include "shared/machine_identity.hpp"
+#include "shared/manifest_request.hpp"
 #include "shared/paths.hpp"
+#include "shared/update_health.hpp"
+#include "shared/usage_checkin.hpp"
 #include "shared/verify_binary.hpp"
+#include "virule/core/time.hpp"
 #include "shared/version.h"
 
 #include "miniz/miniz.h"
@@ -1035,28 +1040,84 @@ inline bool version_is_upgrade(const std::string& approved,
     return compare_prerelease(prerelease_of(approved), prerelease_of(installed)) > 0;
 }
 
-inline bool fetch_manifest(Manifest& out, std::string& why) {
+// This installation's check-in for the manifest request
+// (shared/usage_checkin.hpp): its identity and minimal state always, plus
+// the Admin's sealed usage batches for THIS environment when there are any.
+// The machine identity is the existing shared credential; when none exists
+// yet (the Admin has never run here) the client creates it exactly as the
+// QA redemption does, recording the provenance a full uninstall relies on.
+// An empty body means the identity is unavailable: the check is a plain GET.
+//
+// A SANDBOXED CLIENT NEVER CHECKS IN TO THE REAL SERVICE. Test harnesses run
+// this exe with LOCALAPPDATA pointed at a throwaway tree (the same
+// condition the machine-registration guard uses, paths::environment_redirected).
+// Such a run must not mint an identity and put a throwaway installation on
+// record with VIRULE. It checks in only when the harness has also pointed
+// it at its own manifest server (--admin-manifest-url=).
+inline bool checkin_suppressed() {
+    return g_manifest_override.empty() && paths::environment_redirected();
+}
+
+inline usage_checkin::Pending pending_usage() {
+    if (checkin_suppressed()) return {};
+    bool created = false;
+    (void)machine_identity::ensure(created);
+    if (created) state::mark_created_dev_machine_cred();
+    usage_checkin::Identity id;
+    id.public_key_hex = machine_identity::public_key_hex();
+    if (id.public_key_hex.empty()) return {};
+    id.install_id = machine_identity::install_id();
+    id.sign_hex = [](const std::string& m) { return machine_identity::sign_hex(m); };
+    usage_checkin::Install install;
+    install.client_version = VIRULE_CLIENT_VERSION_STRING;
+    if (admin_installed()) install.admin_version = authoritative_admin_version();
+    install.previous_key = usage_checkin::load_checked_key(paths::checkin_state_file());
+    return usage_checkin::prepare(paths::usage_spool_dir(), env::kStaging, id,
+                                  virule::core::utc_timestamp_rfc3339(), install);
+}
+
+// Fetch and validate the approved manifest. The exchange itself, including
+// the pending usage batches that ride it, is shared/manifest_request.hpp.
+//
+// `scheduled` = this is the quiet startup/periodic check; it only decides
+// whether a connectivity failure counts toward the update-health record
+// (shared/update_health.hpp), which every call updates.
+inline bool fetch_manifest(Manifest& out, std::string& why, bool scheduled = false) {
     const bool dev = !g_manifest_override.empty();
-    unsigned long status = 0;
-    std::string body;
+    http::Url u;
     if (dev) {
-        http::Url u;
         if (!http::parse_url(g_manifest_override, u)) {
             why = "unparseable --admin-manifest-url";
             return false;
         }
-        if (!http::http_get(u.host.c_str(), u.port, u.secure, u.path.c_str(),
-                            kMaxManifestBytes, status, body) ||
-            status != 200) {
-            why = "manifest fetch failed, status=" + std::to_string(status);
-            return false;
-        }
-    } else if (!http::https_get(kManifestHost, kManifestPath, kMaxManifestBytes,
-                                status, body) ||
-               status != 200) {
-        why = "manifest fetch failed, status=" + std::to_string(status);
+    } else {
+        u.secure = true;
+        u.host = kManifestHost;
+        u.port = INTERNET_DEFAULT_HTTPS_PORT;
+        u.path = kManifestPath;
+    }
+    // The check-in must never cost the update check anything: a spool or
+    // identity problem means a plain GET.
+    usage_checkin::Pending pending;
+    try {
+        pending = pending_usage();
+    } catch (...) {
+        pending = {};
+    }
+    const manifest_request::Result r =
+        manifest_request::run(u, kMaxManifestBytes, pending);
+    if (r.delivered > 0) {
+        log::client("admin: update check delivered " +
+                    std::to_string(r.delivered) + " usage batch(es)");
+    }
+    if (r.seen) usage_checkin::note_seen(paths::checkin_state_file(), pending);
+    update_health::record(paths::update_health_file(), (long long)time(nullptr),
+                          r.reached, scheduled);
+    if (!r.answered) {
+        why = "manifest fetch failed, status=" + std::to_string(r.status);
         return false;
     }
+    const std::string& body = r.body;
     if (!json_scan::find_string_in(body, 0, body.size(), "version", out.version) ||
         !is_version_grammar(out.version)) {
         why = "manifest version missing or malformed";
@@ -1110,8 +1171,10 @@ inline bool fetch_manifest(Manifest& out, std::string& why) {
 // AUTOMATIC CHECKING, USER-INITIATED INSTALLING (owner spec 2026-09-03).
 // The client is the one component that reads the approved manifest, so it
 // caches the approved version here; the Admin's Settings page asks over a
-// local control connection and owns no manifest logic. No check ever runs
-// while no managed Admin install exists (nothing to update = no traffic).
+// local control connection and owns no manifest logic. The SCHEDULED check
+// runs whether or not a managed Admin exists, because it is also this
+// installation's check-in (see refresh_update_check); an unscheduled ask
+// never runs without one.
 
 // A fresh explicit ask (Settings opening) tolerates a cache this old;
 // beyond it the manifest is refetched.
@@ -1126,8 +1189,18 @@ inline unsigned long long g_update_check_tick = 0; // 0 = never attempted
 // Refresh the cached approved version when the cache is older than
 // `fresh_ms`. The attempt instant is stamped up front so a failing network
 // can never turn the quiet check into a hammer.
-inline void refresh_update_check(unsigned long long fresh_ms) {
-    if (!admin_installed()) return;
+// `scheduled` marks the quiet startup/periodic check (see fetch_manifest).
+//
+// THE SCHEDULED CHECK RUNS WITH OR WITHOUT A MANAGED ADMIN (owner spec
+// 2026-10-01): it is also this installation's check-in, and a running
+// client must be on record even if the Admin is never installed or opened.
+// Without an Admin the manifest answer is simply unused (every update
+// claim below still requires an installed Admin). Unscheduled callers (the
+// Admin's own asks) keep the old rule: no Admin, no request.
+// A sandboxed run (checkin_suppressed) has nothing to check in, so it keeps
+// the old rule too.
+inline void refresh_update_check(unsigned long long fresh_ms, bool scheduled = false) {
+    if (!admin_installed() && (!scheduled || checkin_suppressed())) return;
     {
         std::lock_guard<std::mutex> lock(g_update_mutex);
         const unsigned long long now = GetTickCount64();
@@ -1138,7 +1211,7 @@ inline void refresh_update_check(unsigned long long fresh_ms) {
     }
     Manifest manifest;
     std::string why;
-    if (!fetch_manifest(manifest, why)) {
+    if (!fetch_manifest(manifest, why, scheduled)) {
         log::client("admin: update check failed: " + why);
         return;
     }
@@ -1258,6 +1331,17 @@ inline void reconcile_launch_update_hold() {
     g_hold_failed_utc = s.admin_hold_failed_utc;
     g_hold_until_utc = s.admin_hold_until_utc;
     log::client("admin: launch-update hold active for " + g_hold_version);
+}
+
+// The update_health answer for the bridge's local update_health message:
+// whether the update service has been unreachable long enough for the Admin
+// to show its passive notice. A read of the persisted record only; it never
+// makes a request, so the Admin may ask freely.
+inline std::string update_health_json() {
+    const bool is_blocked = admin_installed() &&
+        update_health::is_blocked(paths::update_health_file(), (long long)time(nullptr));
+    return std::string("{\"type\":\"update_health\",\"blocked\":") +
+           (is_blocked ? "true" : "false") + "}";
 }
 
 // The admin_update_status answer for the bridge's local

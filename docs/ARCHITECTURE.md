@@ -3,7 +3,8 @@
 Current state only. When a change makes something here untrue, REPLACE it,
 and advance the last-verified stamp.
 
-Last verified 2026-09-10, against client v0.8.3. The compiled constant in
+Last verified 2026-09-10, against client v0.8.3; the usage check-in and
+update-health sections were written against v0.8.6 (2026-10-01). The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
 
@@ -116,6 +117,7 @@ in both components).
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
 | local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below |
+| local | `{"type":"update_health"}` | answers `{"type":"update_health","blocked":bool}` from the persisted update-connectivity record (see "Update connectivity health"); a read only, it never makes a request (v0.8.6) |
 | local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch |
 | local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
@@ -848,12 +850,88 @@ Admin skips the grace entirely and is not relaunched.
 
 THE SILENT UPDATE CHECK: the client caches the approved manifest's
 version (client startup, a quiet 6-hour recheck while serving, and a
-15-minute-fresh refetch on the local `admin_update_check` ask), only ever
-while a managed install exists. Checking is automatic; INSTALLING is
+15-minute-fresh refetch on the local `admin_update_check` ask). The two
+SCHEDULED checks run whether or not a managed Admin exists, because they are
+also this installation's check-in (below, v0.8.6); without an Admin the
+manifest answer is simply unused. An ask from the Admin never runs without a
+managed install. Checking is automatic; INSTALLING is
 always user-initiated (Admin Settings > GENERAL > Update, or virule.app's
 Update VIRULE). The Admin host owns no manifest logic: it asks over a
 local control connection, starting the (resident) client if it is not
 serving, which is the in-session recovery for a client ended by hand.
+
+THE CHECK-IN RIDES THE UPDATE CHECK (owner spec 2026-10-01, v0.8.6;
+product law `VIRULE/docs/specs/usage-tracking.md`). Every manifest check is
+sent as a `POST` to the same path (`src/shared/manifest_request.hpp`,
+`src/shared/usage_checkin.hpp`) and does two things in the one request:
+
+1. IDENTIFIES THIS INSTALLATION, always: the machine's VIRULE identity, its
+   install id, the client version and the installed Admin version (empty
+   when none). A client whose Admin was never opened, or never installed, is
+   therefore still on record with the service.
+2. CARRIES THE ADMIN'S PENDING USAGE BATCHES, when there are any. The VIRULE
+   Admin records its usage events to an on-disk spool and sends nothing
+   itself; the answer is the same manifest plus `ack`, the batch ids the
+   service stored.
+
+The identity is the existing shared `dev_machine.cred`. When none exists yet
+the client creates it exactly as QA redemption does (same provenance record
+in `state.json`). THE PREVIOUS-KEY LINK: the Admin issues its own machine
+key on its first run when the credential it finds was created by this
+client, so the client remembers the key its last accepted check-in used
+(`client\checkin.json`) and, while the current key differs, names the old
+one as `pk` until the service answers `seen`. That is what keeps "client
+only" and "Admin user" one installation.
+
+A SANDBOXED CLIENT NEVER CHECKS IN TO THE REAL SERVICE: while
+`paths::environment_redirected()` answers true (a harness run with
+`LOCALAPPDATA` redirected) and no `--admin-manifest-url=` is given, the
+client creates no identity, sends no check-in, and without a managed Admin
+makes no manifest request at all (`admin_install::checkin_suppressed`).
+
+- ONE request per check. A second (the plain `GET`) is made only when the
+  `POST` was answered with something other than 200, which is how a service
+  that predates the check-in is handled. A `POST` that got no answer at all
+  is not retried as a `GET`.
+- Only acknowledged batches are deleted. Everything else stays for the next
+  check; the service de-duplicates by event id, so a batch delivered twice
+  is stored once.
+- At most 8 batches and 40 KiB of spool per check, so an offline backlog
+  drains over several checks rather than one large request.
+- The request is signed with the machine's VIRULE identity
+  (`virule-checkin.v1|<install id>|<batch ids>|<timestamp>`, the id list
+  empty when there is no batch). Only when the identity can be neither read
+  nor created is the check the plain `GET`, and any batches wait.
+- The update check never depends on the batches: any spool, identity or
+  service problem on that side leaves the manifest answer exactly as before.
+- THE SPOOL IS THE ONE HAND-OFF across the ownership boundary:
+  `%LOCALAPPDATA%\VIRULE\usage\` is Admin-owned and Admin-written
+  (`virule/core/usage_spool.hpp`, vendored byte-identical from v2_mvp); the
+  client reads sealed batches and deletes acknowledged ones, nothing else.
+  A staging build reads `s-*.jsonl`, production `b-*.jsonl`, so neither
+  environment can deliver the other's records.
+
+UPDATE CONNECTIVITY HEALTH (owner spec 2026-10-01, v0.8.6;
+`src/shared/update_health.hpp`). Every manifest request records whether the
+update service was REACHED, in `client\update_health.json`
+(`{last_contact_utc, failed_attempts}`):
+
+- Reached = any HTTP response arrived, whatever its status. A 500, a 404 or
+  a manifest this client refuses is contact, never evidence that the user's
+  network blocks VIRULE. Only no response at all (DNS failure, timeout,
+  refused connection, TLS failure) is a failed attempt.
+- Every request updates the last-contact instant when it reaches the
+  service; only SCHEDULED checks (startup and the 6-hour recheck) add to the
+  failure count, so a Settings ask or a retried install cannot fast-forward
+  the notice.
+- `blocked` = more than 48 hours since the last contact AND at least 3 failed
+  scheduled attempts since then. On a machine that has never reached the
+  service the 48 hours run from its first attempt. One contact clears it.
+- The Admin asks with the local `update_health` message and shows its
+  passive notice only on `blocked:true` (`v2_mvp/docs/STYLE_GUIDE.md` 14.1).
+- The record is its own file, not `state.json`, so no other writer's
+  load-modify-save can drop it. A default uninstall removes it with
+  `client\`.
 
 ONE UPDATE ACTION CONVERGES BOTH (owner spec 2026-09-16, v0.8.5): every
 user-initiated Admin install, update or launch handoff also forces the

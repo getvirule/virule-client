@@ -19,6 +19,12 @@
 //       qa_tester_test.cred
 //   %LOCALAPPDATA%\VIRULE\qa_test_mode        the Super Admin QA TEST MODE
 //                                             flag file (Admin-owned)
+//   %LOCALAPPDATA%\VIRULE\usage\              the Admin's usage spool
+//       b-<id>.jsonl       (Admin-owned and Admin-written. The ONE hand-off:
+//                           the client READS sealed batches to attach them
+//                           to its update check and DELETES a batch the
+//                           service acknowledged, nothing else. See
+//                           virule/core/usage_spool.hpp.)
 //
 // Everything else under %LOCALAPPDATA%\VIRULE (virule.db, workspace\,
 // logs\, backup.json, .resources anywhere) belongs to the VIRULE Admin and
@@ -106,6 +112,15 @@ inline std::filesystem::path security_dir()      { const auto r = virule_data_ro
 inline std::filesystem::path client_state_dir()  { const auto r = virule_data_root(); return r.empty() ? r : r / L"client"; }
 inline std::filesystem::path client_logs_dir()   { const auto r = client_state_dir(); return r.empty() ? r : r / L"logs"; }
 inline std::filesystem::path client_state_file() { const auto r = client_state_dir(); return r.empty() ? r : r / L"state.json"; }
+
+// The persisted update-connectivity record (shared/update_health.hpp).
+inline std::filesystem::path update_health_file() { const auto r = client_state_dir(); return r.empty() ? r : r / L"update_health.json"; }
+
+// The machine key the last accepted check-in used (shared/usage_checkin.hpp).
+inline std::filesystem::path checkin_state_file() { const auto r = client_state_dir(); return r.empty() ? r : r / L"checkin.json"; }
+
+// The Admin's usage spool (see the ownership map above).
+inline std::filesystem::path usage_spool_dir()   { const auto r = virule_data_root(); return r.empty() ? r : r / L"usage"; }
 
 // The QA TEST MODE flag file (Admin-owned, machine-local; presence = on).
 inline std::filesystem::path qa_test_mode_flag() { const auto r = virule_data_root(); return r.empty() ? r : r / L"qa_test_mode"; }

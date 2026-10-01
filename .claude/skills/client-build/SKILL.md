@@ -30,6 +30,9 @@ transient is not a failure.
 node tools\protocol_routing_test.mjs      # virule:// grammar of BOTH components; fails on divergence
 build\Release\x64\virule-client.exe --no-register   # dev run without touching the machine's virule://
 node tools\bridge_test.mjs                # bridge protocol/security matrix
+tests\usage\run_tests.bat                 # usage spool, check-in and update-health units, then the
+                                          # check-in end to end against the real service code
+                                          # (needs ..\..\VIRULE_BACKEND); starts NO client
 ```
 
 Never run the harnesses against the owner's installed client unless the
