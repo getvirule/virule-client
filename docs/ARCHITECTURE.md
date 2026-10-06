@@ -4,7 +4,9 @@ Current state only. When a change makes something here untrue, REPLACE it,
 and advance the last-verified stamp.
 
 Last verified 2026-09-10, against client v0.8.3; the usage check-in and
-update-health sections were written against v0.8.6 (2026-10-01). The compiled constant in
+update-health sections were written against v0.8.6 (2026-10-01); residency
+(VIRULE Service), the manifest's service fields and Setup's service
+placement against v0.9.0 (2026-10-06). The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
 
@@ -242,8 +244,9 @@ always available to the browser and an installed VIRULE is discoverable
 from a cold boot with no click. Idle costs nothing: every background
 thread sleeps, no connected page means no status pushes, and the update
 checks are one manifest fetch per 6 hours (client self-update and the
-managed-Admin check ride the same cadence). Two small PER-USER mechanisms
-give the residency, no service and no scheduled task:
+managed-Admin check ride the same cadence). Three small PER-USER mechanisms
+give the residency (no Windows SCM service, no scheduled task, no
+elevation): the two below, and VIRULE Service (next section).
 
 - the login start, `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
   value `VIRULE` = the managed `virule-client.exe`
@@ -262,12 +265,108 @@ give the residency, no service and no scheduled task:
   `wWinMain` still wins over a restart that races a removal.
 
 The client leaves only on request: Setup's `shutdown`, the self-update
-swap, an uninstall, or a port it can never own. `virule://open` remains the
-FALLBACK wake for whatever is left (a client ended by hand before the next
-login), never the normal path to discovery; while the Admin runs, its
-`client_health` monitor is the in-session watchdog for that case. The
-single-instance mutex makes a login start racing a `virule://` launch
-harmless (the second forwards and exits).
+swap, an uninstall, or a port it can never own. Anything else (End task, a
+kill) is restored by VIRULE Service. `virule://open` remains a FALLBACK
+wake, never the normal path to discovery, and the Admin's `client_health`
+monitor remains an in-session watchdog. The single-instance mutex makes a
+login start racing a `virule://` launch harmless (the second forwards and
+exits).
+
+## Core Services residency: VIRULE Service (v0.9.0, 2026-10-06)
+
+Windows names (the process identity table and the PascalCase naming law
+live in `v2_mvp/docs/ADMIN_ARCHITECTURE.md`): `virule-client.exe` presents
+as **VIRULE Core Services** (the file keeps its grandfathered name),
+`ViruleService.exe` as **VIRULE Service**, `Virule-Setup.exe` as **VIRULE
+Setup**.
+
+THE HOLE IT CLOSES: before v0.9.0 a client ended deliberately or cleanly
+while the Admin was closed stayed gone until the next login (WER restarts
+only crashes after 60 s; `client_health` exists only while the Admin runs).
+`ViruleService.exe` closes it. It is a normal per-user background process
+(`src/service/main.cpp`): NOT a Windows SCM service, no elevation, no window,
+no tray, no network, no telemetry, no CEF; about 400 KB, static CRT. Its one
+job is to wait on the Core Services process handle and restore it.
+
+ONE CONTRACT, `src/shared/residency.hpp`, shared by the client, the service
+and Setup. A healthy installed machine runs exactly one of each, and they
+protect one another:
+
+- the service blocks in `WaitForMultipleObjects` on {stop event, wake event,
+  every `virule-client.exe` process in the session}; the client runs one
+  watch thread (`src/client/service_watch.hpp`) that blocks the same way on
+  {its wake event, every `ViruleService.exe`}. Idle is a blocked wait: a
+  timed wait exists only while a backoff, hold-off or grace window runs.
+  Discovery (a toolhelp snapshot) happens only at a re-evaluation.
+- Each restores ONLY the exact managed executable under
+  `%LOCALAPPDATA%\Programs\VIRULE\` (`launch_managed` refuses any other
+  path), with the client's own fixed development seams and nothing else
+  (`--no-register`, `--dev-unsigned`, and manifest overrides only when they
+  point at the loopback interface). No path, executable or command line is
+  accepted from anywhere; there is no new IPC surface.
+- Both run only AS the managed install (a copy elsewhere exits at once) and
+  never under the uninstall latch.
+
+SINGLE INSTANCE, never two survivors: `Local\ViruleClient.Singleton` (the
+existing name, unchanged; a second client forwards its work and exits) and
+`Local\VIRULE.Service.Singleton` (a second service leaves quietly). A race
+(login, `virule://`, Setup, the Admin, both peers at once) may START a
+process; the singletons guarantee one of each SURVIVES. A start that loses
+the race is not counted as a failure.
+
+INTENTIONAL EXITS WIN. On every wake a watcher decides, in order:
+
+1. the uninstall latch (`HKCU\Software\VIRULE\Lifecycle`) is set: stand
+   down for good (the service exits; the client's watch thread ends). Every
+   uninstall entry point also sets `Local\VIRULE.Service.Stop` right after
+   writing the latch, so the helper finds the install directory free;
+2. the peer is running: wait on it;
+3. `Local\VIRULE.Residency.Maintenance` is HELD: wait for it, then give the
+   maintainer's own restart a 10 s grace (`kPostMaintenanceGraceMs`; the
+   replacement wakes the watcher the moment it serves). Holders: Setup
+   (from stopping the old client until the new one is started), the client
+   self-update helper (`--finish-self-update`, for the whole swap or
+   rollback), and the client's own service replacement. A mutex follows its
+   holder's lifetime: a crashed holder abandons it and residency resumes, so
+   nothing durable can be stranded;
+4. Core Services announced its exit (`Local\VIRULE.CoreServices.ExitIntent`,
+   set right before Setup's `shutdown` or the self-update swap exit): the
+   service holds off up to 60 s for the replacement (`kIntentHoldoffMs`).
+   This is what keeps an OLDER Setup, which knows nothing of maintenance,
+   from being fought;
+5. otherwise the exit was unexpected: restore.
+
+The service never announces an intentional exit of its own: it leaves on
+purpose only on the stop event, which is set only under maintenance or with
+the latch already written, and both are seen first.
+
+CRASH-LOOP PROTECTION (`kSustainMs`, `kBackoffLadderMs`): an exit after a
+run of at least 60 s (the same bar WER uses) is restored after 1 s;
+consecutive short runs climb 5 s, 30 s, 2 min, 10 min, then stay at 30 min
+for good: at most two launches an hour, no process storm, one log line per
+attempt. One sustained run resets the ladder. A session that is ending
+(`SM_SHUTTINGDOWN`) restores nothing.
+
+LOGIN START IS THE CLIENT'S ALONE: the existing Run value `VIRULE` (unchanged)
+starts Core Services, which starts the service when it begins serving.
+Deliberately not a second Run entry: one Startup item in Task Manager, and a
+user who disables it disables both, instead of the service resurrecting a
+client the user turned off. WER application restart stays armed for the
+client.
+
+DISTRIBUTION (see "Distribution" and "VIRULE Service distribution" below):
+the service ships in every client release; Setup places it, the client
+installs it when missing and replaces it when it is not the one its own
+release ships. Old installations converge on their own: an older client
+self-updates to 0.9.0 (reading only the four fields it knows), and the new
+client finds no service and installs it from the same manifest.
+
+Logs: `client\logs\virule-service.log` (the service) and
+`virule-client.log` (`service watch:` and `service:` lines). Proof:
+`tools/residency_test.mjs` (17 sandboxed scenarios: mutual restore,
+duplicates, start races, the latch, a real self-update swap and rollback, a
+real service update, real Setup over a running pair, fresh install and
+repair, both crash-loop ladders, full uninstall).
 
 ## Environments (production and staging)
 
@@ -350,7 +449,7 @@ cut last:
 
 | Tag | Assets |
 |---|---|
-| `client-staging` | `Virule-Setup.exe`, `virule-client.exe`, `manifest.json` |
+| `client-staging` | `Virule-Setup.exe`, `virule-client.exe`, `ViruleService.exe`, `manifest.json` |
 | `admin-staging` | `Virule-v<version>-staging.zip` |
 
 `helpers/publish_staging_client.ps1` is the only writer of the first, and
@@ -375,7 +474,8 @@ assets are only publicly downloadable from public repositories):
 |---|---|
 | `Virule-Setup.exe` | replaced when Setup changes |
 | `virule-client.exe` | IMMUTABLE; a published version is never rewritten |
-| `manifest.json` | describes THAT release's client |
+| `ViruleService.exe` | IMMUTABLE (since 0.9.0); same rule as the client |
+| `manifest.json` | describes THAT release's client and service |
 
 The LATEST release is the approved release. Setup follows
 `releases/latest/download/manifest.json`; the site links
@@ -385,10 +485,51 @@ https to https onto GitHub's CDN; WinHTTP follows that by default), never
 the human release page.
 
 The manifest is minimal and secret-free:
-`{"version","url","sha256","size"}` in COMPACT JSON (the marker scanner
-takes no whitespace). `helpers/publish.ps1` is the only writer: it refuses
-unsigned artifacts, refuses to overwrite a published version with
-different bytes, and verifies every public asset URL by re-downloading it.
+`{"version","url","sha256","size","service_url","service_sha256","service_size"}`
+in COMPACT JSON (the marker scanner takes no whitespace). The first four are
+the client's and keep their names and their place; the three `service_*`
+fields (0.9.0) are ADDITIVE: every scanner matches a field name with its
+leading quote, so `"url"` never matches `"service_url"`, and every Setup and
+client ever shipped (and v2_mvp's `client_health` repair) reads exactly what
+it always read. `helpers/publish.ps1` is the only writer: it refuses
+unsigned artifacts, refuses to overwrite a published client or service with
+different bytes, uploads the service BEFORE the manifest that names it, and
+verifies every public asset URL by re-downloading it.
+
+### VIRULE Service distribution (0.9.0)
+
+`src/client/service_install.hpp` is the whole implementation, and it is the
+client's own trust model applied to a second file: url pinned to this
+environment's client release repository, exact size, exact SHA-256 (never
+waived), Authenticode + `CN=Heath Michaels` (staging skips only the two
+signature gates; `--dev-unsigned` likewise). No second update system: the
+client's ordinary update check (startup, the 6-hour recheck, the forced
+check a user Admin operation triggers) parses the service fields and calls
+`reconcile`:
+
+- the installed service is MISSING: install the manifest's (the migration
+  path for every machine whose client arrived through an older Setup or the
+  self-update, and the repair path; the watch also forces one check the
+  moment it finds the executable gone, then at most one per 30 min);
+- it is present and the manifest is THIS client's release but the bytes
+  differ: replace it (the service update rides the client release);
+- a newer manifest leaves it alone (the client that self-updates to that
+  release brings its own service); an older one never downgrades it;
+- a malformed set of service fields refuses only the service, never the
+  client's own update; a release without them (older releases) is not an
+  error.
+
+Replacement is a maintenance transaction: download to
+`ViruleService.exe.update`, full gate, take the maintenance lock, stop the
+running service (`Local\VIRULE.Service.Stop`), live -> `.old`, staged ->
+live, start it and require residency within 10 s; any failure restores the
+known-good binary, starts it, and holds that exact artifact against retry
+for 6 hours. Startup restores a stranded `.old` and discards stale staging.
+A sandboxed client never downloads without a manifest seam.
+
+Setup (0.9.0) acquires the service through the same gates and places it
+beside the client while it holds the maintenance lock; a service that
+cannot be acquired never fails the install (the client repairs it).
 Since 2026-09-11 it is driven by the product-wide promotion
 (`v2_mvp\helpers\release-production.bat`, `release_promote.ps1`): the
 client ships only when `src\shared\version.h` is above the live manifest
@@ -438,7 +579,9 @@ answering with the NEW version. Success removes every trace; any failure
 puts the known-good binary straight back, restarts it, and records the
 failure. A fresh `swapping` record belongs to the helper (a starting
 client leaves it alone for 10 minutes) so a rollback can never race a
-re-staged copy of itself into a loop.
+re-staged copy of itself into a loop. The exiting client announces its exit
+and the helper holds the residency maintenance lock for the whole swap or
+rollback (0.9.0), so VIRULE Service never restores the binary mid-rename.
 
 QUIET BY DESIGN: no card, no toast, no Admin modal - the restart fits
 inside the browser's 5-second disconnect hysteresis and open virule.app
@@ -469,8 +612,12 @@ with one short human line; the technical reason goes to the log.
 It then installs to `%LOCALAPPDATA%\Programs\VIRULE\virule-client.exe`,
 registers `virule://` + the `ViruleClient` HKCU uninstall entry
 (DisplayName "VIRULE", `--uninstall`), records the INSTALLED CLIENT's
-version (the manifest's) in state.json, starts the client, transfers the
-takeover, and waits for the client's release (see "The Setup takeover").
+version (the manifest's) in state.json, places the release's verified
+`ViruleService.exe` beside it (0.9.0; never fatal), starts the client,
+transfers the takeover, and waits for the client's release (see "The Setup
+takeover"). From stopping the running client until the new one has been
+started it holds the residency maintenance lock, so VIRULE Service never
+restores the binary being replaced.
 Development seams: `--dev-unsigned` waives only the signature gates;
 `--manifest-url=` fetches the manifest elsewhere and relaxes only the
 repository pin.
@@ -703,7 +850,8 @@ closed); the intent is cleared and the page settles.
 VIRULE uninstall has TWO EXPLICIT MODES (owner spec 2026-09-03; see
 `src/shared/uninstall.hpp`), both driven by an explicit ownership
 inventory. The DEFAULT preserves user data: it removes the install dir
-(the managed `Admin\` installation included), the client state dir,
+(`ViruleService.exe` and the managed `Admin\` installation included; the
+service is told to stop the moment the latch is written), the client state dir,
 `virule://` ONLY while it points at this client, the uninstall entry, and
 the desktop `VIRULE.lnk` ONLY when the client created it (state.json
 provenance); `virule.db`, `workspace\`, `logs\`, `backup.json` and the
@@ -800,7 +948,9 @@ hashed on the way through -> exact size -> exact SHA-256 (never waived) ->
 zip-slip-guarded extraction into `Admin.staging\` -> Authenticode + the
 VIRULE signer identity (`CN=Heath Michaels`) on every VIRULE-owned binary
 (virule.exe, ViruleAdminHost.exe, SidecarK32/64.dll, both
-SidecarKHost.exe) -> atomic placement. A fresh install is ONE directory
+SidecarKHost.exe, and ViruleUIHelper.exe WHEN PRESENT: newer packages carry
+it, older approved packages do not, and both stay installable) -> atomic
+placement. A fresh install is ONE directory
 rename; an update renames live -> `Admin.previous`, staging -> `Admin`,
 and a failed swap renames the previous install straight back, so a
 known-good install always survives.

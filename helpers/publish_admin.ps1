@@ -187,6 +187,7 @@ if (-not (Test-Path (Join-Path $publishDir 'virule.exe'))) {
 $requiredSigned = @(
     'virule.exe',
     '.resources\admin\ViruleAdminHost.exe',
+    '.resources\admin\ViruleUIHelper.exe',
     '.resources\bin\Win32\SidecarK32.dll',
     '.resources\bin\Win32\SidecarKHost.exe',
     '.resources\bin\x64\SidecarK64.dll',

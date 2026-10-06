@@ -1,7 +1,7 @@
 # VIRULE STAGING client publisher: pushes the UNSIGNED staging
-# Virule-Setup.exe, the UNSIGNED staging virule-client.exe and their
-# manifest.json to the FIXED `client-staging` tag on the staging release
-# repository.
+# Virule-Setup.exe, the UNSIGNED staging virule-client.exe and
+# ViruleService.exe and their manifest.json to the FIXED `client-staging` tag
+# on the staging release repository.
 #
 # WHY THIS IS A SEPARATE SCRIPT FROM publish.ps1. Not because the logic
 # differs, but because the two REFUSALS differ and both must stay absolute:
@@ -45,8 +45,9 @@ $publicBase = "https://github.com/$ghRepo/releases/download"
 $stagingHost = 'virule-api-staging.heath-michaels9441.workers.dev'
 $prodHost    = 'api.virule.app'
 
-$clientExe = Join-Path $repo 'build\Release\x64\staging\virule-client.exe'
-$setupExe  = Join-Path $repo 'build\Release\x64\staging\Virule-Setup.exe'
+$clientExe  = Join-Path $repo 'build\Release\x64\staging\virule-client.exe'
+$serviceExe = Join-Path $repo 'build\Release\x64\staging\ViruleService.exe'
+$setupExe   = Join-Path $repo 'build\Release\x64\staging\Virule-Setup.exe'
 $versionH  = Join-Path $repo 'src\shared\version.h'
 $stageDir  = Join-Path $repo 'build\publish-staging'
 
@@ -140,23 +141,31 @@ $version = $Matches[1]
 Write-Host "OK:   client version $version (staging tag $tag)"
 
 # ---- the gate: only STAGING builds are ever published here ----
-Require-StagingBuild $clientExe 'virule-client.exe'
-Require-StagingBuild $setupExe  'Virule-Setup.exe'
+Require-StagingBuild $clientExe  'virule-client.exe'
+Require-StagingBuild $serviceExe 'ViruleService.exe'
+Require-StagingBuild $setupExe   'Virule-Setup.exe'
 
-$clientSha  = Sha256 $clientExe
-$clientSize = (Get-Item $clientExe).Length
-$setupSha   = Sha256 $setupExe
-$clientUrl  = "$publicBase/$tag/virule-client.exe"
-Write-Host "OK:   client sha256=$clientSha size=$clientSize"
-Write-Host "OK:   setup  sha256=$setupSha"
+$clientSha   = Sha256 $clientExe
+$clientSize  = (Get-Item $clientExe).Length
+$serviceSha  = Sha256 $serviceExe
+$serviceSize = (Get-Item $serviceExe).Length
+$setupSha    = Sha256 $setupExe
+$clientUrl   = "$publicBase/$tag/virule-client.exe"
+$serviceUrl  = "$publicBase/$tag/ViruleService.exe"
+Write-Host "OK:   client  sha256=$clientSha size=$clientSize"
+Write-Host "OK:   service sha256=$serviceSha size=$serviceSize"
+Write-Host "OK:   setup   sha256=$setupSha"
 
 New-Item -ItemType Directory -Force $stageDir | Out-Null
 
 # COMPACT JSON on purpose: Setup's parser is the product's exact marker
 # scanner ("name":"value" with no whitespace); keep the wire form it reads.
+# The client's four fields first; the service fields are additive (the same
+# wire form publish.ps1 writes for production).
 $manifestPath = Join-Path $stageDir 'manifest.json'
-$manifestJson = '{{"version":"{0}","url":"{1}","sha256":"{2}","size":{3}}}' -f `
-    $version, $clientUrl, $clientSha, $clientSize
+$manifestJson = ('{{"version":"{0}","url":"{1}","sha256":"{2}","size":{3},' +
+                 '"service_url":"{4}","service_sha256":"{5}","service_size":{6}}}') -f `
+    $version, $clientUrl, $clientSha, $clientSize, $serviceUrl, $serviceSha, $serviceSize
 $manifestJson | Out-File -Encoding ascii -NoNewline $manifestPath
 $manifestSha = Sha256 $manifestPath
 Write-Host "OK:   manifest staged: $manifestJson"
@@ -184,12 +193,15 @@ if ($view.Code -ne 0) {
 # Staging assets are always replaced: nothing in the world pins them.
 $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $clientExe, '--clobber')
 Write-Host 'OK:   uploaded virule-client.exe'
+$null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $serviceExe, '--clobber')
+Write-Host 'OK:   uploaded ViruleService.exe'
 $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $manifestPath, '--clobber')
 Write-Host 'OK:   uploaded manifest.json'
 $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $setupExe, '--clobber')
 Write-Host 'OK:   uploaded Virule-Setup.exe'
 
 Test-PublicAsset "$publicBase/$tag/virule-client.exe" $clientSha 'virule-client.exe'
+Test-PublicAsset "$publicBase/$tag/ViruleService.exe" $serviceSha 'ViruleService.exe'
 Test-PublicAsset "$publicBase/$tag/manifest.json" $manifestSha 'manifest.json'
 Test-PublicAsset "$publicBase/$tag/Virule-Setup.exe" $setupSha 'Virule-Setup.exe'
 
@@ -197,4 +209,5 @@ Write-Host ''
 Write-Host 'SUCCESS: staging client published and verified.' -ForegroundColor Green
 Write-Host "  setup    $publicBase/$tag/Virule-Setup.exe"
 Write-Host "  client   $clientUrl"
+Write-Host "  service  $serviceUrl"
 Write-Host "  manifest $publicBase/$tag/manifest.json"

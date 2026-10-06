@@ -1,17 +1,20 @@
 # VIRULE Client build stages. THIS SCRIPT NEVER SIGNS - signing is
 # centralized in D:\Dropbox\Dropbox\development\VIRULE_SECURITY\artifact-signing
-# (sign_client.bat / sign_client_setup.bat).
+# (sign_client.bat / sign_client_service.bat / sign_client_setup.bat).
 #
-# virule-client.exe and Virule-Setup.exe are INDEPENDENT signed artifacts.
-# Setup embeds nothing: it downloads the approved client release from the
-# getvirule/virule-client GitHub Release at install time and verifies it
-# (manifest SHA-256 + Authenticode + the VIRULE signing identity). There is
-# no build coupling and no required order between the two; sign whichever
-# artifact was rebuilt.
+# virule-client.exe, ViruleService.exe and Virule-Setup.exe are INDEPENDENT
+# signed artifacts. Setup embeds nothing: it downloads the approved client
+# release (client + service) from the getvirule/virule-client GitHub Release
+# at install time and verifies them (manifest SHA-256 + Authenticode + the
+# VIRULE signing identity). There is no build coupling and no required order
+# between them; sign whichever artifact was rebuilt. The client and the
+# service ship in the SAME release (one manifest), so a client release builds
+# and signs both.
 #
 # Release flow per artifact:
-#   client: helpers\build.ps1 -Stage client  ->  sign_client.bat
-#   setup : helpers\build.ps1 -Stage setup   ->  sign_client_setup.bat
+#   client : helpers\build.ps1 -Stage client   ->  sign_client.bat
+#   service: helpers\build.ps1 -Stage service  ->  sign_client_service.bat
+#   setup  : helpers\build.ps1 -Stage setup    ->  sign_client_setup.bat
 # Publishing to the GitHub Release is helpers\publish.ps1.
 #
 # -Environment Staging builds the SAME sources with VIRULE_ENV_STAGING
@@ -22,10 +25,10 @@
 # are published by helpers\publish_staging_client.ps1 to the staging
 # release repository. Production output is unchanged by its presence.
 #
-# Usage:  powershell -ExecutionPolicy Bypass -File helpers\build.ps1 [-Stage all|client|setup] [-Environment Production|Staging]
+# Usage:  powershell -ExecutionPolicy Bypass -File helpers\build.ps1 [-Stage all|client|service|setup] [-Environment Production|Staging]
 
 param(
-    [ValidateSet('all', 'client', 'setup')]
+    [ValidateSet('all', 'client', 'service', 'setup')]
     [string]$Stage = 'all',
     [ValidateSet('Production', 'Staging')]
     [string]$Environment = 'Production'
@@ -53,8 +56,9 @@ function Find-MSBuild {
 }
 
 $msbuild = Find-MSBuild
-$clientExe = Join-Path $repo ('build\Release\x64\' + $outLeaf + 'virule-client.exe')
-$setupExe  = Join-Path $repo ('build\Release\x64\' + $outLeaf + 'Virule-Setup.exe')
+$clientExe  = Join-Path $repo ('build\Release\x64\' + $outLeaf + 'virule-client.exe')
+$serviceExe = Join-Path $repo ('build\Release\x64\' + $outLeaf + 'ViruleService.exe')
+$setupExe   = Join-Path $repo ('build\Release\x64\' + $outLeaf + 'Virule-Setup.exe')
 
 # This repository lives under Dropbox, whose sync client briefly memory-maps
 # and holds freshly written files. MSBuild then dies writing a .tlog or a .pdb
@@ -84,6 +88,14 @@ function Build-Client {
     if (-not (Test-Path $clientExe)) { throw "client build produced no exe: $clientExe" }
 }
 
+function Build-Service {
+    Write-Host "=== build ViruleService.exe ($Environment) ==="
+    Invoke-MsBuildWithRetry (@((Join-Path $repo 'service\virule_service.vcxproj'),
+        '/p:Configuration=Release', '/p:Platform=x64', "/p:SolutionDir=$repo\") +
+        $envArgs + @('/nologo', '/v:minimal')) 'service build'
+    if (-not (Test-Path $serviceExe)) { throw "service build produced no exe: $serviceExe" }
+}
+
 function Build-Setup {
     Write-Host "=== build Virule-Setup.exe ($Environment) ==="
     Invoke-MsBuildWithRetry (@((Join-Path $repo 'setup\virule_setup.vcxproj'),
@@ -105,6 +117,18 @@ switch ($Stage) {
             Write-Host 'Staging builds are not signed. Publish via helpers\publish_staging_client.ps1.'
         }
     }
+    'service' {
+        Build-Service
+        Write-Host ''
+        Write-Host "DONE (stage: service, environment: $Environment)"
+        Write-Host "  service: $serviceExe"
+        if (-not $staging) {
+            Write-Host 'Next: sign it via VIRULE_SECURITY\artifact-signing\sign_client_service.bat,'
+            Write-Host 'then publish via helpers\publish.ps1.'
+        } else {
+            Write-Host 'Staging builds are not signed. Publish via helpers\publish_staging_client.ps1.'
+        }
+    }
     'setup' {
         Build-Setup
         Write-Host ''
@@ -119,10 +143,12 @@ switch ($Stage) {
     }
     'all' {
         Build-Client
+        Build-Service
         Build-Setup
         Write-Host ''
         Write-Host "DONE (unsigned build, environment: $Environment)"
-        Write-Host "  client: $clientExe"
-        Write-Host "  setup : $setupExe"
+        Write-Host "  client : $clientExe"
+        Write-Host "  service: $serviceExe"
+        Write-Host "  setup  : $setupExe"
     }
 }

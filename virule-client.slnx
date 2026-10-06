@@ -4,4 +4,5 @@
   </Configurations>
   <Project Path="client/virule_client.vcxproj" Id="4d2c1a70-5b7e-4b1a-9a6c-101010101001" />
   <Project Path="setup/virule_setup.vcxproj" Id="4d2c1a70-5b7e-4b1a-9a6c-101010101002" />
+  <Project Path="service/virule_service.vcxproj" Id="4d2c1a70-5b7e-4b1a-9a6c-101010101003" />
 </Solution>

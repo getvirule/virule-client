@@ -28,7 +28,11 @@
 // DEFAULT UNINSTALL (delete_data = false) removes the SOFTWARE and its
 // integration and PRESERVES every piece of user-owned VIRULE data:
 //   - %LOCALAPPDATA%\VIRULE\client\           (client software state)
-//   - %LOCALAPPDATA%\Programs\VIRULE\         (client + managed Admin\)
+//   - %LOCALAPPDATA%\Programs\VIRULE\         (client, ViruleService.exe and
+//                                              the managed Admin\; the service
+//                                              is told to stop the moment the
+//                                              latch is written, so the helper
+//                                              finds the directory free)
 //   - the desktop / Start Menu VIRULE.lnk when VIRULE-owned: recorded
 //     provenance OR a stored target inside the managed install tree
 //     (never a VIRULE-named shortcut pointing elsewhere)
@@ -166,9 +170,9 @@ inline void remove_uninstall_entry() {
 // ---- process accounting ----
 
 // Any process (other than this one) whose image path sits under the
-// installed program directory: the serving client, the managed Admin's
-// virule.exe, ViruleAdminHost.exe and its CEF children. These must all be
-// gone before file removal can succeed.
+// installed program directory: the serving client, VIRULE Service, the
+// managed Admin's virule.exe, ViruleAdminHost.exe and its ViruleUIHelper.exe
+// CEF children. These must all be gone before file removal can succeed.
 inline bool any_install_dir_process_running() {
     const auto dir = paths::install_dir();
     if (dir.empty()) return false;

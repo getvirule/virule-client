@@ -46,5 +46,6 @@ inline void write(const char* file_name, const std::string& text) {
 
 inline void client(const std::string& text) { write("virule-client.log", text); }
 inline void setup(const std::string& text)  { write("virule-setup.log", text); }
+inline void service(const std::string& text) { write("virule-service.log", text); }
 
 } // namespace vclient::log

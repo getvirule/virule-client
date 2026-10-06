@@ -36,11 +36,17 @@
 // through a per-user Run value (shared/login_start.hpp) and after a
 // crash through Windows Error Reporting's application restart
 // (RegisterApplicationRestart in serve()); both are managed-install only,
-// no service and no scheduled task. It leaves only on request: Setup's
-// shutdown, the self-update swap, an uninstall, or a port it can never
-// own. virule:// remains the fallback wake for whatever is left (a client
-// ended by hand), never the normal path to discovery; the Admin's
-// client_health monitor is the in-session watchdog for that case.
+// no Windows SCM service and no scheduled task. It leaves only on request:
+// Setup's shutdown, the self-update swap, an uninstall, or a port it can
+// never own.
+//
+// MUTUAL RECOVERY (2026-10-06): an ending this process did not choose (End
+// task, a kill) is restored by VIRULE Service (ViruleService.exe), which this
+// process in turn starts and keeps resident (client/service_watch.hpp; the
+// contract is shared/residency.hpp). This process owns the login start; it
+// starts the service when it begins serving. An intentional exit announces
+// itself first so the service holds off instead of fighting a replacement.
+// virule:// and the Admin's client_health remain fallbacks.
 
 #include <atomic>
 #include <string>
@@ -51,6 +57,8 @@
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
 #include "client/self_update.hpp"
+#include "client/service_install.hpp"
+#include "client/service_watch.hpp"
 #include "client/takeover.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
@@ -59,6 +67,7 @@
 #include "shared/login_start.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
+#include "shared/residency.hpp"
 #include "shared/uninstall.hpp"
 #include "shared/version.h"
 
@@ -167,6 +176,9 @@ void run_uninstall_sequence(bool delete_data) {
     }
     vclient::log::client(std::string("uninstall: intent recorded; teardown starting (") +
                          (delete_data ? "delete local data)" : "keep local data)"));
+    // VIRULE Service lives in the install directory and must be gone before
+    // the helper can remove it; with the latch written nothing restores it.
+    vclient::residency::request_service_stop();
 
     // 2. Immediate visible feedback + the site's Removing state.
     vclient::bridge::broadcast_uninstall_state("removing");
@@ -262,6 +274,9 @@ int run_finish_uninstall(unsigned long parent_pid, bool delete_data) {
 
     un::temp_log(std::string("helper: starting (") +
                  (delete_data ? "delete local data)" : "keep local data)"));
+    // Idempotent: the serving client already asked; a launcher-driven
+    // removal reaches here with the service possibly still resident.
+    vclient::residency::request_service_stop();
     if (parent_pid != 0) {
         if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, parent_pid)) {
             WaitForSingleObject(h, 30000);
@@ -334,7 +349,7 @@ int run_finish_uninstall(unsigned long parent_pid, bool delete_data) {
 }
 
 void serve(const std::string& initial_qa_token, bool register_protocol,
-           const std::wstring& restart_args) {
+           const std::wstring& restart_args, const std::wstring& residency_seams) {
     // Self-heal the pieces an installed client owns. Registration mirrors
     // the Admin's behavior: whichever VIRULE component ran last holds
     // virule://, and both handle qa/verify identically. (--no-register is
@@ -511,6 +526,17 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // process, or cleared when expired/moot (audit M2).
     vclient::admin_install::reconcile_launch_update_hold();
 
+    // MUTUAL RECOVERY (2026-10-06), managed installs only: settle any
+    // interrupted service replacement, start watching (and if need be
+    // starting) VIRULE Service, and tell a running service this Core
+    // Services is serving so it binds to it at once. A missing service is
+    // repaired through the update check below (service_install.hpp).
+    if (vclient::self_update::g_enabled.load()) {
+        vclient::service_install::reconcile_startup_residue();
+        vclient::service_watch::start(residency_seams);
+        vclient::residency::signal_event(vclient::residency::kServiceWakeEvent);
+    }
+
     // The silent Admin update check (AUTOMATIC CHECKING, USER-INITIATED
     // INSTALLING): one check at startup, then a quiet periodic recheck
     // while this process happens to be serving. The scheduled Admin check
@@ -613,6 +639,12 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         // cost of staying alive: one wake-up a second.
     }
     g_state.store(RunState::Draining);
+    // An exit this process chose (Setup's shutdown, the self-update swap)
+    // is announced so VIRULE Service holds off for the replacement instead
+    // of restoring the binary being replaced. A port that can never be
+    // owned is not a choice: that exit stays "unexpected" and residency's
+    // backoff governs any retry.
+    if (g_exit_requested.load()) vclient::residency::announce_client_exit_intent();
     vclient::bridge::stop_listening();
 }
 
@@ -651,14 +683,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     bool delete_data_arg = false;
     bool dev_unsigned = false;       // signature gates only (dev)
     bool restarted = false;          // relaunched by WER after a crash
+    bool restored = false;           // relaunched by VIRULE Service
     std::wstring self_manifest_url;  // self-update manifest seam (dev)
     std::wstring admin_manifest_url; // Admin-manifest seam (dev)
+    // The development seams this run carries, in the only form residency
+    // ever forwards (loopback manifest urls only; residency.hpp).
+    const std::wstring residency_seams = vclient::residency::forward_seams(argc, argv);
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--no-register") no_register = true;
         if (arg == L"--delete-data") delete_data_arg = true;
         if (arg == L"--dev-unsigned") dev_unsigned = true;
         if (arg == L"--restarted") restarted = true;
+        if (arg == L"--restored") restored = true;
         if (arg.rfind(L"--self-manifest-url=", 0) == 0) {
             self_manifest_url = arg.substr(20);
         }
@@ -668,7 +705,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     LocalFree(argv);
     if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
-        arg1 == L"--restarted" ||
+        arg1 == L"--restarted" || arg1 == L"--restored" ||
         arg1.rfind(L"--self-manifest-url=", 0) == 0 ||
         arg1.rfind(L"--admin-manifest-url=", 0) == 0) {
         arg1.clear();
@@ -729,6 +766,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         vclient::self_update::g_enabled.store(
             !installed.empty() && self_path == installed);
     }
+    // VIRULE Service distribution and residency follow the same rule: the
+    // managed install only, the same two seams.
+    vclient::service_install::g_enabled.store(vclient::self_update::g_enabled.load());
+    vclient::service_install::g_dev_unsigned = dev_unsigned;
+    vclient::service_install::g_manifest_seam = !self_manifest_url.empty();
+    vclient::service_install::g_seams = residency_seams;
 
     // ---- helper mode (a %TEMP% copy finishing an uninstall) ----
     if (arg1 == L"--finish-uninstall") {
@@ -764,6 +807,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         // No serving instance: this process runs the pre-teardown steps
         // itself. Intent FIRST, then Admin-close-first, then the helper.
         if (!vclient::lifecycle::set_uninstall_intent()) return 1;
+        vclient::residency::request_service_stop();
         vclient::result_card::show_working("Removing VIRULE\xE2\x80\xA6", "");
         vclient::uninstall::reconcile_admin_update_residue();
         if (vclient::admin_install::admin_running()) {
@@ -843,7 +887,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
 
     // ---- single instance ----
-    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\ViruleClient.Singleton");
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, vclient::residency::kClientSingleton);
     const bool already_running =
         (mutex != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) ||
         (mutex == nullptr);
@@ -869,7 +913,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (restarted) {
         vclient::log::client("residency: restarted by Windows after an unexpected exit");
     }
-    serve(qa_token, !no_register, restart_args);
+    if (restored) {
+        vclient::log::client("residency: restored by VIRULE Service after an unexpected exit");
+    }
+    serve(qa_token, !no_register, restart_args, residency_seams);
 
     ReleaseMutex(mutex);
     CloseHandle(mutex);

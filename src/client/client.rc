@@ -2,6 +2,9 @@
 // The client is plumbing, but it now owns the native lifecycle surface
 // ("Updating…", "Finishing up…", "VIRULE is ready"), so its windows and
 // taskbar entries must present as VIRULE (result_card loads icon id 1).
+// FileDescription is what Task Manager shows: "VIRULE Core Services" (the
+// Windows process identity table, v2_mvp docs\ADMIN_ARCHITECTURE.md); the
+// physical file name stays virule-client.exe (grandfathered).
 #include <winres.h>
 #include "../shared/version.h"
 
@@ -21,7 +24,7 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "VIRULE"
-            VALUE "FileDescription", "VIRULE Client"
+            VALUE "FileDescription", "VIRULE Core Services"
             VALUE "FileVersion", VIRULE_CLIENT_VERSION_STRING
             VALUE "InternalName", "virule-client"
             VALUE "OriginalFilename", "virule-client.exe"

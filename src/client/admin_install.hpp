@@ -148,6 +148,16 @@ inline const wchar_t* kRequiredSigned[] = {
     L".resources\\bin\\x64\\SidecarKHost.exe",
 };
 
+// VIRULE-owned binaries that newer packages carry and older ones do not:
+// verified exactly like the list above WHEN PRESENT, so a package carrying
+// one unsigned is refused, while an older approved package (or a validated
+// Admin.previous) without it stays installable. ViruleUIHelper.exe is the
+// Admin's CEF subprocess host (2026-10-06); a host without it beside it runs
+// its CEF children from its own image, as before.
+inline const wchar_t* kSignedIfPresent[] = {
+    L".resources\\admin\\ViruleUIHelper.exe",
+};
+
 // Every unsigned file the package must also carry. outreach_providers.json
 // is the owner's registered Google and Microsoft application configuration:
 // an installed Admin connects a mailbox by signing in, and only because this
@@ -313,6 +323,17 @@ inline bool previous_install_restorable(const std::filesystem::path& previous,
             why = "required component missing: " + p.filename().string();
             return false;
         }
+        if (kRequireAuthenticode && !g_dev_unsigned &&
+            (!verify_binary::authenticode_valid(p) ||
+             !verify_binary::signed_by(p, kExpectedSigner))) {
+            why = "signature verification failed: " + p.filename().string();
+            return false;
+        }
+    }
+    for (const wchar_t* rel : kSignedIfPresent) {
+        const auto p = previous / rel;
+        ec.clear();
+        if (!std::filesystem::exists(p, ec) || ec) continue;
         if (kRequireAuthenticode && !g_dev_unsigned &&
             (!verify_binary::authenticode_valid(p) ||
              !verify_binary::signed_by(p, kExpectedSigner))) {
@@ -1685,6 +1706,20 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
             broadcast_result("failed", "");
             return "failed";
         }
+        if (kRequireAuthenticode && !g_dev_unsigned &&
+            (!verify_binary::authenticode_valid(p) ||
+             !verify_binary::signed_by(p, kExpectedSigner))) {
+            log::client("admin: staged binary failed signature verification: " +
+                        p.filename().string());
+            cleanup_staging();
+            broadcast_result("failed", "");
+            return "failed";
+        }
+    }
+    for (const wchar_t* rel : kSignedIfPresent) {
+        const auto p = staging / rel;
+        ec.clear();
+        if (!std::filesystem::exists(p, ec) || ec) continue;
         if (kRequireAuthenticode && !g_dev_unsigned &&
             (!verify_binary::authenticode_valid(p) ||
              !verify_binary::signed_by(p, kExpectedSigner))) {

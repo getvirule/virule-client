@@ -5,7 +5,8 @@
 //
 // Ownership map (Phase 2):
 //   %LOCALAPPDATA%\Programs\VIRULE\           the installed program
-//       virule-client.exe
+//       virule-client.exe                     VIRULE Core Services
+//       ViruleService.exe                     VIRULE Service (residency)
 //       Admin\                                the managed VIRULE Admin
 //           virule.exe, .resources\, ...      installation (Phase 2; the
 //                                             development publish folder is
@@ -139,6 +140,25 @@ inline std::filesystem::path install_dir() {
 inline std::filesystem::path installed_client_exe() {
     const auto d = install_dir();
     return d.empty() ? d : d / L"virule-client.exe";
+}
+
+// VIRULE Service, the residency companion (shared/residency.hpp), beside the
+// client. `.update` is a verified staged replacement and `.old` exists only
+// during a replacement (the known-good binary restored on failure), the same
+// shape as the client's own self-update files.
+inline std::filesystem::path installed_service_exe() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"ViruleService.exe";
+}
+
+inline std::filesystem::path service_update_staged_exe() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"ViruleService.exe.update";
+}
+
+inline std::filesystem::path service_old_exe() {
+    const auto d = install_dir();
+    return d.empty() ? d : d / L"ViruleService.exe.old";
 }
 
 // Client self-update staging, beside the installed exe on the same volume

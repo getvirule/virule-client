@@ -47,6 +47,17 @@
 //      expected VIRULE signing identity.
 // Any failure refuses the install. The hash gate always holds;
 // --dev-unsigned (development only) waives only the signature gates.
+//
+// VIRULE SERVICE (2026-10-06): when the manifest describes the release's
+// ViruleService.exe (the additive service_* fields), it is acquired through
+// the SAME gates and placed beside the client. It is not a reason to refuse
+// the install: the installed client repairs a missing service itself
+// through the same trusted path (client/service_install.hpp).
+//
+// REPLACEMENT IS MAINTENANCE: Setup holds the residency maintenance lock
+// (shared/residency.hpp) from stopping the running client until the new one
+// has been started, so VIRULE Service never restores the binary Setup is
+// replacing.
 // GitHub is a HOST, not a trust anchor: nothing is weakened because the
 // bytes come from a public release; the manifest hash + Authenticode +
 // signer identity remain the whole trust decision.
@@ -56,6 +67,7 @@
 #include <string>
 
 #include "client/bridge.hpp"     // loopback client half (talk to the client)
+#include "client/service_install.hpp" // VIRULE Service acquisition + placement
 #include "setup/handoff_listener.hpp"
 #include "setup/setup_window.hpp"
 #include "shared/client_state.hpp"
@@ -67,6 +79,7 @@
 #include "shared/login_start.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
+#include "shared/residency.hpp"
 #include "shared/uninstall.hpp"  // register_uninstall_entry
 #include "shared/verify_binary.hpp"
 #include "shared/version.h"
@@ -414,6 +427,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     vclient::log::setup("manifest: version=" + manifest.version +
                         " size=" + std::to_string(manifest.size) +
                         " sha256=" + manifest.sha256);
+    // The release's VIRULE Service (additive fields; an older release has
+    // none). A malformed set costs only the service, never the install.
+    vclient::service_install::Artifact service;
+    {
+        std::string swhy;
+        if (!vclient::service_install::parse_artifact(manifest_body, !dev_manifest,
+                                                      service, swhy)) {
+            vclient::log::setup("manifest service fields rejected (" + swhy +
+                                "); the client will repair the service");
+            service = vclient::service_install::Artifact{};
+        } else if (service.present) {
+            vclient::log::setup("manifest: service size=" + std::to_string(service.size) +
+                                " sha256=" + service.sha256);
+        }
+    }
 
     // 2. The approved client binary, capped at the manifest's declared size.
     Url curl;
@@ -493,6 +521,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
     }
 
+    // The release's VIRULE Service, through the same gates (exact size,
+    // exact SHA-256, Authenticode + the VIRULE signer), staged beside the
+    // client. Placed further down, once the latch is cleared.
+    const auto service_staged = vclient::paths::service_update_staged_exe();
+    bool service_ready = false;
+    if (service.present) {
+        std::string swhy;
+        service_ready = vclient::service_install::download_verified(
+            service, service_staged, allow_unsigned, swhy);
+        vclient::log::setup(service_ready
+            ? std::string("service downloaded and verified")
+            : "service not installed (" + swhy + "); the client will repair it");
+    }
+
+    // REPLACEMENT IS MAINTENANCE (shared/residency.hpp): from here until the
+    // new client has been started, VIRULE Service must not restore the
+    // binary being replaced. An explicit install proceeds even if the lock
+    // cannot be had (a wedged holder must never block Setup).
+    vclient::residency::MaintenanceLock maintenance;
+    if (!maintenance.acquire(30000)) {
+        vclient::log::setup("residency maintenance lock unavailable; proceeding");
+    }
+
     // A running older client would both hold the exe and, worse, keep
     // serving a bridge that predates the takeover protocol; ask it to exit
     // before the replacement so the freshly installed client is the one
@@ -556,6 +607,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         (void)vclient::state::save(s);
     }
 
+    // 7b. VIRULE Service: replace any running one with the verified release
+    // binary and make it resident. It finds no Core Services yet and sees
+    // the maintenance lock, so it simply waits until the client below is up.
+    if (service_ready) {
+        std::string swhy;
+        if (vclient::service_install::place_staged(service_staged, L"", swhy)) {
+            vclient::log::setup("VIRULE Service installed and resident");
+        } else {
+            vclient::log::setup("VIRULE Service not placed (" + swhy +
+                                "); the client will repair it");
+        }
+        std::filesystem::remove(service_staged, ec);
+        ec.clear();
+    }
+
     // 8. Start the client.
     {
         STARTUPINFOW si{};
@@ -572,6 +638,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             vclient::log::setup("installed but could not start the client");
         }
     }
+    // The replacement is done: residency resumes (the service binds to the
+    // client just started, or restores one if that start failed).
+    maintenance.release();
 
     // 9. THE TAKEOVER TRANSFER. Hand the client whatever the browser
     // handed us: the one pending-operation envelope, or its explicit

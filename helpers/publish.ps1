@@ -1,19 +1,25 @@
 # VIRULE distribution publisher: pushes the SIGNED Virule-Setup.exe, the
-# SIGNED virule-client.exe and its manifest.json to the versioned GitHub
-# Release on getvirule/virule-client. GitHub Releases are the MVP binary
-# distribution source; the LATEST release's manifest is the mutable pointer
-# Virule-Setup.exe follows at install time.
+# SIGNED virule-client.exe, the SIGNED ViruleService.exe and their
+# manifest.json to the versioned GitHub Release on getvirule/virule-client.
+# GitHub Releases are the MVP binary distribution source; the LATEST
+# release's manifest is the mutable pointer Virule-Setup.exe and the
+# installed client follow.
 #
 # This is the minimum deterministic Phase-1 distribution publisher, NOT the
 # full release automation. What it does, in order:
 #   1. requires a VALID VIRULE Authenticode signature on every artifact it
 #      is about to publish (it never signs anything itself);
-#   2. computes the client's SHA-256 and size;
-#   3. generates manifest.json (version / direct asset url / sha256 / size);
+#   2. computes the client's and the service's SHA-256 and size;
+#   3. generates manifest.json: version / direct asset url / sha256 / size
+#      for the client (the fields every Setup and client ever shipped
+#      reads), then service_url / service_sha256 / service_size, ADDITIVE
+#      fields only Setup and clients from 0.9.0 read (src\client\
+#      service_install.hpp). The old fields keep their names and come first;
 #   4. creates the release tag v<version> when it does not exist yet;
-#   5. uploads virule-client.exe, Virule-Setup.exe and manifest.json - but
-#      REFUSES to replace an already-published virule-client.exe whose
-#      bytes differ (a published client version is never rewritten; bump
+#   5. uploads virule-client.exe, ViruleService.exe, Virule-Setup.exe and
+#      manifest.json - but REFUSES to replace an already-published
+#      virule-client.exe or ViruleService.exe whose bytes differ (a
+#      published client release is never rewritten; bump
 #      VIRULE_CLIENT_VERSION instead);
 #   6. re-downloads every asset from its public direct URL and verifies the
 #      hash against the local signed artifact;
@@ -39,9 +45,10 @@ $ghRepo     = 'getvirule/virule-client'
 $publicBase = "https://github.com/$ghRepo/releases/download"
 $expectedSubject = 'CN=Heath Michaels'
 
-$clientExe = Join-Path $repo 'build\Release\x64\virule-client.exe'
-$setupExe  = Join-Path $repo 'build\Release\x64\Virule-Setup.exe'
-$versionH  = Join-Path $repo 'src\shared\version.h'
+$clientExe  = Join-Path $repo 'build\Release\x64\virule-client.exe'
+$serviceExe = Join-Path $repo 'build\Release\x64\ViruleService.exe'
+$setupExe   = Join-Path $repo 'build\Release\x64\Virule-Setup.exe'
+$versionH   = Join-Path $repo 'src\shared\version.h'
 $stageDir  = Join-Path $repo 'build\publish'
 
 function Fail([string]$msg) { throw "PUBLISH FAILED: $msg" }
@@ -129,24 +136,32 @@ $tag = "v$version"
 Write-Host "OK:   client version $version (release tag $tag)"
 
 # ---- gate: only signed artifacts are ever published ----
-Require-Signed $clientExe 'virule-client.exe'
-Require-Signed $setupExe  'Virule-Setup.exe'
+Require-Signed $clientExe  'virule-client.exe'
+Require-Signed $serviceExe 'ViruleService.exe'
+Require-Signed $setupExe   'Virule-Setup.exe'
 
-$clientSha  = Sha256 $clientExe
-$clientSize = (Get-Item $clientExe).Length
-$setupSha   = Sha256 $setupExe
-$clientUrl  = "$publicBase/$tag/virule-client.exe"
-Write-Host "OK:   client sha256=$clientSha size=$clientSize"
-Write-Host "OK:   setup  sha256=$setupSha"
+$clientSha   = Sha256 $clientExe
+$clientSize  = (Get-Item $clientExe).Length
+$serviceSha  = Sha256 $serviceExe
+$serviceSize = (Get-Item $serviceExe).Length
+$setupSha    = Sha256 $setupExe
+$clientUrl   = "$publicBase/$tag/virule-client.exe"
+$serviceUrl  = "$publicBase/$tag/ViruleService.exe"
+Write-Host "OK:   client  sha256=$clientSha size=$clientSize"
+Write-Host "OK:   service sha256=$serviceSha size=$serviceSize"
+Write-Host "OK:   setup   sha256=$setupSha"
 
 New-Item -ItemType Directory -Force $stageDir | Out-Null
 
 # ---- the manifest: the one mutable pointer ----
 # COMPACT JSON on purpose: Setup's parser is the product's exact marker
 # scanner ("name":"value" with no whitespace); keep the wire form it reads.
+# The client's four fields keep their names and come FIRST (every Setup and
+# client ever shipped reads exactly those); the service fields are additive.
 $manifestPath = Join-Path $stageDir 'manifest.json'
-$manifestJson = '{{"version":"{0}","url":"{1}","sha256":"{2}","size":{3}}}' -f `
-    $version, $clientUrl, $clientSha, $clientSize
+$manifestJson = ('{{"version":"{0}","url":"{1}","sha256":"{2}","size":{3},' +
+                 '"service_url":"{4}","service_sha256":"{5}","service_size":{6}}}') -f `
+    $version, $clientUrl, $clientSha, $clientSize, $serviceUrl, $serviceSha, $serviceSize
 $manifestJson | Out-File -Encoding ascii -NoNewline $manifestPath
 $manifestSha = Sha256 $manifestPath
 Write-Host "OK:   manifest staged: $manifestJson"
@@ -163,7 +178,7 @@ if ($view.Code -ne 0) {
     Write-Host "--    creating release $tag"
     $null = Invoke-Gh @('release', 'create', $tag, '-R', $ghRepo,
         '--title', "VIRULE Client $version", '--latest',
-        '--notes', "VIRULE Client $version. Virule-Setup.exe installs the client release this release's manifest.json describes, after verifying its SHA-256, Authenticode signature, and signer identity.")
+        '--notes', "VIRULE Client $version. Virule-Setup.exe installs the client release this release's manifest.json describes (VIRULE Core Services and VIRULE Service), after verifying each SHA-256, Authenticode signature, and signer identity.")
 } else {
     Write-Host "OK:   release $tag already exists"
 }
@@ -181,6 +196,19 @@ if ($null -eq $remoteClient) {
           'a published client version is never rewritten.')
 }
 
+# ---- 1b. the IMMUTABLE versioned service (before the manifest that names it)
+$remoteService = Get-RemoteAssetHash $tag 'ViruleService.exe'
+if ($null -eq $remoteService) {
+    $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $serviceExe)
+    Write-Host 'OK:   uploaded ViruleService.exe'
+} elseif ($remoteService -eq $serviceSha) {
+    Write-Host 'OK:   ViruleService.exe already published with identical bytes; leaving it.'
+} else {
+    Fail ("IMMUTABILITY VIOLATION: $tag already carries a ViruleService.exe with DIFFERENT bytes " +
+          "(remote=$remoteService local=$serviceSha). Bump VIRULE_CLIENT_VERSION and rebuild; " +
+          'a published client release is never rewritten.')
+}
+
 # ---- 2. the manifest (mutable pointer; safe to replace) ----
 $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $manifestPath, '--clobber')
 Write-Host 'OK:   uploaded manifest.json'
@@ -196,6 +224,7 @@ if ($remoteSetup -eq $setupSha) {
 
 # ---- 4. verify what the world will actually download ----
 Verify-PublicAsset "$publicBase/$tag/virule-client.exe" $clientSha 'virule-client.exe'
+Verify-PublicAsset "$publicBase/$tag/ViruleService.exe" $serviceSha 'ViruleService.exe'
 Verify-PublicAsset "$publicBase/$tag/manifest.json" $manifestSha 'manifest.json'
 Verify-PublicAsset "$publicBase/$tag/Virule-Setup.exe" $setupSha 'Virule-Setup.exe'
 # The pointer Setup actually follows: the LATEST release's manifest. GitHub
@@ -226,5 +255,6 @@ Write-Host ''
 Write-Host 'SUCCESS: GitHub release published and verified.' -ForegroundColor Green
 Write-Host "  setup    $publicBase/$tag/Virule-Setup.exe"
 Write-Host "  client   $clientUrl"
+Write-Host "  service  $serviceUrl"
 Write-Host "  manifest $publicBase/$tag/manifest.json"
 Write-Host "  pointer  https://github.com/$ghRepo/releases/latest/download/manifest.json"

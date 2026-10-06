@@ -67,6 +67,7 @@
 
 #include "client/admin_install.hpp" // version_is_upgrade, grammar helpers
 #include "client/bridge.hpp"
+#include "client/service_install.hpp"
 #include "shared/client_state.hpp"
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
@@ -311,6 +312,9 @@ struct Manifest {
     std::string url;
     std::string sha256;
     long long size = 0;
+    // The release's VIRULE Service (additive fields; absent in releases that
+    // predate it). Reconciled on every check (service_install.hpp).
+    service_install::Artifact service;
 };
 
 inline bool fetch_manifest(Manifest& out, std::string& why) {
@@ -366,6 +370,13 @@ inline bool fetch_manifest(Manifest& out, std::string& why) {
         out.size <= 0 || out.size > (long long)kMaxClientBytes) {
         why = "manifest size missing or out of bounds";
         return false;
+    }
+    // The service fields are additive: a malformed set refuses only the
+    // service (logged), never the client's own update.
+    std::string service_why;
+    if (!service_install::parse_artifact(body, !dev, out.service, service_why)) {
+        log::client("self-update: " + service_why + "; service fields ignored");
+        out.service = service_install::Artifact{};
     }
     return true;
 }
@@ -496,6 +507,10 @@ inline void refresh_check(unsigned long long fresh_ms) {
         }
         g_approved_version = m.version;
     }
+
+    // The release's VIRULE Service: installed when missing, replaced when it
+    // is not the one this client release ships (service_install.hpp).
+    service_install::reconcile(m.version, m.service);
 
     if (!admin_install::version_is_upgrade(m.version,
                                            VIRULE_CLIENT_VERSION_STRING)) {
@@ -769,6 +784,26 @@ inline bool helper_rename_retries(const std::filesystem::path& from,
 
 inline int run_finish_self_update(unsigned long parent_pid) {
     log::client("self-update helper: starting");
+    // THE SWAP IS MAINTENANCE (residency.hpp): while this helper holds the
+    // lock, VIRULE Service never restores the exiting client into the middle
+    // of the rename. Released on every return (the lock's destructor), or
+    // abandoned with this process if it dies, and residency resumes either
+    // way. Taken before anything else so the gap after the parent's exit is
+    // covered from its first instant (the parent also announced its exit).
+    residency::MaintenanceLock maintenance;
+    if (!maintenance.acquire(30000)) {
+        log::client("self-update helper: another VIRULE maintenance operation is running; swap abandoned");
+        Txn t = load_txn();
+        if (t.state == "swapping") {
+            t.state = "verified";
+            (void)save_txn(t);
+        }
+        // Starting a client here would collide with whatever owns the
+        // maintenance (Setup replacing the client starts its own when it is
+        // done, and residency restores one after it otherwise).
+        uninstall::schedule_self_delete();
+        return 1;
+    }
     // The parent client announced its exit before spawning this helper;
     // waiting on it is verification. A parent that will not die means the
     // swap is off: revert to "verified" and leave (no forced kill, ever).
