@@ -513,7 +513,7 @@ inline const char* kDonePage =
     // Smoky Blue (STYLE_GUIDE 3.1-3.3), the website's page field,
     // primary ink and muted ink in each theme; the canonical 44px V mark
     // (17.2), identical in both.
-    "html{color-scheme:dark;--bg:#0b1015;--ink:#e9edf2;--muted:#aab3bf}"
+    "html{color-scheme:dark;--bg:#10161c;--ink:#e9edf2;--muted:#aab3bf}"
     "html.l{color-scheme:light;--bg:#e2e8ee;--ink:#1a2330;--muted:#465466}"
     "@media (prefers-color-scheme:light){html:not(.d){color-scheme:light;--bg:#e2e8ee;--ink:#1a2330;--muted:#465466}}"
     "html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:'Segoe UI',system-ui,sans-serif}"
