@@ -382,6 +382,30 @@ try {
   check("the QA credential file is untouched (QA keeps working without the account)",
     JSON.parse(fs.readFileSync(path.join(ROOT, "VIRULE", "security", "qa_tester.cred"), "utf8")).credentials[0].signature === sig);
 
+  // --- a password change on the website signs this installation out with
+  // no restart (2026-10-16): its tokens are refused from the change on.
+  const qaPath = path.join(ROOT, "VIRULE", "security", "qa_tester.cred");
+  const qaBefore = fs.readFileSync(qaPath, "utf8"), machineBefore = fs.readFileSync(devPath, "utf8");
+  await site("/reauth/password", { password: "a long enough desktop passphrase" });
+  const pc = await site("/password/set", { password: "a changed desktop passphrase here" });
+  check("(setup) a verified password change on the website", pc.status === 200, pc.body);
+  // The Admin asks on every window activation; the Client contacts the
+  // service at most once per 20 seconds, so this ends within that window.
+  const pcStart = Date.now();
+  let sPc = await status();
+  while (sPc?.signed_in !== false && Date.now() - pcStart < 35000) {
+    await bridge('{"type":"account_refresh"}');
+    await sleep(1000);
+    sPc = await status();
+  }
+  check("a password change signs this running installation out (no restart, within the 20 s check window)",
+    sPc?.signed_in === false && sPc.error === "signed_out_by_service" && Date.now() - pcStart < 25000, { sPc, ms: Date.now() - pcStart });
+  check("... and leaves the machine identity and the QA credential exactly as they were",
+    fs.readFileSync(qaPath, "utf8") === qaBefore && fs.readFileSync(devPath, "utf8") === machineBefore);
+  check("the browser that changed the password stays signed in", (await site("/account")).status === 200);
+  await signInOnce();
+  check("the installation can sign in again afterwards", (await waitStatus((x) => x.signed_in && x.account))?.signed_in === true);
+
   const so = JSON.parse(await bridge('{"type":"account_sign_out"}'));
   const s8 = await status();
   check("sign out clears the Client", so.ok === true && s8.signed_in === false && !fs.existsSync(sessFile));
