@@ -134,6 +134,7 @@ in both components).
 | local | `{"type":"account_link_qa"}` | the explicit QA identity link (the person chose it in the Admin) |
 | local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
 | local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
+| local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` (at most four `/[A-Za-z0-9_-]+` segments) made here under this installation's DPoP authorization; the body is the message's LAST field, raw JSON. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
 
 Client pushes to every connected page: `{"type":"qa_result","token","state"}`,
 `{"type":"admin_result","state","version"}`,
@@ -255,6 +256,13 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   bridge answer carries the link. Signed out or offline it opens the plain
   page (with the hint when known). The snapshot keeps the service's
   `account_hint`. Staging test seam: `test_settings_url` in the status.
+- EVALUATION RELAY (v0.9.7, `account_api`, grammar
+  `src/shared/account_relay.hpp`, unit tests `tests/account_relay`): the
+  Admin's Evaluations and Assignments reach the service's evaluation records
+  only through this, so the access token and the device key never leave the
+  Client. A 401 refreshes once (a refused refresh signs out, as anywhere);
+  no answer marks the snapshot offline. VIRULE_BACKEND
+  `docs/EVALUATIONS.md` is the contract.
 - QA link: reads `qa_tester.cred`, proves the credential's machine key
   (dev_machine.cred), sends both under the DPoP authorization. The QA
   credential is never changed; QA keeps working without any account.

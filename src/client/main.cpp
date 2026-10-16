@@ -440,6 +440,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         if (type == "account_link_qa") return acct::link_qa();
         if (type == "account_set_appearance") return acct::set_appearance(payload);
         if (type == "account_open_settings") return acct::open_settings();
+        if (type == "account_api") return acct::api_call(payload);
         return std::string();
     };
     callbacks.on_qa_accept = [](const std::string& token) {

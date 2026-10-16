@@ -63,6 +63,8 @@
 //                    {"type":"account_set_appearance","appearance":"light"|"dark"}
 //                                                      (explicit account appearance)
 //                    {"type":"account_open_settings"}  (website account page, this account)
+//                    {"type":"account_api","method","path","body"}  (the evaluation relay:
+//                                                       /v1/evaluations and /v1/assignments only)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin"}
 //                      (answered on request, and ALSO PUSHED unsolicited to
@@ -127,6 +129,12 @@ namespace vclient::bridge {
 constexpr unsigned short kPort = 47612;
 constexpr size_t kMaxHandshakeBytes = 8192;
 constexpr size_t kMaxFrameBytes = 4096;
+// LOCAL control connections only (no Origin: the Admin host, a second
+// instance, Setup): the evaluation relay (account_api) carries a purchase's
+// game profile one way and a developer's or evaluator's state the other,
+// which can exceed a page frame. A PAGE frame stays bounded by
+// kMaxFrameBytes in both directions.
+constexpr size_t kMaxLocalFrameBytes = 60000;
 
 // Accepted browser origins live in the ONE environment seam
 // (shared/environment.hpp -> virule/core/launch_policy.hpp): this
@@ -593,7 +601,8 @@ inline void handle_client(SOCKET client) {
         } else if (len == 127) {
             return; // absurd for this protocol
         }
-        if (!masked || len > kMaxFrameBytes) return; // RFC: client frames are masked
+        // RFC: client frames are masked. Pages stay at the small bound.
+        if (!masked || len > (is_page ? kMaxFrameBytes : kMaxLocalFrameBytes)) return;
         unsigned char mask[4];
         if (!recv_exact(client, mask, 4)) return;
         std::string payload(len, '\0');
@@ -821,7 +830,8 @@ inline void handle_client(SOCKET client) {
         } else if (!is_page && (type == "account_status" || type == "account_sign_in" ||
                                 type == "account_sign_in_cancel" || type == "account_sign_out" ||
                                 type == "account_refresh" || type == "account_link_qa" ||
-                                type == "account_set_appearance" || type == "account_open_settings")) {
+                                type == "account_set_appearance" || type == "account_open_settings" ||
+                                type == "account_api")) {
             // Desktop account (client/account.hpp). LOCAL ONLY: a web page
             // can neither start a sign-in nor read the account, and no
             // answer ever carries a token. The browser half of sign-in is
@@ -829,7 +839,7 @@ inline void handle_client(SOCKET client) {
             // callback listener, never this bridge.
             const std::string answer = g_callbacks.account_message
                 ? g_callbacks.account_message(type, payload) : std::string();
-            if (answer.empty() || answer.size() > kMaxFrameBytes) {
+            if (answer.empty() || answer.size() > (type == "account_api" ? kMaxLocalFrameBytes : kMaxFrameBytes)) {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             } else {
                 if (!reply(0x1, answer)) return;

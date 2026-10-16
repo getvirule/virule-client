@@ -41,6 +41,7 @@
 #include <thread>
 #include <vector>
 
+#include "shared/account_relay.hpp"
 #include "shared/account_store.hpp"
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
@@ -1012,6 +1013,65 @@ inline std::string link_qa() {
     if (linked > 0) confirm_async();
     return std::string("{\"type\":\"account_link_qa\",\"ok\":") + (linked > 0 ? "true" : "false") +
         ",\"linked\":" + std::to_string(linked) + "}";
+}
+
+// ------------------------------------------------- the evaluation relay --
+
+/**
+ * {"type":"account_api","method":"GET"|"POST","path":"/v1/evaluations...","body":{...}}
+ *
+ * THE EVALUATION RELAY (VIRULE_BACKEND/docs/EVALUATIONS.md). The Admin's
+ * Evaluations and Assignments read and change the service's evaluation
+ * records THROUGH this installation's own DPoP authorization: the call is
+ * made here, with the device key and the access token, which never leave
+ * this process. The Admin names only the method, one of the two evaluation
+ * path families and a JSON body (the LAST field of the message, passed as
+ * raw JSON and validated by the service); it can reach nothing else
+ * (shared/account_relay.hpp). LOCAL ONLY, like every account_* message.
+ *
+ * Answers {"type":"account_api","status":<HTTP status>,"body":<the service's
+ * JSON object>}. status 0 = no answer, with "error": "signed_out" (no
+ * authorization here, or the service ended it), "offline" (the service
+ * could not be reached), "bad_request" or "too_large". A refused refresh
+ * signs this installation out, as anywhere.
+ */
+inline std::string api_call(const std::string& message) {
+    namespace relay = vclient::account_relay;
+    std::string method, path;
+    if (!json_scan::find_string_in(message, 0, message.size(), "method", method) ||
+        !json_scan::find_string_in(message, 0, message.size(), "path", path) ||
+        (method != "GET" && method != "POST") || !relay::path_ok(path)) {
+        return relay::failure("bad_request");
+    }
+    const std::string body = method == "POST" ? relay::body_of(message) : std::string();
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        ensure_loaded_locked(st());
+        if (!st().signed_in) return relay::failure("signed_out");
+    }
+    store::DeviceKey key;
+    if (!store::device_key(key)) return relay::failure("signed_out");
+    const wchar_t* wm = method == "GET" ? L"GET" : L"POST";
+    const auto no_token = [] {
+        std::lock_guard<std::mutex> lock(st().m);
+        return relay::failure(st().signed_in ? "offline" : "signed_out");
+    };
+    std::lock_guard<std::mutex> tl(token_mutex());
+    std::string at;
+    if (!access_token_locked(key, at)) return no_token();
+    Reply r = call(wm, method.c_str(), path, body, key, at);
+    if (r.status == 401) {
+        if (!refresh_locked(key)) return no_token();
+        { std::lock_guard<std::mutex> lock(st().m); at = st().access_token; }
+        r = call(wm, method.c_str(), path, body, key, at);
+    }
+    if (r.status == 0) {
+        std::lock_guard<std::mutex> lock(st().m);
+        st().offline = true;
+        return relay::failure("offline");
+    }
+    const std::string out = relay::answer(r.status, r.body);
+    return out.size() > relay::kMaxAnswerBytes ? relay::failure("too_large") : out;
 }
 
 } // namespace vclient::account
