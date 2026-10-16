@@ -43,7 +43,8 @@ struct Palette {
     COLORREF line;
     COLORREF word;
     COLORREF muted;
-    COLORREF accent;
+    COLORREF accent;     // accent LINE and FILL: always VIRULE yellow, never darkened
+    COLORREF accent_ink; // accent as TEXT: yellow on dark, dark neutral ink on light (3.4)
     COLORREF danger;
 };
 
@@ -62,13 +63,13 @@ inline Palette resolve_palette() {
         RegCloseKey(key);
     }
     if (light) {
-        return Palette{ RGB(0xf4, 0xf6, 0xf8), RGB(0xc4, 0xcc, 0xd6),
-                        RGB(0x20, 0x25, 0x2b), RGB(0x71, 0x7b, 0x86),
-                        RGB(0xb4, 0x86, 0x0f), RGB(0xdc, 0x26, 0x26) };
+        return Palette{ RGB(0xed, 0xf1, 0xf5), RGB(0xb2, 0xbf, 0xce),
+                        RGB(0x1a, 0x23, 0x30), RGB(0x5c, 0x6b, 0x7e),
+                        RGB(0xfb, 0xbf, 0x24), RGB(0x1a, 0x23, 0x30), RGB(0xdc, 0x26, 0x26) };
     }
-    return Palette{ RGB(0x19, 0x19, 0x18), RGB(0x2a, 0x2a, 0x28),
-                    RGB(0xee, 0xee, 0xec), RGB(0xb4, 0xb2, 0xac),
-                    RGB(0xfb, 0xbf, 0x24), RGB(0xef, 0x44, 0x44) };
+    return Palette{ RGB(0x16, 0x1d, 0x25), RGB(0x2f, 0x3a, 0x47),
+                    RGB(0xe9, 0xed, 0xf2), RGB(0xaa, 0xb3, 0xbf),
+                    RGB(0xfb, 0xbf, 0x24), RGB(0xfb, 0xbf, 0x24), RGB(0xef, 0x44, 0x44) };
 }
 
 // Window-thread-only state (run() is modal on the calling thread).
@@ -229,7 +230,7 @@ inline void paint(HWND hwnd) {
             SelectObject(mem, old_br);
             SelectObject(mem, old_pen);
             DeleteObject(pen);
-            SetTextColor(mem, g_pal.accent);
+            SetTextColor(mem, g_pal.accent_ink);
             DrawTextW(mem, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(mem, old_f);
             DeleteObject(f);

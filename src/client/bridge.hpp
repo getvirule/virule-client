@@ -52,8 +52,17 @@
 //                    {"type":"admin_launch"}           (managed launch handoff)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
 //                    {"type":"update_health"}          (Admin notice query)
+//                    {"type":"evidence_status","assignment_id":"<32 hex>"}
+//                                                      (evaluation evidence query)
 //                    {"type":"setup_takeover",...}     (Setup envelope transfer)
 //                    {"type":"setup_wait"}             (Setup release poll)
+//                    {"type":"account_status"}         (Admin: the account snapshot)
+//                    {"type":"account_sign_in"} / {"type":"account_sign_in_cancel"}
+//                    {"type":"account_sign_out"} / {"type":"account_refresh"}
+//                    {"type":"account_link_qa"}        (explicit QA identity link)
+//                    {"type":"account_set_appearance","appearance":"light"|"dark"}
+//                                                      (explicit account appearance)
+//                    {"type":"account_open_settings"}  (website account page, this account)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin"}
 //                      (answered on request, and ALSO PUSHED unsolicited to
@@ -66,6 +75,9 @@
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
 //                    {"type":"admin_update_status","installed",...,"update"}
 //                    {"type":"update_health","blocked":true|false}
+//                    {"type":"evidence_status","assignment_id","counts":{...},
+//                     "packages":[{"id","state","simulated","attempts",
+//                     "last_error"}],"truncated":bool}
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"admin_result","state":...,"version":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
@@ -156,6 +168,11 @@ struct Callbacks {
     // been unreachable long enough to tell the user. Answers the FULL
     // update_health JSON message from the persisted record; never fetches.
     std::function<std::string()> update_health_json;
+    // A local caller (the Admin host) asked for the delivery state of one
+    // evaluation assignment's evidence packages. Answers the FULL
+    // evidence_status JSON message (shared/evidence_queue.hpp status_json,
+    // bounded inside kMaxFrameBytes); a read only, it never delivers.
+    std::function<std::string(const std::string& assignment_id)> evidence_status_json;
     // A verified uninstall authorization arrived from a page. The flag is
     // the page's explicit Delete local data choice; false (the default)
     // preserves every piece of user-owned VIRULE data.
@@ -169,6 +186,12 @@ struct Callbacks {
     // Setup's release poll: true once the takeover is complete and the
     // next feedback surface (page or native card) is ready/visible.
     std::function<bool()> setup_released;
+    // The account messages (client/account.hpp), LOCAL ONLY: the Admin
+    // host asking for the account snapshot or starting / cancelling a
+    // desktop sign-in, sign-out, a refresh, the explicit QA link, or an
+    // explicit appearance choice. Gets the message type and the whole
+    // payload; answers the FULL JSON reply; never a token.
+    std::function<std::string(const std::string& type, const std::string& payload)> account_message;
 };
 
 // Listener ownership: 0 unresolved, 1 this process listens, 2 the port is
@@ -689,6 +712,26 @@ inline void handle_client(SOCKET client) {
             } else {
                 if (!reply(0x1, answer)) return;
             }
+        } else if (type == "evidence_status" && !is_page) {
+            // Evaluation evidence delivery state for one assignment.
+            // Local-only and read-only: pending | acknowledged | damaged per
+            // package, from the outbox, the receipts and the Client's
+            // delivery state. A malformed assignment id is refused.
+            std::string assignment_id;
+            (void)js::find_string_in(payload, 0, payload.size(), "assignment_id",
+                                     assignment_id);
+            bool id_ok = assignment_id.size() == 32;
+            for (const char c : assignment_id) {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) id_ok = false;
+            }
+            const std::string answer = (id_ok && g_callbacks.evidence_status_json)
+                ? g_callbacks.evidence_status_json(assignment_id)
+                : std::string();
+            if (answer.empty() || answer.size() > kMaxFrameBytes) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            } else {
+                if (!reply(0x1, answer)) return;
+            }
         } else if (type == "admin_open" && is_page) {
             const bool opened = g_callbacks.on_admin_open &&
                                 g_callbacks.on_admin_open();
@@ -775,6 +818,22 @@ inline void handle_client(SOCKET client) {
                         (delete_data ? " (delete local data)" : " (keep local data)"));
             if (g_callbacks.on_uninstall) g_callbacks.on_uninstall(delete_data);
             continue;
+        } else if (!is_page && (type == "account_status" || type == "account_sign_in" ||
+                                type == "account_sign_in_cancel" || type == "account_sign_out" ||
+                                type == "account_refresh" || type == "account_link_qa" ||
+                                type == "account_set_appearance" || type == "account_open_settings")) {
+            // Desktop account (client/account.hpp). LOCAL ONLY: a web page
+            // can neither start a sign-in nor read the account, and no
+            // answer ever carries a token. The browser half of sign-in is
+            // the site's own /authorize page plus the one-shot loopback
+            // callback listener, never this bridge.
+            const std::string answer = g_callbacks.account_message
+                ? g_callbacks.account_message(type, payload) : std::string();
+            if (answer.empty() || answer.size() > kMaxFrameBytes) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            } else {
+                if (!reply(0x1, answer)) return;
+            }
         } else if (type == "wake" && !is_page) {
             if (!reply(0x1, "{\"type\":\"ok\"}")) return;
         } else if (type == "shutdown" && !is_page) {

@@ -52,6 +52,7 @@
 #include <string>
 #include <vector>
 
+#include "client/account.hpp"
 #include "client/admin_install.hpp"
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
@@ -62,6 +63,8 @@
 #include "client/takeover.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
+#include "shared/environment.hpp"
+#include "shared/evidence_queue.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/login_start.hpp"
@@ -91,6 +94,48 @@ namespace {
 enum class RunState { Starting, Serving, Draining, Uninstalling };
 std::atomic<RunState> g_state{ RunState::Starting };
 std::atomic<bool> g_exit_requested{ false };
+
+// The evidence test transport seam (--evidence-test-endpoint=); honored only
+// in a staging build or a redirected sandbox (shared/evidence_queue.hpp).
+std::wstring g_evidence_test_endpoint;
+HANDLE g_evidence_stop = nullptr;
+
+// EVALUATION EVIDENCE DELIVERY (EVALUATION_VIRULE.md section 6): the
+// dedicated evidence thread. One forced recovery pass now, then a blocked
+// wait on Local\VIRULE.Evidence.Wake, the earliest retry, or the stop event
+// set when this process stops serving. An uninstall pauses it. Runs on every
+// client (managed or not): the evidence root is the env-resolved
+// %LOCALAPPDATA%\VIRULE\evidence, so a sandboxed run only sees its sandbox.
+void start_evidence_delivery() {
+    namespace ev = vclient::evidence;
+    g_evidence_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_evidence_stop) {
+        vclient::log::client("evidence: stop event unavailable; delivery not started");
+        return;
+    }
+    struct Arg { ev::DriverConfig cfg; std::unique_ptr<ev::Transport> transport; };
+    auto* arg = new Arg{};
+    arg->transport = ev::select_transport(g_evidence_test_endpoint, vclient::env::kStaging,
+                                          vclient::paths::environment_redirected(),
+                                          [](const std::string& t) { vclient::log::client(t); });
+    arg->cfg.root = ev::ee::root_under(vclient::paths::virule_data_root());
+    arg->cfg.transport = arg->transport.get();
+    arg->cfg.stop_event = g_evidence_stop;
+    arg->cfg.paused = [] {
+        return vclient::bridge::g_uninstalling.load() ||
+               vclient::lifecycle::uninstall_intent_active();
+    };
+    arg->cfg.log = [](const std::string& t) { vclient::log::client(t); };
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID p) -> DWORD {
+            Arg* a = (Arg*)p;
+            vclient::evidence::run_driver(a->cfg);
+            delete a;
+            return 0;
+        },
+        arg, 0, nullptr);
+    if (h) CloseHandle(h); else delete arg;
+}
 
 std::string narrow(const std::wstring& w) {
     if (w.empty()) return "";
@@ -215,6 +260,12 @@ void run_uninstall_sequence(bool delete_data) {
         }
         vclient::log::client("uninstall: the Admin closed");
     }
+
+    // 4b. Sign this installation out of its VIRULE account at the service
+    // (bounded; offline is fine): the session file goes with the client
+    // state directory in both modes, and a removed installation must not
+    // leave a live device authorization behind.
+    (void)vclient::account::sign_out(true);
 
     // 5. Helper handoff. The listener closes so the freed port reads as
     // removal in progress (existing page connections stay open for the
@@ -379,6 +430,18 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     }
 
     vclient::bridge::Callbacks callbacks;
+    callbacks.account_message = [](const std::string& type, const std::string& payload) -> std::string {
+        namespace acct = vclient::account;
+        if (type == "account_status") return acct::status_json();
+        if (type == "account_sign_in") return acct::start_sign_in();
+        if (type == "account_sign_in_cancel") return acct::cancel_sign_in();
+        if (type == "account_sign_out") return acct::sign_out();
+        if (type == "account_refresh") return acct::refresh();
+        if (type == "account_link_qa") return acct::link_qa();
+        if (type == "account_set_appearance") return acct::set_appearance(payload);
+        if (type == "account_open_settings") return acct::open_settings();
+        return std::string();
+    };
     callbacks.on_qa_accept = [](const std::string& token) {
         // A page is driving the redemption: any standalone Setup
         // conclusion is revoked (the browser owns the flow).
@@ -454,6 +517,11 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     };
     callbacks.update_health_json = []() {
         return vclient::admin_install::update_health_json();
+    };
+    callbacks.evidence_status_json = [](const std::string& assignment_id) {
+        return vclient::evidence::status_json(
+            vclient::evidence::ee::root_under(vclient::paths::virule_data_root()),
+            assignment_id);
     };
     callbacks.on_uninstall = [](bool delete_data) {
         begin_uninstall_async(delete_data);
@@ -568,6 +636,11 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         CloseHandle(h);
     }
 
+    // Evaluation evidence: delivered by this process whether or not a
+    // wrapper or the Admin is running (survives both closing, a client
+    // restart and a Windows restart: the startup pass is the recovery).
+    start_evidence_delivery();
+
     // THE LIFECYCLE STATUS WATCHER (P1 status push, 2026-09-04): while any
     // virule.app page is connected, re-read the lifecycle core (the admin
     // block + the uninstalling flag) once a second and push a status frame
@@ -645,6 +718,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // owned is not a choice: that exit stays "unexpected" and residency's
     // backoff governs any retry.
     if (g_exit_requested.load()) vclient::residency::announce_client_exit_intent();
+    if (g_evidence_stop) SetEvent(g_evidence_stop);
     vclient::bridge::stop_listening();
 }
 
@@ -702,12 +776,29 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (arg.rfind(L"--admin-manifest-url=", 0) == 0) {
             admin_manifest_url = arg.substr(21);
         }
+        if (arg.rfind(L"--evidence-test-endpoint=", 0) == 0) {
+            g_evidence_test_endpoint = arg.substr(25);
+        }
+        // Staging-only harness seam (tools/account_live_staging_test.mjs):
+        // the real staging service, the browser played by the harness.
+        if (arg == L"--account-browser=capture") vclient::account::capture_browser() = true;
+        // Development seam for the account service (tools/account_flow_test.mjs):
+        // LOOPBACK ONLY, so no argument can point a real sign-in elsewhere.
+        if (arg.rfind(L"--account-endpoint=", 0) == 0) {
+            const std::wstring v = arg.substr(19);
+            if (v.rfind(L"http://127.0.0.1:", 0) == 0 || v.rfind(L"https://127.0.0.1:", 0) == 0) {
+                vclient::account::set_endpoint_override(v);
+            }
+        }
     }
     LocalFree(argv);
     if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
         arg1 == L"--restarted" || arg1 == L"--restored" ||
         arg1.rfind(L"--self-manifest-url=", 0) == 0 ||
-        arg1.rfind(L"--admin-manifest-url=", 0) == 0) {
+        arg1.rfind(L"--admin-manifest-url=", 0) == 0 ||
+        arg1.rfind(L"--evidence-test-endpoint=", 0) == 0 ||
+        arg1.rfind(L"--account-endpoint=", 0) == 0 ||
+        arg1 == L"--account-browser=capture") {
         arg1.clear();
     }
 
@@ -723,6 +814,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     if (!admin_manifest_url.empty()) {
         restart_args += L" --admin-manifest-url=" + admin_manifest_url;
+    }
+    if (!g_evidence_test_endpoint.empty()) {
+        restart_args += L" --evidence-test-endpoint=" + g_evidence_test_endpoint;
     }
 
     // Self-update run configuration. Self-update manages ONLY the managed

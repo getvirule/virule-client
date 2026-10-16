@@ -91,7 +91,8 @@ constexpr const wchar_t* kSiteUrl = env::kSiteUrl;
 
 enum class Mode { Result, Working, Ready, Action };
 
-// The Admin splash's two palettes (dark Graphite / light Fog), resolved
+// The transitional family's two palettes (Smoky Blue dark / light, STYLE_GUIDE
+// 21: card, line, word and dim equal the Admin token values), resolved
 // from the OS AppsUseLightTheme value the same way (missing = dark).
 struct Palette {
     COLORREF bg;
@@ -119,12 +120,12 @@ inline Palette resolve_palette() {
         RegCloseKey(key);
     }
     if (light) {
-        return Palette{ RGB(0xf4, 0xf6, 0xf8), RGB(0xc4, 0xcc, 0xd6),
-                        RGB(0x20, 0x25, 0x2b), RGB(0x71, 0x7b, 0x86),
+        return Palette{ RGB(0xed, 0xf1, 0xf5), RGB(0xb2, 0xbf, 0xce),
+                        RGB(0x1a, 0x23, 0x30), RGB(0x5c, 0x6b, 0x7e),
                         RGB(0xfb, 0xbf, 0x24), RGB(0x0f, 0x0e, 0x0a) };
     }
-    return Palette{ RGB(0x19, 0x19, 0x18), RGB(0x2a, 0x2a, 0x28),
-                    RGB(0xee, 0xee, 0xec), RGB(0xb4, 0xb2, 0xac),
+    return Palette{ RGB(0x16, 0x1d, 0x25), RGB(0x2f, 0x3a, 0x47),
+                    RGB(0xe9, 0xed, 0xf2), RGB(0xaa, 0xb3, 0xbf),
                     RGB(0xfb, 0xbf, 0x24), RGB(0x0f, 0x0e, 0x0a) };
 }
 

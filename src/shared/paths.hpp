@@ -26,6 +26,12 @@
 //                           to its update check and DELETES a batch the
 //                           service acknowledged, nothing else. See
 //                           virule/core/usage_spool.hpp.)
+//   %LOCALAPPDATA%\VIRULE\evidence\           evaluation evidence
+//       .incoming\        (the wrapper's, until its rename; never touched)
+//       outbox\ delivery\ receipts\ (Client-owned from the rename:
+//                           delivered and receipted by
+//                           shared/evidence_queue.hpp; format
+//                           virule/core/evaluation_evidence.hpp)
 //
 // Everything else under %LOCALAPPDATA%\VIRULE (virule.db, workspace\,
 // logs\, backup.json, .resources anywhere) belongs to the VIRULE Admin and

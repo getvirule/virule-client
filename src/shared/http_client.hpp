@@ -135,17 +135,28 @@ inline bool http_get(const wchar_t* host, unsigned short port, bool secure,
 // development seam. Same failure contract as http_get, which is what the
 // update-health record relies on: `status_out` is 0 exactly when NO HTTP
 // response was received (DNS, connect, TLS, timeout), and non-zero for any
-// answer the service gave, whatever its status.
+// answer the service gave, whatever its status. `timeouts` (WinHTTP resolve,
+// connect, send, receive, in ms) defaults to the manifest check's posture;
+// the evidence test transport (shared/evidence_queue.hpp) passes shorter ones.
+struct Timeouts {
+    int resolve_ms = 10000;
+    int connect_ms = 10000;
+    int send_ms = 15000;
+    int receive_ms = 30000;
+};
+
 inline bool http_post_json(const wchar_t* host, unsigned short port, bool secure,
                            const wchar_t* path, const std::string& body,
                            size_t max_bytes, unsigned long& status_out,
-                           std::string& body_out) {
+                           std::string& body_out,
+                           const Timeouts& timeouts = Timeouts{}) {
     status_out = 0;
     body_out.clear();
     HINTERNET hsession = WinHttpOpen(L"ViruleClient/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hsession) return false;
-    WinHttpSetTimeouts(hsession, 10000, 10000, 15000, 30000);
+    WinHttpSetTimeouts(hsession, timeouts.resolve_ms, timeouts.connect_ms,
+                       timeouts.send_ms, timeouts.receive_ms);
     bool ok = false;
     bool overflow = false;
     HINTERNET hconnect = WinHttpConnect(hsession, host, port, 0);
@@ -355,6 +366,70 @@ inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
         sha256_out[i * 2 + 1] = kHex[digest[i] & 0xF];
     }
     return true;
+}
+
+// One bounded request with caller-supplied headers (the account service:
+// form-encoded OAuth posts, DPoP proofs, Authorization: DPoP). Same failure
+// contract as http_post_json: `status_out` is 0 exactly when NO HTTP
+// response was received. The headers string is CRLF-terminated "Name: value" lines and
+// never contains a secret that must not reach the wire; nothing here logs.
+// No redirects are followed: an account endpoint never redirects, and a
+// token request must never be replayed to another host.
+inline bool request(const wchar_t* method, const wchar_t* host, unsigned short port, bool secure,
+                    const std::wstring& path, const std::wstring& headers,
+                    const std::string& body, size_t max_bytes,
+                    unsigned long& status_out, std::string& body_out,
+                    const Timeouts& timeouts = Timeouts{}) {
+    status_out = 0;
+    body_out.clear();
+    HINTERNET hsession = WinHttpOpen(L"ViruleClient/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hsession) return false;
+    WinHttpSetTimeouts(hsession, timeouts.resolve_ms, timeouts.connect_ms,
+                       timeouts.send_ms, timeouts.receive_ms);
+    bool ok = false;
+    bool overflow = false;
+    HINTERNET hconnect = WinHttpConnect(hsession, host, port, 0);
+    if (hconnect) {
+        HINTERNET hrequest = WinHttpOpenRequest(hconnect, method, path.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            secure ? WINHTTP_FLAG_SECURE : 0);
+        if (hrequest) {
+            DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(hrequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
+            if (WinHttpSendRequest(hrequest,
+                    headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+                    headers.empty() ? 0 : static_cast<DWORD>(-1L),
+                    body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()),
+                    static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) &&
+                WinHttpReceiveResponse(hrequest, nullptr)) {
+                DWORD status = 0;
+                DWORD sz = sizeof(status);
+                if (WinHttpQueryHeaders(hrequest,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+                    status_out = status;
+                    ok = true;
+                }
+                DWORD avail = 0;
+                while (WinHttpQueryDataAvailable(hrequest, &avail) && avail > 0) {
+                    if (body_out.size() + avail > max_bytes) { overflow = true; break; }
+                    std::string chunk(avail, '\0');
+                    DWORD read = 0;
+                    if (!WinHttpReadData(hrequest, chunk.data(), avail, &read) || read == 0) break;
+                    body_out.append(chunk.data(), read);
+                }
+            }
+            WinHttpCloseHandle(hrequest);
+        }
+        WinHttpCloseHandle(hconnect);
+    }
+    WinHttpCloseHandle(hsession);
+    if (overflow) {
+        body_out.clear();
+        return false;
+    }
+    return ok;
 }
 
 } // namespace vclient::http

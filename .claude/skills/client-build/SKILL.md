@@ -38,6 +38,13 @@ node tools\bridge_test.mjs                # bridge protocol/security matrix
 tests\usage\run_tests.bat                 # usage spool, check-in and update-health units, then the
                                           # check-in end to end against the real service code
                                           # (needs ..\..\VIRULE_BACKEND); starts NO client
+tests\evidence\run_tests.bat              # evaluation evidence queue units, then the sandboxed
+                                          # delivery run (tools\evidence_queue_test.mjs: the
+                                          # client's evidence thread in a test exe, loopback
+                                          # endpoint); starts NO client, never touches 47612
+node tools\account_flow_test.mjs          # desktop sign-in (PAR + PKCE + DPoP) of the STAGING build
+                                          # against the real account routes (needs ..\..\VIRULE_BACKEND);
+                                          # evicts the real client first, starts it again at the end
 node tools\residency_test.mjs [--only=1,3]  # Core Services <-> VIRULE Service residency, 17
                                           # sandboxed scenarios (~15 min); evicts the real client
                                           # first and starts it again at the end

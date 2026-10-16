@@ -6,7 +6,9 @@ and advance the last-verified stamp.
 Last verified 2026-09-10, against client v0.8.3; the usage check-in and
 update-health sections were written against v0.8.6 (2026-10-01); residency
 (VIRULE Service), the manifest's service fields and Setup's service
-placement against v0.9.0 (2026-10-06). The compiled constant in
+placement against v0.9.0 (2026-10-06); evaluation evidence delivery
+against the 2026-10-14 tree; the VIRULE account against v0.9.4 (2026-10-15).
+The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
 
@@ -123,7 +125,15 @@ in both components).
 | local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch |
 | local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
+| local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
+| local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4). Never a token |
+| local | `{"type":"account_sign_in"}` / `{"type":"account_sign_in_cancel"}` | start (idempotent) / cancel the browser sign-in |
+| local | `{"type":"account_sign_out"}` | revoke at the service (bounded), then forget locally |
+| local | `{"type":"account_refresh"}` | re-confirm the account and capabilities with the service (asynchronous) |
+| local | `{"type":"account_link_qa"}` | the explicit QA identity link (the person chose it in the Admin) |
+| local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
+| local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
 
 Client pushes to every connected page: `{"type":"qa_result","token","state"}`,
 `{"type":"admin_result","state","version"}`,
@@ -190,6 +200,73 @@ Browser/native ownership of the QA outcome mirrors the Admin: result is
 pushed to pages on this bridge; with none, a running Admin GUI session's
 47611 bridge is asked to deliver it to its pages; only with no page
 anywhere does the minimal native result card appear.
+
+## VIRULE account (2026-10-15, staging; `src/client/account.hpp`, `src/shared/account_store.hpp`)
+
+The Client is the ONE owner of persistent desktop authentication; the Admin
+presents it through the account_* LOCAL messages above (a page, even an
+allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
+
+- Sign-in: OAuth 2.0 authorization code + PKCE S256 + PAR + DPoP. The Client
+  opens a one-shot listener on `127.0.0.1:<ephemeral>` (only `GET
+  /callback`, only its own state, constant-time; the issuer must equal this
+  build's site), pushes the request to `/v1/oauth/par` under a DPoP proof,
+  and opens the person's default browser on `<site>/authorize/`. The answer
+  page the listener serves is Smoky Blue with the canonical mark, light or
+  dark: the authorize page appends `ui=light|dark` (its own resolved theme)
+  to the redirect, and without it the browser's preference decides; `ui` is
+  presentation only. Ten-minute bound; Cancel ends it.
+- Device key: `security\account_device.cred` (Ed25519, DPAPI user scope,
+  entropy `virule-account-device.v1`). NOT dev_machine.cred, which the Admin
+  may replace; the machine public key is sent as information only. THE KEY
+  BELONGS TO ONE AUTHORIZATION (v0.9.4): every sign-out (the person's, the
+  service's refusal on refresh, uninstall) deletes it and the next sign-in
+  makes a new one, so a second person signing in here never shares a key or
+  an authorization with the first, and an authorization an offline sign-out
+  could not revoke is left bound to a key that no longer exists. A device
+  key is never created while signed out.
+- Session: `client\account.dat` (DPAPI, entropy `virule-account-session.v1`):
+  the rotating refresh token plus the last snapshot. The access token lives
+  in memory only. Staging builds use `.staging` file names.
+- Every token operation is serialized (a racing refresh would present one
+  refresh token twice, which the service treats as theft). A refresh the
+  service refuses signs the installation out (`signed_out_by_service`);
+  network failure keeps the snapshot and reports `offline`. A snapshot older
+  than 5 minutes is re-confirmed in the background on the next status read.
+- Uninstall signs the installation out at the service (bounded, step 4b of
+  the teardown), which deletes the session and the device key. Sign-out
+  never touches local records: games, QA credentials, the machine identity
+  and evaluation files stay.
+- ACCOUNT APPEARANCE (v0.9.4): the session snapshot carries the account's
+  explicit appearance and its version (`/v1/account/me`), and the status
+  reports `appearance` ("light" | "dark", "" = never chosen).
+  `{"type":"account_set_appearance","appearance":...}` (local only; refused
+  signed out) records an explicit choice at once (persisted with the version
+  it was made on) and delivers it in the background as the live choice. If
+  the service is unreachable it stays pending, survives restarts, and is
+  replayed with `base_version` on the next contact (status reads retry it at
+  most every 30 s); a 409 means the account changed elsewhere since, and the
+  installation adopts the preference in force. `account_refresh` re-confirms
+  at most every 20 s (the Admin asks at start, on every activation and every
+  30 s while in the foreground).
+- ACCOUNT SETTINGS (v0.9.5): `account_open_settings` mints a single-use web
+  link (`POST /v1/account/web-link`, DPoP) and opens
+  `<site>/account/?for=<account hint>#h=<link>` itself (ShellExecute); no
+  bridge answer carries the link. Signed out or offline it opens the plain
+  page (with the hint when known). The snapshot keeps the service's
+  `account_hint`. Staging test seam: `test_settings_url` in the status.
+- QA link: reads `qa_tester.cred`, proves the credential's machine key
+  (dev_machine.cred), sends both under the DPoP authorization. The QA
+  credential is never changed; QA keeps working without any account.
+- Development seam: `--account-endpoint=http(s)://127.0.0.1:<port>` (loopback
+  only) points the service and site at a test server and replaces opening the
+  browser with a `test_authorize_url` in the status. Proof:
+  `tools/account_flow_test.mjs` (the real binary, sandboxed, against the real
+  service routes). A second seam, `--account-browser=capture`, exists ONLY in
+  staging builds (ignored in production): the real staging service, with the
+  authorize URL surfaced instead of the browser opened. Proof against live
+  staging with the published binary: `tools/account_live_staging_test.mjs`.
+- Nothing here logs a token, code, verifier or key.
 
 ## virule://
 
@@ -1105,3 +1182,76 @@ process-launch surface: install runs only the pipeline above against the
 approved manifest (package SHA-256 + Authenticode + signer identity are
 the trust decision, exactly Virule-Setup's), and open launches only the
 managed installation the client itself placed.
+
+## Evaluation evidence delivery (2026-10-14)
+
+Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 6. Format,
+layout, handoff and receipt: `virule/core/evaluation_evidence.hpp`, vendored
+byte-identical from v2_mvp (never redefined here). Engine and driver:
+`src/shared/evidence_queue.hpp`; wiring: `start_evidence_delivery()` in
+`src/client/main.cpp`.
+
+OWNERSHIP, under `%LOCALAPPDATA%\VIRULE\evidence\` (a sibling of `client\`,
+so a default uninstall keeps it; Uninstall & Delete Data removes it with the
+rest of the data root):
+
+| Path | Owner |
+|---|---|
+| `.incoming\<id>\` | the wrapper's session, until its one rename; the Client never touches it |
+| `outbox\<id>\` (`package.json` + frames) | the Client, from the rename on |
+| `delivery\<id>.json` | Client-written delivery state `{attempts, failures, next_attempt_utc, last_error, damaged, acked}`, atomic |
+| `receipts\<id>.json` | Client-written receipt; the Admin reads it to unlock writing |
+
+THE DRIVER is a dedicated thread started in `serve()` on every client. It
+runs one FORCED pass at startup (the recovery after a crash, a kill or a
+Windows restart, with or without a wake), then blocks on the wake event
+`Local\VIRULE.Evidence.Wake`, the earliest `next_attempt_utc`, or its stop
+event (set when `serve()` ends). Idle with nothing pending is an infinite
+wait. An uninstall (`g_uninstalling` or the intent latch) pauses it. The
+Client creates the event auto-reset, initially clear (the parameters the
+wrapper's `open_wake_event` uses), with an explicit descriptor: full access
+for this user's SID and SYSTEM, medium mandatory label, so a same-user
+wrapper at medium or high integrity can signal it. Without the event the
+driver polls once a minute.
+
+GUARANTEES, each covered by `tests/evidence`:
+
+- Oldest package first (outbox directory creation time).
+- A COMPLETE acknowledgment (every file acked, `complete`, a receipt id)
+  writes the receipt atomically, and only then removes the payload
+  (`evaluation_evidence::acknowledge`). An outbox package that already has a
+  receipt is never delivered or reported again: the pass only finishes
+  removing its payload.
+- A partial acknowledgment is kept and only unacknowledged files are offered
+  again; a duplicate acknowledgment changes nothing. `package.json` is
+  delivered as the first file.
+- Retry never gives up and never expires: 10 s, 1 min, 5 min, 15 min, 30
+  min, then 30 min forever. An answer that grew the acked set restarts the
+  ladder. A `next_attempt_utc` more than 30 min ahead (the clock moved back)
+  is due.
+- A DAMAGED package (unreadable `package.json`, a missing file, a size or
+  hash mismatch) is never deleted: it is reported `damaged`, kept, and
+  re-checked on the ladder.
+- Nothing is reported delivered without a receipt.
+
+TRANSPORTS:
+
+- PRODUCTION is DEFERRED (no evidence endpoint exists): it answers
+  `unavailable` with no network call, so every package stays `pending`
+  (logged once per package per process). Evaluation writing stays locked.
+- TEST: loopback HTTP JSON against `--evidence-test-endpoint=http://127.0.0.1:<port>/<path>`,
+  honored ONLY in a staging build or while `paths::environment_redirected()`
+  is true, and only for a `127.0.0.1`/`localhost` url; otherwise it is
+  ignored with a log line. Every receipt it produces carries
+  `simulated: true`. Wire: `POST <endpoint>/packages/<id>` registers
+  `{v:1, package_id, assignment_id, files:[{file, sha256, bytes}]}`; then
+  each unacknowledged file goes as `POST <endpoint>/packages/<id>/files/<file>`
+  chunks `{package_id, file, sha256, bytes, offset, last, data(base64)}` of
+  at most 192 KiB raw. Every 200 answer is
+  `{acked:[...], complete:bool, receipt_id}`; a non-200, an unreadable
+  answer or no answer (10 s receive timeout) is a failed attempt. The seam
+  rides the crash-restart command line; VIRULE Service does not forward it.
+
+`evidence_status` (bridge, local-only) reads the outbox, the receipts and
+the delivery state; damaged rows first, then pending, then acknowledged,
+bounded to the 4 KB frame with complete `counts` and `truncated`.
