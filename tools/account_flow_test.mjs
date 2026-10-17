@@ -114,8 +114,8 @@ async function site(route, body = {}) {
 const EMAIL = "desk@example.com";
 const su = await site("/signup", { email: EMAIL, turnstile: "harness-turnstile-token" }); if (su.status !== 202) console.log("signup:", JSON.stringify(su));
 const verifyToken = /#t=([A-Za-z0-9_-]{43})/.exec(identity.prepare("SELECT body_text FROM staging_outbox ORDER BY id DESC LIMIT 1").get().body_text)[1];
-await site("/verify", { token: verifyToken });
-await site("/password/set", { password: "a long enough desktop passphrase" });
+// The link completes with the first credential (VIRULE_BACKEND docs/ACCOUNTS.md "SIGNUP").
+await site("/verify/password", { token: verifyToken, password: "a long enough desktop passphrase" });
 const acctId = identity.prepare("SELECT id FROM accounts WHERE email_norm = ?").get(EMAIL).id;
 
 // A machine identity in the exact product format (as a QA redemption would

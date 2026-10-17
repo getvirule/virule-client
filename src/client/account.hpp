@@ -1037,13 +1037,11 @@ inline std::string link_qa() {
  */
 inline std::string api_call(const std::string& message) {
     namespace relay = vclient::account_relay;
-    std::string method, path;
-    if (!json_scan::find_string_in(message, 0, message.size(), "method", method) ||
-        !json_scan::find_string_in(message, 0, message.size(), "path", path) ||
-        (method != "GET" && method != "POST") || !relay::path_ok(path)) {
-        return relay::failure("bad_request");
-    }
-    const std::string body = method == "POST" ? relay::body_of(message) : std::string();
+    const relay::Request req = relay::parse(message);
+    if (!req.ok) return relay::failure("bad_request");
+    const std::string& method = req.method;
+    const std::string& path = req.path;
+    const std::string& body = req.body;
     {
         std::lock_guard<std::mutex> lock(st().m);
         ensure_loaded_locked(st());

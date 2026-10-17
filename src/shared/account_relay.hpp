@@ -10,6 +10,8 @@
 
 #include <string>
 
+#include "shared/json_scan.hpp"
+
 namespace vclient::account_relay {
 
 /** /v1/evaluations or /v1/assignments, then at most four "/segment" parts
@@ -52,6 +54,27 @@ inline std::string body_of(const std::string& message) {
         return "{}";
     }
     return message.substr(vb, message.size() - 1 - vb);
+}
+
+/** One relay request as the Client reads it: the method, the path and (for
+ *  a POST) the raw body. `ok` false = refused before a token is touched. */
+struct Request {
+    bool ok = false;
+    std::string method;
+    std::string path;
+    std::string body;
+};
+
+inline Request parse(const std::string& message) {
+    Request r;
+    if (!json_scan::find_string_in(message, 0, message.size(), "method", r.method) ||
+        !json_scan::find_string_in(message, 0, message.size(), "path", r.path) ||
+        (r.method != "GET" && r.method != "POST") || !path_ok(r.path)) {
+        return Request{};
+    }
+    if (r.method == "POST") r.body = body_of(message);
+    r.ok = true;
+    return r;
 }
 
 /** The service's body trimmed of surrounding whitespace when it is a JSON
