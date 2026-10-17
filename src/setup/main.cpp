@@ -335,6 +335,8 @@ std::string takeover_message(const vclient::setup_handoff::Envelope& env) {
             }
         } else if (env.op == "INSTALL_ADMIN") {
             msg += std::string(",\"shortcut\":") + (env.shortcut ? "true" : "false");
+            msg += ",\"capability\":\"" +
+                   vclient::capabilities::entry_capability(env.capability) + "\"";
         }
     }
     msg += "}";
@@ -601,11 +603,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     // 7. Record the installed version (the manifest's, i.e. the client
     // release that was actually installed; Setup has its own version).
-    {
-        auto s = vclient::state::load();
+    (void)vclient::state::update([&](vclient::state::State& s) {
         s.installed_version = manifest.version;
-        (void)vclient::state::save(s);
-    }
+        return true;
+    });
 
     // 7b. VIRULE Service: replace any running one with the verified release
     // binary and make it resident. It finds no Core Services yet and sees

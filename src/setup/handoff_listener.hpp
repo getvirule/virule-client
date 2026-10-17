@@ -18,16 +18,19 @@
 //   - EXACTLY ONE pending-operation envelope is kept (first valid wins;
 //     duplicates are acknowledged and ignored), consumed once by Setup's
 //     transfer to the client;
-//   - the envelope carries NO capability: no URL, no path, no executable,
+//   - the envelope carries NO authority: no URL, no path, no executable,
 //     no filesystem anything. Operations are the two known intents, and
 //     the client revalidates all authorization itself (a QA token still
 //     has to survive service redemption; an Admin install still runs the
-//     verified manifest/signature pipeline).
+//     verified manifest/signature pipeline). INSTALL_ADMIN's "capability"
+//     names its ENTRY POINT (dev_tools | evaluator, 0.9.9), a local
+//     presentation record the client keeps; it grants nothing.
 //
 // Envelope (page -> Setup), version 1:
 //   {"type":"handoff","v":1,"op":"QA_ACCEPT","token":"<invite token>",
 //    "game":"<display label>"}
-//   {"type":"handoff","v":1,"op":"INSTALL_ADMIN","shortcut":true|false}
+//   {"type":"handoff","v":1,"op":"INSTALL_ADMIN","shortcut":true|false,
+//    "capability":"dev_tools"|"evaluator"}   (absent/unknown = dev_tools)
 // Reply: {"type":"handoff_accepted"} (or {"type":"error"}).
 //
 // Setup does not understand the operation semantically; it treats the
@@ -38,6 +41,7 @@
 #include <string>
 
 #include "client/bridge.hpp" // reuses the proven WS handshake/frame helpers
+#include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 #include "shared/protocol_reg.hpp"
@@ -64,6 +68,7 @@ struct Envelope {
     std::string token;   // QA_ACCEPT only; validated invite-token grammar
     std::string game;    // QA_ACCEPT only; display label, sanitized
     bool shortcut = false; // INSTALL_ADMIN only
+    std::string capability; // INSTALL_ADMIN only; "dev_tools" | "evaluator"
 };
 
 inline std::mutex g_mutex;
@@ -115,6 +120,11 @@ inline bool parse_envelope(const std::string& payload, Envelope& out) {
         out.present = true;
         out.op = op;
         out.shortcut = payload.find("\"shortcut\":true") != std::string::npos;
+        // The entry point (installed_capabilities.hpp's one grammar): only
+        // a known name is kept, anything else is the Dev Tools entry.
+        std::string capability;
+        (void)js::find_string_in(payload, 0, payload.size(), "capability", capability);
+        out.capability = capabilities::entry_capability(capability);
         return true;
     }
     return false;

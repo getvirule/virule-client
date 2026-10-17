@@ -52,6 +52,10 @@
 //                   ownership doctrine (the page owns ALL visible
 //                   verification UX); the watch stands down quietly.
 //
+// INSTALL_ADMIN carries its entry point's capability (dev_tools |
+// evaluator; installed_capabilities.hpp), recorded at the start of
+// run_admin. QA_ACCEPT and STANDALONE record nothing.
+//
 // INTENT, NEVER AUTHORIZATION: the envelope grants nothing. A QA token
 // still has to survive service redemption with this machine's proof; an
 // Admin install still runs the verified manifest/signature pipeline.
@@ -65,6 +69,7 @@
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
 #include "shared/environment.hpp"
+#include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 
@@ -177,7 +182,19 @@ inline void run_qa(const std::string& token) {
 
 // ---- INSTALL_ADMIN ----
 
-inline void run_admin(bool shortcut) {
+inline void run_admin(bool shortcut, const std::string& capability) {
+    // THE ENTRY POINT'S CAPABILITY IS RECORDED FIRST (0.9.9), before either
+    // the already-current watched open or the install: the person chose
+    // this entry point, and an existing installation gains the capability
+    // without reinstalling. Additive; local presentation only.
+    bool changed = false;
+    if (!capabilities::enable(capability, &changed)) {
+        log::client("takeover: could not record capability " + capability);
+    } else if (changed) {
+        log::client("takeover: capability " + capability + " enabled");
+        bridge::push_lifecycle_status();
+    }
+
     // THE NATIVE CONTINUATION IS UNCONDITIONAL (owner handoff rule): Setup
     // may close only into a ready native surface, and a live browser page
     // does not waive that - it renders its own progress in parallel.
@@ -342,12 +359,13 @@ struct ThreadArg {
     std::string token;
     std::string game;
     bool shortcut = false;
+    std::string capability; // INSTALL_ADMIN only; the entry-point grammar
 };
 
 inline DWORD WINAPI thread_entry(LPVOID p) {
     ThreadArg* a = (ThreadArg*)p;
     if (a->op == "QA_ACCEPT") run_qa(a->token);
-    else if (a->op == "INSTALL_ADMIN") run_admin(a->shortcut);
+    else if (a->op == "INSTALL_ADMIN") run_admin(a->shortcut, a->capability);
     else run_standalone();
     delete a;
     return 0;
@@ -361,11 +379,17 @@ inline DWORD WINAPI thread_entry(LPVOID p) {
 // operation runs.
 inline void on_setup_takeover(const std::string& payload) {
     namespace js = vclient::json_scan;
-    std::string op, token, game;
+    std::string op, token, game, requested;
     (void)js::find_string_in(payload, 0, payload.size(), "op", op);
     (void)js::find_string_in(payload, 0, payload.size(), "token", token);
     (void)js::find_string_in(payload, 0, payload.size(), "game", game);
     const bool shortcut = payload.find("\"shortcut\":true") != std::string::npos;
+    // INSTALL_ADMIN's entry point (0.9.9), validated exactly like the
+    // page's admin_install: absent or unknown = dev_tools (a pre-0.9.9
+    // Setup, or a homepage envelope). QA_ACCEPT and STANDALONE record
+    // nothing.
+    (void)js::find_string_in(payload, 0, payload.size(), "capability", requested);
+    const std::string capability = capabilities::entry_capability(requested);
     if (op != "QA_ACCEPT" && op != "INSTALL_ADMIN") op = "STANDALONE";
     if (op == "QA_ACCEPT" && !protocol_reg::is_invite_token(token)) {
         op = "STANDALONE"; // never trust a malformed token
@@ -398,7 +422,7 @@ inline void on_setup_takeover(const std::string& payload) {
     }
     log::client("takeover: " + op);
 
-    auto* arg = new ThreadArg{ op, token, game, shortcut };
+    auto* arg = new ThreadArg{ op, token, game, shortcut, capability };
     HANDLE h = CreateThread(nullptr, 0, thread_entry, arg, 0, nullptr);
     if (h) {
         CloseHandle(h);

@@ -45,6 +45,7 @@
 #include "shared/account_store.hpp"
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
+#include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 #include "shared/machine_identity.hpp"
@@ -861,6 +862,12 @@ inline std::string status_json() {
             stale = (long long)time(nullptr) - s.session.checked_epoch > kSnapshotFreshSeconds;
             pending = !s.session.pending_appearance.empty();
         }
+        // The INSTALLED capabilities (0.9.9, installed_capabilities.hpp),
+        // signed in or out: which entry points this installation came
+        // through. Local presentation only; the Admin shows a workspace
+        // that uses the service only when the account's capability above
+        // allows it too.
+        out += ",\"enabled\":" + capabilities::enabled_json();
         out += "}";
     }
     // Stale snapshot: re-confirm. An undelivered appearance change: try

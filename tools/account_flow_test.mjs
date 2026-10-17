@@ -386,8 +386,10 @@ try {
   // no restart (2026-10-16): its tokens are refused from the change on.
   const qaPath = path.join(ROOT, "VIRULE", "security", "qa_tester.cred");
   const qaBefore = fs.readFileSync(qaPath, "utf8"), machineBefore = fs.readFileSync(devPath, "utf8");
-  await site("/reauth/password", { password: "a long enough desktop passphrase" });
-  const pc = await site("/password/set", { password: "a changed desktop passphrase here" });
+  // Replacing an existing password is /password/change: the current
+  // password is the confirmation (/password/set refuses an account that
+  // already has one).
+  const pc = await site("/password/change", { current: "a long enough desktop passphrase", password: "a changed desktop passphrase here" });
   check("(setup) a verified password change on the website", pc.status === 200, pc.body);
   // The Admin asks on every window activation; the Client contacts the
   // service at most once per 20 seconds, so this ends within that window.

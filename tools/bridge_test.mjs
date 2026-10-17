@@ -3,11 +3,17 @@
 //
 // Run with the client already started:  node tools/bridge_test.mjs
 // (start it as:  build\Release\x64\virule-client.exe --no-register )
+// A staging build answers only the staging site: pass
+//   --origin=https://virule-api-staging.heath-michaels9441.workers.dev
+// Every check here is non-mutating (the installed-capability record is
+// only READ; tools/takeover_test.mjs scenario 8 covers recording it,
+// sandboxed).
 
 import net from "node:net";
 import crypto from "node:crypto";
 
 const PORT = 47612;
+const PAGE_ORIGIN = (process.argv.find((a) => a.startsWith("--origin=")) ?? "--origin=https://virule.app").slice(9);
 let pass = 0;
 let fail = 0;
 
@@ -60,7 +66,7 @@ function parseFrames(buf) {
 }
 
 // Open one connection; returns helpers. `origin: null` = local control.
-function connect({ origin = "https://virule.app", path = "/v1" } = {}) {
+function connect({ origin = PAGE_ORIGIN, path = "/v1" } = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(PORT, "127.0.0.1", () => {
       const headers = [
@@ -148,7 +154,26 @@ async function main() {
     check("status answers version + capabilities",
       !!status && status.includes('"version"') && status.includes('"qa"') && status.includes('"uninstall"'),
       status ?? "none");
+    const enabledShape = /"enabled":\{"dev_tools":(true|false),"evaluator":(true|false)\}/;
+    check("status carries the installed capabilities (enabled)",
+      !!status && enabledShape.test(status), status ?? "none");
+    // Refusals write nothing: an unknown capability and a missing one.
+    c.sendText('{"type":"capability_enable","capability":"superuser"}');
+    const unk = await c.next();
+    check("capability_enable with an unknown capability answers error",
+      unk === '{"type":"error"}', unk ?? "none");
+    c.sendText('{"type":"capability_enable"}');
+    const none = await c.next();
+    check("capability_enable with no capability answers error",
+      none === '{"type":"error"}', none ?? "none");
     c.end();
+    const local = await connect({ origin: null });
+    await local.next(); // hello
+    local.sendText('{"type":"account_status"}');
+    const acct = await local.next();
+    check("account_status carries the installed capabilities (enabled)",
+      !!acct && enabledShape.test(acct), acct ?? "none");
+    local.end();
   }
 
   console.log("A2. connected-page count (Setup's browser-handoff signal)");
@@ -255,13 +280,23 @@ async function main() {
   {
     const c = await connect();
     await c.next(); // hello
+    // A page also receives UNSOLICITED lifecycle status pushes (on a fresh
+    // client the 1 s watcher's first push lands on the first long-lived
+    // page, this one); they are not answers, so skip them here.
+    const nextAnswer = async (ms = 4000) => {
+      const end = Date.now() + ms;
+      for (;;) {
+        const m = await c.next(Math.max(1, end - Date.now()));
+        if (m === null || !m.includes('"type":"status"')) return m;
+      }
+    };
     const bogus = crypto.randomBytes(32).toString("hex");
     c.sendText(`{"type":"qa_accept","token":"${bogus}"}`);
-    const r1 = await c.next();
+    const r1 = await nextAnswer();
     check("qa_accept acknowledged", r1 === '{"type":"accepted"}', r1 ?? "none");
     // The client redeems against production; a random token resolves
     // invalid and the result is pushed to this page connection.
-    const r2 = await c.next(20000);
+    const r2 = await nextAnswer(20000);
     check("qa_result pushed with state invalid",
       !!r2 && r2.includes('"qa_result"') && r2.includes(`"${bogus}"`) && r2.includes('"invalid"'),
       r2 ?? "none");
@@ -269,10 +304,10 @@ async function main() {
     // accepted by the grammar and resolves invalid at the service.
     const bogus32 = crypto.randomBytes(24).toString("base64url");
     c.sendText(`{"type":"qa_accept","token":"${bogus32}"}`);
-    const r3 = await c.next();
+    const r3 = await nextAnswer();
     check("qa_accept accepts the 32-character Base64URL token grammar",
       r3 === '{"type":"accepted"}', r3 ?? "none");
-    const r4 = await c.next(20000);
+    const r4 = await nextAnswer(20000);
     check("32-character token resolves invalid at the service",
       !!r4 && r4.includes('"qa_result"') && r4.includes(`"${bogus32}"`) && r4.includes('"invalid"'),
       r4 ?? "none");

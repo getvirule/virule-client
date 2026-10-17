@@ -65,6 +65,7 @@
 #include "shared/client_state.hpp"
 #include "shared/environment.hpp"
 #include "shared/evidence_queue.hpp"
+#include "shared/installed_capabilities.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/login_start.hpp"
@@ -590,6 +591,18 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // authoritative in-install metadata immediately, so a reinstalled or
     // reset client never serves stale/empty version knowledge.
     vclient::admin_install::reconcile_installed_version();
+
+    // 5b. Installed capabilities (0.9.9), ONE TIME: an installation with
+    // no record gains dev_tools when the managed Admin is installed (every
+    // Admin installed before 0.9.9 came through the Dev Tools entry point)
+    // and never evaluator. Additive, so a capability a page recorded in
+    // the moments since the bridge started is kept.
+    if (vclient::capabilities::migrate_once(
+            vclient::admin_install::admin_installed())) {
+        vclient::log::client("capabilities: recorded " +
+                             vclient::capabilities::enabled_json() +
+                             " (one-time migration)");
+    }
 
     // 6. The persisted launch-update failure hold: loaded into this
     // process, or cleared when expired/moot (audit M2).

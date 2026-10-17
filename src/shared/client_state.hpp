@@ -9,7 +9,10 @@
 //     "created_desktop_shortcut": true|false,   // uninstall provenance
 //     "admin_hold_version": "x.y.z-alpha.n",    // launch-update failure hold
 //     "admin_hold_failed_utc": 1756944000,      //   when the failure happened
-//     "admin_hold_until_utc": 1756965600 }      //   launch retry-after expiry
+//     "admin_hold_until_utc": 1756965600,       //   launch retry-after expiry
+//     "enabled_recorded": true|false,           // installed capabilities
+//     "enabled_dev_tools": true|false,          //   (0.9.9; see
+//     "enabled_evaluator": true|false }         //   installed_capabilities.hpp)
 //
 // `created_dev_machine_cred` records that THIS product created the machine
 // identity file. A full VIRULE uninstall removes dev_machine.cred only when
@@ -33,9 +36,24 @@
 // update claims for that exact version stay suppressed until
 // `admin_hold_until_utc`, across client restarts. Empty version = no hold.
 // admin_install.hpp owns every rule (set, clear, expiry, contexts).
+//
+// The `enabled_*` triple is THE INSTALLED CAPABILITY RECORD (0.9.9): which
+// entry points this installation was acquired through (Dev Tools,
+// Evaluator), additive, local presentation only.
+// `enabled_recorded` = the one-time startup migration has run.
+// installed_capabilities.hpp owns every rule.
+//
+// ONE WRITER DISCIPLINE: every in-process read-modify-write goes through
+// update(), which holds g_mutex across the load, the change and the save,
+// so two threads (the update check, an install, a bridge capability
+// record) can never interleave and drop each other's fields. Because State
+// carries EVERY field, a load()+save() round trip preserves fields the
+// caller never touched. Virule-Setup is a separate process; it writes
+// (installed_version) only while no client is running.
 
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 
 #include "shared/json_scan.hpp"
@@ -51,9 +69,17 @@ struct State {
     std::string admin_hold_version;      // "" = no launch-update hold
     long long admin_hold_failed_utc = 0;
     long long admin_hold_until_utc = 0;
+    bool enabled_recorded = false;       // the one-time migration ran
+    bool enabled_dev_tools = false;
+    bool enabled_evaluator = false;
 };
 
-inline State load() {
+// Serializes every in-process access to state.json (see ONE WRITER
+// DISCIPLINE above). A leaf lock: nothing is called while it is held but
+// the file I/O below.
+inline std::mutex g_mutex;
+
+inline State load_unlocked() {
     State s;
     const auto file = paths::client_state_file();
     if (file.empty()) return s;
@@ -77,10 +103,16 @@ inline State load() {
     (void)json_scan::find_number_in(text, 0, text.size(),
                                     "admin_hold_until_utc",
                                     s.admin_hold_until_utc);
+    s.enabled_recorded =
+        text.find("\"enabled_recorded\":true") != std::string::npos;
+    s.enabled_dev_tools =
+        text.find("\"enabled_dev_tools\":true") != std::string::npos;
+    s.enabled_evaluator =
+        text.find("\"enabled_evaluator\":true") != std::string::npos;
     return s;
 }
 
-inline bool save(const State& s) {
+inline bool save_unlocked(const State& s) {
     const auto file = paths::client_state_file();
     if (file.empty()) return false;
     std::error_code ec;
@@ -95,6 +127,12 @@ inline bool save(const State& s) {
             json_scan::json_escape(s.admin_hold_version) + "\"";
     body += ",\"admin_hold_failed_utc\":" + std::to_string(s.admin_hold_failed_utc);
     body += ",\"admin_hold_until_utc\":" + std::to_string(s.admin_hold_until_utc);
+    body += ",\"enabled_recorded\":";
+    body += s.enabled_recorded ? "true" : "false";
+    body += ",\"enabled_dev_tools\":";
+    body += s.enabled_dev_tools ? "true" : "false";
+    body += ",\"enabled_evaluator\":";
+    body += s.enabled_evaluator ? "true" : "false";
     body += "}";
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     if (!out) return false;
@@ -102,11 +140,33 @@ inline bool save(const State& s) {
     return out.good();
 }
 
+inline State load() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return load_unlocked();
+}
+
+inline bool save(const State& s) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return save_unlocked(s);
+}
+
+// The one in-process read-modify-write: `change(State&)` runs on a fresh
+// load under the lock and returns whether anything changed; only a change
+// is saved. Returns false only when a needed save failed.
+template <typename Change>
+inline bool update(Change&& change) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    State s = load_unlocked();
+    if (!change(s)) return true;
+    return save_unlocked(s);
+}
+
 inline void mark_created_dev_machine_cred() {
-    State s = load();
-    if (s.created_dev_machine_cred) return;
-    s.created_dev_machine_cred = true;
-    (void)save(s);
+    (void)update([](State& s) {
+        if (s.created_dev_machine_cred) return false;
+        s.created_dev_machine_cred = true;
+        return true;
+    });
 }
 
 } // namespace vclient::state

@@ -39,8 +39,11 @@
 // (protocol_reg::is_invite_token):
 //   page -> client   {"type":"status"}
 //                    {"type":"qa_accept","token":"<invite token>"}
-//                    {"type":"admin_install","shortcut":true|false}
+//                    {"type":"admin_install","shortcut":true|false,
+//                     "capability":"dev_tools"|"evaluator"}
+//                                      (capability absent/unknown = dev_tools)
 //                    {"type":"admin_open"}
+//                    {"type":"capability_enable","capability":"dev_tools"|"evaluator"}
 //                    {"type":"uninstall","nonce":"<32 hex>",
 //                     "timestamp":"<UTC>","signature":"<128 hex>",
 //                     "delete_data":true|false}
@@ -48,7 +51,9 @@
 //   local -> client  {"type":"qa_verify_url","token":"<invite token>"} (2nd instance)
 //                    {"type":"wake"}                              (2nd instance)
 //                    {"type":"shutdown"}                          (Setup replace)
-//                    {"type":"admin_install"}          (Admin Settings Update)
+//                    {"type":"admin_install"}          (Admin Settings Update;
+//                                                       records no capability)
+//                    {"type":"capability_enable","capability":...}  (as from a page)
 //                    {"type":"admin_launch"}           (managed launch handoff)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
 //                    {"type":"update_health"}          (Admin notice query)
@@ -66,15 +71,21 @@
 //                    {"type":"account_api","method","path","body"}  (the evaluation relay:
 //                                                       /v1/evaluations and /v1/assignments only)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
-//                    {"type":"status","version","capabilities","pages","admin"}
+//                    {"type":"status","version","capabilities","pages","admin",
+//                     "enabled":{"dev_tools":bool,"evaluator":bool}}
 //                      (answered on request, and ALSO PUSHED unsolicited to
 //                       every page when the lifecycle state changes: the
-//                       admin block's installed/version/running/updating or
-//                       the uninstalling flag - the P1 status push,
-//                       2026-09-04. Pages treat any status frame as the
-//                       current truth; polling remains the backstop.)
+//                       admin block's installed/version/running/updating,
+//                       the uninstalling flag or the enabled installed
+//                       capabilities - the P1 status push, 2026-09-04.
+//                       Pages treat any status frame as the current truth;
+//                       polling remains the backstop. "capabilities" is the
+//                       client's protocol feature list; "enabled" is the
+//                       INSTALLED capability record, installed_capabilities.hpp.)
 //                    {"type":"accepted"}
 //                    {"type":"admin_install_started"} / {"type":"admin_opened"}
+//                    {"type":"capability_enabled","capability":"<name>",
+//                     "enabled":{"dev_tools":bool,"evaluator":bool}}
 //                    {"type":"admin_update_status","installed",...,"update"}
 //                    {"type":"update_health","blocked":true|false}
 //                    {"type":"evidence_status","assignment_id","counts":{...},
@@ -91,6 +102,15 @@
 // the trust decision, exactly Virule-Setup's), and open launches only the
 // managed Admin installation the client itself placed.
 //
+// INSTALLED CAPABILITIES (0.9.9, shared/installed_capabilities.hpp): the
+// entry point that drove an install decides which capability it adds
+// (dev_tools / evaluator, additive). A PAGE's admin_install records its
+// capability the moment the request is accepted, before the pipeline
+// runs; capability_enable adds one to an installation that already
+// exists. A LOCAL admin_install (the Admin's own Settings Update) records
+// nothing. The record is local presentation only and authorizes nothing:
+// the VIRULE service enforces the account's capabilities on every call.
+//
 // The WebSocket plumbing below (handshake, SHA-1 accept, frame codec) is
 // ported from the VIRULE Admin's qa_bridge, which is live in production.
 
@@ -102,6 +122,7 @@
 #include <vector>
 
 #include "shared/environment.hpp"
+#include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
 #include "shared/protocol_reg.hpp"
@@ -365,12 +386,14 @@ inline std::string build_status_message(const std::string& admin_json) {
         std::to_string(open_page_count()) +
         ",\"qa_last_s\":" + std::to_string(qa_last_s) +
         ",\"uninstalling\":" + (g_uninstalling.load() ? "true" : "false") +
-        ",\"admin\":" + admin_json + "}";
+        ",\"admin\":" + admin_json +
+        ",\"enabled\":" + capabilities::enabled_json() + "}";
 }
 
-// The last lifecycle core (admin block + uninstalling flag) broadcast to
-// pages. Only these fields gate a push: pages/qa_last_s change constantly
-// and are per-request detail, not lifecycle state.
+// The last lifecycle core (admin block + uninstalling flag + the enabled
+// installed capabilities) broadcast to pages. Only these fields gate a
+// push: pages/qa_last_s change constantly and are per-request detail, not
+// lifecycle state.
 inline std::mutex g_push_mutex;
 inline std::string g_last_push_key;
 
@@ -385,7 +408,8 @@ inline void push_lifecycle_status(bool force = false) {
     const std::string admin = g_callbacks.admin_status_json
         ? g_callbacks.admin_status_json() : std::string("null");
     const std::string key = admin +
-        (g_uninstalling.load() ? "|u1" : "|u0");
+        (g_uninstalling.load() ? "|u1" : "|u0") +
+        "|" + capabilities::enabled_json();
     {
         std::lock_guard<std::mutex> lock(g_push_mutex);
         if (!force && key == g_last_push_key) return;
@@ -642,7 +666,8 @@ inline void handle_client(SOCKET client) {
             }
         } else if (g_uninstalling.load() &&
                    (type == "admin_install" || type == "admin_launch" ||
-                    type == "admin_open" || type == "qa_accept" ||
+                    type == "admin_open" || type == "capability_enable" ||
+                    type == "qa_accept" ||
                     type == "qa_verify_url" || type == "setup_takeover")) {
             // ORDERED TEARDOWN: once an explicit uninstall has begun, no
             // lifecycle operation is accepted any more (owner precedence
@@ -650,7 +675,8 @@ inline void handle_client(SOCKET client) {
             if (!reply(0x1, "{\"type\":\"error\"}")) return;
         } else if (g_self_update_draining.load() &&
                    (type == "admin_install" || type == "admin_launch" ||
-                    type == "admin_open" || type == "qa_accept" ||
+                    type == "admin_open" || type == "capability_enable" ||
+                    type == "qa_accept" ||
                     type == "qa_verify_url" || type == "setup_takeover" ||
                     type == "uninstall" || type == "uninstall_local")) {
             // SELF-UPDATE DRAIN: this process exits within moments so its
@@ -666,12 +692,29 @@ inline void handle_client(SOCKET client) {
             // Admin host's control connection), which never asks for one.
             // Local trust model: a local process could run Setup itself, so
             // accepting a local install request weakens nothing.
+            // A PAGE is an entry point: its capability (absent or unknown =
+            // dev_tools, the homepage entry every pre-0.9.9 page is) is
+            // RECORDED here, as the request is accepted and before the
+            // pipeline runs. A LOCAL caller updates an installation that
+            // already exists and records nothing.
             if (g_callbacks.on_admin_install) {
                 const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
                 if (is_page) {
                     g_page_drove.store(true);
                     g_page_drove_admin.store(true);
+                    std::string requested;
+                    (void)js::find_string_in(payload, 0, payload.size(),
+                                             "capability", requested);
+                    const std::string capability =
+                        capabilities::entry_capability(requested);
+                    bool changed = false;
+                    if (!capabilities::enable(capability, &changed)) {
+                        log::client("bridge: could not record capability " + capability);
+                    } else if (changed) {
+                        log::client("bridge: capability " + capability +
+                                    " enabled (admin_install)");
+                    }
                 }
                 g_callbacks.on_admin_install(shortcut, is_page);
                 if (!reply(0x1, "{\"type\":\"admin_install_started\"}")) return;
@@ -741,6 +784,31 @@ inline void handle_client(SOCKET client) {
             } else {
                 if (!reply(0x1, answer)) return;
             }
+        } else if (type == "capability_enable") {
+            // An entry point reached an installation that already exists
+            // (the evaluator's "Install VIRULE" with VIRULE present, or the
+            // Admin itself): ADD the capability, never remove another, and
+            // never reinstall. Page or local alike: the record is local
+            // presentation only and authorizes nothing at the service.
+            std::string capability;
+            (void)js::find_string_in(payload, 0, payload.size(), "capability",
+                                     capability);
+            bool changed = false;
+            if (!capabilities::enable(capability, &changed)) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+                continue;
+            }
+            if (changed) {
+                log::client("bridge: capability " + capability + " enabled");
+            }
+            if (!reply(0x1, "{\"type\":\"capability_enabled\",\"capability\":\"" +
+                            capability + "\",\"enabled\":" +
+                            capabilities::enabled_json() + "}")) {
+                return;
+            }
+            // Every open page converges at once (the push key carries the
+            // enabled record, so the 1 s watcher would also see it).
+            if (changed) push_lifecycle_status();
         } else if (type == "admin_open" && is_page) {
             const bool opened = g_callbacks.on_admin_open &&
                                 g_callbacks.on_admin_open();

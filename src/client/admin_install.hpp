@@ -264,17 +264,18 @@ inline std::string authoritative_admin_version() {
 inline void reconcile_installed_version() {
     if (!admin_installed()) return;
     const std::string from_install = installed_release_version();
-    auto s = state::load();
     if (!from_install.empty()) {
-        if (s.admin_version != from_install) {
+        (void)state::update([&](state::State& s) {
+            if (s.admin_version == from_install) return false;
             log::client("admin: recovered installed version " + from_install +
                         " from install metadata (state said '" +
                         s.admin_version + "')");
             s.admin_version = from_install;
-            (void)state::save(s);
-        }
+            return true;
+        });
         return;
     }
+    const auto s = state::load();
     if (!s.admin_version.empty()) {
         std::ofstream out(installed_release_file(),
                           std::ios::binary | std::ios::trunc);
@@ -1279,11 +1280,12 @@ constexpr long long kHoldClaimSuppressS = 90;
 constexpr long long kHoldLaunchRetryS = 6ll * 60ll * 60ll;
 
 inline void persist_hold_locked() {
-    auto s = state::load();
-    s.admin_hold_version = g_hold_version;
-    s.admin_hold_failed_utc = g_hold_failed_utc;
-    s.admin_hold_until_utc = g_hold_until_utc;
-    (void)state::save(s);
+    (void)state::update([](state::State& s) {
+        s.admin_hold_version = g_hold_version;
+        s.admin_hold_failed_utc = g_hold_failed_utc;
+        s.admin_hold_until_utc = g_hold_until_utc;
+        return true;
+    });
 }
 
 inline bool launch_update_on_hold(const std::string& approved,
@@ -1809,12 +1811,11 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
     // launch-update failure hold: a fresh successful install/update is
     // proof the pipeline works again, and a hold for the version that
     // just landed (or an older one) is moot by definition.
-    {
-        auto s = state::load();
+    (void)state::update([&](state::State& s) {
         s.admin_version = manifest.version;
         if (shortcut) s.created_desktop_shortcut = true;
-        (void)state::save(s);
-    }
+        return true;
+    });
     clear_launch_update_hold();
 
     // 9. The desktop shortcut, when the browser's intent asked for one.

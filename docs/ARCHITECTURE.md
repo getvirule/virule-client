@@ -7,7 +7,9 @@ Last verified 2026-09-10, against client v0.8.3; the usage check-in and
 update-health sections were written against v0.8.6 (2026-10-01); residency
 (VIRULE Service), the manifest's service fields and Setup's service
 placement against v0.9.0 (2026-10-06); evaluation evidence delivery
-against the 2026-10-14 tree; the VIRULE account against v0.9.4 (2026-10-15).
+against the 2026-10-14 tree; the VIRULE account against v0.9.4 (2026-10-15);
+installed capabilities, the message table, the handoff envelope and the
+takeover against v0.9.9 (2026-10-16).
 The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
@@ -112,9 +114,10 @@ in both components).
 
 | From | Message | Effect |
 |---|---|---|
-| page | `{"type":"status"}` | version, capability list, connected-page count, the Admin status block |
+| page | `{"type":"status"}` | version, protocol feature list (`capabilities`), connected-page count, the Admin status block, and `enabled` `{"dev_tools":bool,"evaluator":bool}`, the installed capabilities (v0.9.9, see "Installed capabilities") |
 | page | `{"type":"qa_accept","token":"<invite token>"}` | asynchronous QA redemption (below) |
-| page/local | `{"type":"admin_install","shortcut":true\|false}` | the verified staged Admin install/update (below); a LOCAL sender is the Admin's own Settings Update through its host, shortcut always false there |
+| page/local | `{"type":"admin_install","shortcut":true\|false,"capability":"dev_tools"\|"evaluator"}` | the verified staged Admin install/update (below). From a PAGE the entry point's `capability` (absent or unrecognized = `dev_tools`) is RECORDED as the request is accepted, before the pipeline runs (v0.9.9). A LOCAL sender is the Admin's own Settings Update through its host: shortcut always false, and it records no capability |
+| page/local | `{"type":"capability_enable","capability":"dev_tools"\|"evaluator"}` | adds one installed capability to an existing installation, never removing another and never reinstalling (v0.9.9); answers `{"type":"capability_enabled","capability","enabled":{"dev_tools","evaluator"}}`, an unknown or missing capability answers `error`; refused while uninstalling and during the self-update drain; a change pushes `status` to pages at once |
 | page | `{"type":"admin_open"}` | launch the managed Admin installation, and nothing else |
 | page | `{"type":"surface_ack"}` | the page states its next feedback view is rendered and active (the Setup takeover's browser acknowledgement) |
 | page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
@@ -127,7 +130,7 @@ in both components).
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
-| local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4). Never a token |
+| local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4); ALWAYS, signed in or out, `enabled{dev_tools,evaluator}`, the installed capabilities (v0.9.9). Never a token |
 | local | `{"type":"account_sign_in"}` / `{"type":"account_sign_in_cancel"}` | start (idempotent) / cancel the browser sign-in |
 | local | `{"type":"account_sign_out"}` | revoke at the service (bounded), then forget locally |
 | local | `{"type":"account_refresh"}` | re-confirm the account and capabilities with the service (asynchronous) |
@@ -143,7 +146,8 @@ ordered teardown's transitions; `complete` (v0.8.2) is the POSITIVE
 terminal signal sent once the removal is committed, see "Uninstall"), and,
 the P1 lifecycle
 status push (v0.6.3), UNSOLICITED `status` frames whenever the lifecycle
-core changes (the admin block or the `uninstalling` flag): a 1 s watcher
+core changes (the admin block, the `uninstalling` flag or, v0.9.9, the
+`enabled` installed capabilities): a 1 s watcher
 while pages are connected plus immediate pushes at operation boundaries
 (update start/end, Admin launch, teardown start), so open virule.app tabs
 converge in about a second instead of their 15 s poll, which stays as the
@@ -746,8 +750,10 @@ pending operation over while the install runs. CLOSED and versioned:
 - hello `{"virule_setup":1,"v":1}`;
 - exactly one envelope is kept (first valid wins):
   `{"type":"handoff","v":1,"op":"QA_ACCEPT","token","game"}` or
-  `{"type":"handoff","v":1,"op":"INSTALL_ADMIN","shortcut"}`; anything
-  else answers `{"type":"error"}`;
+  `{"type":"handoff","v":1,"op":"INSTALL_ADMIN","shortcut","capability"}`
+  (v0.9.9: `capability` is the entry point, `dev_tools` or `evaluator`;
+  absent or anything else is kept as `dev_tools`); anything else answers
+  `{"type":"error"}`;
 - no URL, no path, no executable, no filesystem capability of any kind;
 - Setup treats it as opaque and the client revalidates all authorization
   (a QA token still has to survive service redemption; an Admin install
@@ -784,7 +790,11 @@ surfaces, and Setup is never released into neither.
   launched Admin is VISIBLE; envelope-driven and page-driven installs
   converge on the ONE `g_busy` operation whichever starts first, and an
   already-current installed Admin short-circuits to a watched open (never
-  re-downloads the package).
+  re-downloads the package). The takeover's INSTALL_ADMIN carries the
+  envelope's `capability` (validated like the page's: absent or unknown =
+  `dev_tools`), and the client RECORDS it first, before either the
+  watched open or the install (v0.9.9). QA_ACCEPT and the standalone
+  takeover record nothing.
 
 THE LAST HOP IS PROVEN LIKE EVERY OTHER, BY WHAT THE USER SEES (v0.8.0
 dead-air fix, corrected v0.8.3, 2026-09-10): every card that ends in an
@@ -925,7 +935,9 @@ key). A forged record can at most reopen a page. It is cleared at every
 terminal state.
 
 `INSTALL_ADMIN` also carries the desktop-shortcut preference asked at the
-protocol preflight. The moment a client is connected with `INSTALL_ADMIN`
+protocol preflight and, v0.9.9, the entry point's `capability` (see
+"Installed capabilities"), on `admin_install` and on the Setup envelope
+alike. The moment a client is connected with `INSTALL_ADMIN`
 pending, the page hands the install over (`admin_install`, the shortcut
 preference riding along) and shows only "Installing VIRULE..." - there is
 no stopping point and no second install button. An already-installed
@@ -1004,6 +1016,47 @@ whichever is first, then exits (`bridge::wait_pages_closed`). The site's
 the fallback for a client that died mid-teardown without sending it. A
 failed removal keeps the latch AND the registrations
 (Windows-recoverable) and offers Try again on the card.
+
+## Installed capabilities (0.9.9)
+
+`src/shared/installed_capabilities.hpp`, persisted in `client\state.json`
+(`enabled_recorded`, `enabled_dev_tools`, `enabled_evaluator`). VIRULE is
+ONE installation (one Virule-Setup.exe, one managed Admin package) whose
+capabilities are acquired through ENTRY POINTS (owner ruling 2026-10-16):
+
+- the homepage "Get VIRULE Dev Tools" entry enables `dev_tools` (the Admin
+  shows Games, Evaluations, Campaigns);
+- an evaluator's "Install VIRULE" entry (the website account page) enables
+  `evaluator` (the Admin shows Assignments).
+
+The entry point determines the capability, and the existing handoff carries
+it: a page's `admin_install` (recorded as the request is accepted), the
+Setup envelope through the takeover (recorded at the start of the
+INSTALL_ADMIN run), or `capability_enable` for an installation that already
+exists (no reinstall). Capabilities are ADDITIVE: receiving one never
+removes another. The Admin reads the record from `account_status`, the
+website from `status`, both as `enabled{dev_tools,evaluator}`.
+
+LOCAL PRESENTATION ONLY, NEVER AUTHORIZATION. The record grants nothing at
+the VIRULE service, which enforces the account's capabilities on every
+call. Navigation in the Admin requires BOTH the local capability and, where
+the workspace uses the service, the account's capability.
+
+MIGRATION, one time, at client startup (after the installed-version
+reconciliation): an installation with no record gains `dev_tools` when the
+managed Admin is installed (every Admin installed before 0.9.9 came
+through the Dev Tools entry point) and never `evaluator`. The migration
+only adds, so a capability recorded in the moments before it ran is kept.
+
+Every uninstall removes it with the client state directory, so a reinstall
+starts fresh. QA is untouched: a QA invitation keeps its per-game QA
+credential flow and records nothing here (QA credentials are not
+capabilities of this record).
+
+Every in-process state.json read-modify-write goes through
+`state::update()` under one mutex, and `State` carries every field, so no
+writer can drop another's fields. Proof: `tools/takeover_test.mjs`
+scenarios 8 and 9 (`--staging --only=8,9`).
 
 ## The managed VIRULE Admin installation (Phase 2)
 

@@ -674,11 +674,11 @@ inline void reconcile_startup_residue(bool listening) {
 // job). virule:// self-heal already runs in serve().
 inline void refresh_installed_identity() {
     if (!g_enabled.load()) return;
-    auto s = state::load();
-    if (s.installed_version != VIRULE_CLIENT_VERSION_STRING) {
+    (void)state::update([](state::State& s) {
+        if (s.installed_version == VIRULE_CLIENT_VERSION_STRING) return false;
         s.installed_version = VIRULE_CLIENT_VERSION_STRING;
-        (void)state::save(s);
-    }
+        return true;
+    });
     // A redirected (test-sandbox) world heals only its own filesystem
     // mirror above; the registry is the real machine's and stays untouched.
     // The "ours" check below is no defense there: a contaminated entry's
