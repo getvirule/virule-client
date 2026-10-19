@@ -14,7 +14,9 @@
 // kind. Three states:
 //
 //   Working    "Setting up VIRULE…"     + a subtle indeterminate bar
-//   Complete   "Setup is complete." briefly, then the window closes itself
+//   Complete   "Continuing…" briefly, then the window closes itself
+//              (never a completion claim: VIRULE may still be installing,
+//              or waiting on the site; owner brief 2026-10-19)
 //   Failed     one short human sentence; the technical reason goes to the
 //              log, never here
 //
@@ -335,10 +337,11 @@ inline void set_state(Stage stage, const std::wstring& line) {
     if (HWND hwnd = g_hwnd.load()) PostMessageW(hwnd, kMsgRefresh, 0, 0);
 }
 
-// The completion state: shown briefly once the client has taken over (the
-// next surface is already visible), then the window closes itself.
+// Setup's part is done: shown briefly once the client has taken over (the
+// next surface is already visible and says what is happening), then the
+// window closes itself. It claims nothing about VIRULE being installed.
 inline void set_complete() {
-    set_state(Stage::Complete, L"Setup is complete.");
+    set_state(Stage::Complete, L"Continuing…");
 }
 
 // One short, human, non-technical sentence. The reason belongs in the log.

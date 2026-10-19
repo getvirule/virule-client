@@ -13,7 +13,8 @@
 //      operation itself even though a page is connected; it never steps
 //      aside into native dead air.
 //   3. setup_takeover with NO envelope (standalone): released only after
-//      the full grace watch, via the native "VIRULE is ready" card (a
+//      the full grace watch, via the native standalone card, which reads
+//      "Finish installing from the site" while VIRULE is not installed (a
 //      merely-connected idle page no longer suppresses it).
 //   4. Version recovery (the false-"up to date" fix): metadata file wins,
 //      state.json heals, and an UNKNOWN installed version never claims an
@@ -634,6 +635,12 @@ async function main() {
     // pre-empts the standalone conclusion.
     check("release respected the full grace watch (>=9s)",
       elapsed >= 9000, `${elapsed}ms`);
+    // No VIRULE installed in this sandbox: the card never claims completion
+    // (owner brief 2026-10-19), it says what is left.
+    const cLog = fs.readFileSync(path.join(root, "VIRULE", "client", "logs", "virule-client.log"), "utf8");
+    check("with no VIRULE installed the card reads Finish installing from the site",
+      cLog.includes("standalone surface: Finish installing from the site") && !cLog.includes("standalone surface: VIRULE is ready"),
+      cLog.split("\n").filter((l) => l.includes("standalone surface")).join(" | "));
     local.end();
     await stopClient();
   }
@@ -845,8 +852,8 @@ async function main() {
     check("released (standalone conclusion reached)", await pollReleased(local, 20000));
     const logFile = path.join(root, "VIRULE", "client", "logs", "virule-client.log");
     const logNow = () => { try { return fs.readFileSync(logFile, "utf8"); } catch { return ""; } };
-    check("standalone completion surface reached",
-      logNow().includes("standalone completion surface"),
+    check("standalone surface reached",
+      logNow().includes("takeover: standalone surface:"),
       logNow().split("\n").slice(-5).join(" | "));
     // THE LATE BROWSER: a page connects and drives admin_install (the
     // pending INSTALL_ADMIN it held all along).
@@ -906,7 +913,7 @@ async function main() {
       logNow().includes("browser-owned Admin operation; native continuation"),
       logNow().split("\n").slice(-5).join(" | "));
     check("Ready/Continue never flashed",
-      !logNow().includes("standalone completion surface"),
+      !logNow().includes("takeover: standalone surface:"),
       logNow().split("\n").slice(-5).join(" | "));
     // Shut down promptly (the doomed sandbox install again).
     page.end();

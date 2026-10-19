@@ -474,7 +474,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         // conclusion (P1 2026-09-04: a browser that was asleep or closed
         // during the takeover grace delivers its pending INSTALL_ADMIN
         // late; the page owns the flow from that moment and a standing
-        // "VIRULE is ready" card must close, never stand beside it).
+        // standalone card must close, never stand beside it).
         if (from_page) vclient::takeover::supersede_standalone();
         struct Arg { bool shortcut; bool native_feedback; };
         auto* arg = new Arg{ shortcut, !from_page };

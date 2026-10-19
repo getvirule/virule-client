@@ -15,7 +15,7 @@
 //
 // VISIBLE SURFACE (setup_window.hpp): one small native card, "Setting up
 // VIRULE..." until the client acknowledges ownership, then a brief
-// "Setup is complete.", then it closes itself. A VIRULE surface must never
+// "Continuing…", then it closes itself. A VIRULE surface must never
 // disappear until the next VIRULE surface is ready (owner invariant): Setup
 // closes ONLY after the client reports that the next feedback surface (a
 // live virule.app page, or a client-owned native card) is already visible.
@@ -145,7 +145,7 @@ constexpr DWORD kReleaseTimeoutMs = 240000;
 // (crashed, killed); Setup leaves rather than lingering uselessly.
 constexpr DWORD kReleasePollDeadMs = 15000;
 
-// The brief completion state ("Setup is complete."). The next surface is
+// The brief completion state ("Continuing…"). The next surface is
 // already visible by the time this shows, so it only needs a beat.
 constexpr DWORD kCompleteVisibleMs = 1400;
 

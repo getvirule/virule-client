@@ -37,10 +37,14 @@
 //            completes an operation ("Updating…", "Finishing up…"): the
 //            Setup card's indeterminate bar, not dismissible, no
 //            auto-close; it becomes a Result via update().
-//   Ready    the branded standalone completion surface for a Setup run
-//            with no recoverable browser intent: "VIRULE is ready" and ONE
-//            explicit [ Continue ] action (opens virule.app in the default
-//            browser). Nothing opens a browser except that click.
+//   Ready    the branded standalone surface for a Setup run with no
+//            recoverable browser intent, and ONE explicit [ Continue ]
+//            action (opens this build's site, env::kSiteUrl, in the default
+//            browser). Nothing opens a browser except that click. Its line
+//            says what is TRUE (owner brief 2026-10-19): "VIRULE is ready"
+//            only when VIRULE itself is installed; with only the client in
+//            place, "Finish installing from the site", whose action there
+//            reads Finish installing.
 //
 // The card is the "next visible feedback surface" the ownership invariant
 // requires before Virule-Setup (or a closing Admin) is allowed to
@@ -565,11 +569,14 @@ inline void show_working(const std::string& primary_utf8,
     start_thread(Mode::Working, /*branded=*/true, primary_utf8, secondary_utf8);
 }
 
-// The standalone Setup completion surface: no recoverable intent, one
-// explicit way onward (owner copy 2026-09-03: the branded window already
-// says VIRULE; the single action is Continue).
-inline void show_ready() {
-    start_thread(Mode::Ready, /*branded=*/true, "VIRULE is ready", "");
+// The standalone Setup surface: no recoverable intent, one explicit way
+// onward (owner copy 2026-09-03: the single action is Continue). Never a
+// completion claim before the installation is complete (owner brief
+// 2026-10-19): `admin_installed` false means Setup placed the client and
+// VIRULE itself is still to be installed from the site.
+inline void show_ready(bool admin_installed) {
+    start_thread(Mode::Ready, /*branded=*/true,
+                 admin_installed ? "VIRULE is ready" : "Finish installing from the site", "");
 }
 
 // Turn the visible card into a Result with new copy (a Working card's

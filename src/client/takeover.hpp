@@ -14,14 +14,17 @@
 //     actively drove the operation over the bridge (qa_accept /
 //     admin_install), or is at least connected and rendering;
 //   - a client-owned native card is visible (the QA continuation card, the
-//     Admin install card, or the standalone "VIRULE is ready" card).
+//     Admin install card, or the standalone card: "Finish installing from
+//     the site", or "VIRULE is ready" when VIRULE is already installed).
 //
 // THE SINGLE AUTHORITATIVE DECISION (owner handoff rule, P1 final
 // correction 2026-09-04). A Setup takeover terminates in exactly ONE of
 // two native surfaces, and Setup is never released into neither:
 //
 //   PENDING INTENT EXISTS  ->  the native continuation "Finishing up…"
-//   NO PENDING INTENT      ->  the standalone "VIRULE is ready" card
+//   NO PENDING INTENT      ->  the standalone card ("Finish installing from
+//                              the site"; "VIRULE is ready" only when VIRULE
+//                              is already installed)
 //
 // The existence of a live browser page does NOT waive the native
 // continuation: the page renders its own progress IN PARALLEL, it never
@@ -323,8 +326,11 @@ inline void run_standalone() {
     // late browser-owned operation revokes the standing card through
     // supersede_standalone).
     g_standalone_terminal.store(true);
-    log::client("takeover: standalone completion surface");
-    result_card::show_ready();
+    const bool admin_present = admin_install::admin_installed();
+    log::client(admin_present
+        ? "takeover: standalone surface: VIRULE is ready"
+        : "takeover: standalone surface: Finish installing from the site");
+    result_card::show_ready(admin_present);
     release_when_card_visible();
     // A revocation that raced the card's creation still wins: the show
     // above is what it could not close yet.
@@ -336,7 +342,7 @@ inline void run_standalone() {
 
 // A browser-owned operation surfaced AFTER the standalone conclusion
 // became terminal (a closed/throttled tab delivering its durable intent
-// late): the standing "VIRULE is ready" card closes; the operation owns
+// late): the standing standalone card closes; the operation owns
 // the flow now. BEFORE the conclusion is terminal this is deliberately a
 // no-op - the watch itself converts a live arrival into the native
 // continuation (and Setup is still waiting on that thread's release, so

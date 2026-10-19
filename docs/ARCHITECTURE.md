@@ -57,7 +57,7 @@ development never sees it.
 DENIED IS A STATE, NOT AN ABSENCE (site, 2026-09-10). A denied permission
 blocks the bridge (47612) AND the Setup handoff channel (47613) alike, so
 an INSTALL_ADMIN intent has no delivery route and re-offering the
-installer only loops (Setup -> "VIRULE is ready" -> Get VIRULE -> Download
+installer only loops (Setup -> "Finish installing from the site" -> Get VIRULE -> Download
 -> Setup, with Admin never installed). The homepage keeps the ONE
 PermissionStatus from its query, treats `denied` as its own connection
 state (`blocked`: once the user has clicked Get VIRULE, a recovery view
@@ -85,7 +85,7 @@ status; no client -> only now does `virule://open` wake one and the
 bounded wake wait run, and only its expiry offers Download. The order is
 therefore always permission resolution -> client detection -> fallback
 wake -> installer offer, so a fresh install can no longer reach Setup
-(and the standalone "VIRULE is ready" card) merely because the user has
+(and the standalone card) merely because the user has
 not answered the browser yet. Firefox exception, from its prompt model:
 a Get VIRULE attempt REFUSED within 4 s while the answer is still
 `prompt` means nothing is listening and Firefox will not ask yet, so the
@@ -723,7 +723,7 @@ component list, no license page and no user choice of any kind.
 | State | Copy |
 |---|---|
 | Working | `Setting up VIRULE...` + a subtle indeterminate bar, held until the client releases Setup |
-| Complete | `Setup is complete.` briefly, then it closes itself |
+| Complete | `Continuing…` briefly, then it closes itself (never a completion claim; 2026-10-19) |
 | Failed | one short human sentence; the technical reason goes to the log only |
 
 The status line sits at the same coordinates in every state. The
@@ -856,10 +856,19 @@ ends a dead transfer long before either fires); raise both together or
 neither.
 - NO PENDING INTENT (the bounded watch expires with no operation; a
   merely-connected idle page is NOT an operation and does not suppress
-  this) -> the standalone branded "VIRULE is ready" card with the ONE
-  explicit `[ Continue ]` action. Only that click opens a browser
-  (virule.app, in the Windows default); the homepage's continuous
-  detection then resolves the machine's real state. The card is TERMINAL
+  this) -> the standalone branded card with the ONE explicit
+  `[ Continue ]` action. Its line never claims completion before there is
+  one (owner brief 2026-10-19): "Finish installing from the site" while
+  VIRULE (the managed Admin) is not installed, whose site action reads
+  Finish installing; "VIRULE is ready" only when it is. Only that click
+  opens a browser: THIS BUILD'S site (`env::kSiteUrl`: virule.app in
+  production, the staging origin in a staging build), in the Windows
+  default; the homepage's continuous detection then resolves the
+  machine's real state, and a browser intent the site still holds (an
+  evaluator's, say) keeps its capability. A Setup of the OTHER
+  environment cannot know about this one: a production Setup always
+  continues to virule.app, so staging QA uses the Setup the staging site
+  downloads (see Environments). The card is TERMINAL
   but REVOCABLE: a browser-owned operation arriving late (a
   closed/throttled tab delivering its durable intent) supersedes it, and
   a mid-watch arrival is instead converted live into the continuation so
