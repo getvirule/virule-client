@@ -220,7 +220,16 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   page the listener serves is Smoky Blue with the canonical mark, light or
   dark: the authorize page appends `ui=light|dark` (its own resolved theme)
   to the redirect, and without it the browser's preference decides; `ui` is
-  presentation only. Ten-minute bound; Cancel ends it.
+  presentation only. Ten-minute bound; Cancel ends it. ONE PENDING
+  SIGN-IN, REOPENABLE (0.9.11): another `account_sign_in` while the browser
+  step waits starts nothing new; it opens the SAME authorize page again (the
+  same request_uri, listener and PKCE pair; answer `{started: true,
+  reopened: true}`), so a closed tab or a browser that opened behind VIRULE
+  is never a dead end and two clicks never make two authorizations. While
+  the request is being prepared, or the code exchanged, it opens nothing.
+  A cancelled sign-in is never reopened. The Admin host lets the browser
+  take the foreground (AllowSetForegroundWindow from the window the person
+  clicked) before it asks; the Client itself never forces a window.
 - Device key: `security\account_device.cred` (Ed25519, DPAPI user scope,
   entropy `virule-account-device.v1`). NOT dev_machine.cred, which the Admin
   may replace; the machine public key is sent as information only. THE KEY

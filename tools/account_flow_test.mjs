@@ -297,6 +297,43 @@ try {
     check("a sign-in cancelled in the browser leaves the Client signed out", res.status === 200 && after?.signed_in === false, after);
   }
 
+  // --- ONE PENDING SIGN-IN, REOPENABLE (account.hpp header): Sign In again
+  // while the browser step waits opens the SAME page (a closed tab, or a
+  // browser that opened behind VIRULE), never a second request.
+  {
+    const pars = () => identity.prepare("SELECT COUNT(*) n FROM oauth_requests").get().n;
+    const devices = () => identity.prepare("SELECT COUNT(*) n FROM devices").get().n;
+    await bridge('{"type":"account_sign_in"}');
+    const p1 = await waitStatus((x) => !!x.test_authorize_url);
+    const reqs = pars(), devs = devices(), opened = p1.test_reopened;
+    const again = JSON.parse(await bridge('{"type":"account_sign_in"}'));
+    const twice = JSON.parse(await bridge('{"type":"account_sign_in"}'));
+    const p2 = await status();
+    check("Sign In while the browser step waits opens the same page again, twice over",
+      again.reopened === true && twice.reopened === true && p2.test_reopened === opened + 2, { again, twice, p2 });
+    check("...with no new sign-in request and the same pending page",
+      pars() === reqs && p2.phase === "browser" && p2.test_authorize_url === p1.test_authorize_url, p2);
+    // The tab was closed: the page opened again completes the SAME sign-in.
+    const requestUri = new URL(p2.test_authorize_url).searchParams.get("request_uri");
+    const ap = await site("/authorize/approve", { client_id: "virule-desktop", request_uri: requestUri });
+    const ok = await deliver(ap.body.redirect, { iss: SEAM });
+    const done = await waitStatus((x) => x.signed_in && x.account);
+    check("the reopened page completes the sign-in", ok.status === 200 && done?.signed_in === true, done);
+    check("...as exactly one device authorization", devices() === devs + 1);
+    await bridge('{"type":"account_sign_out"}');
+    await waitStatus((x) => x.signed_in === false);
+    await bridge('{"type":"account_sign_in"}');
+    await waitStatus((x) => !!x.test_authorize_url);
+    await bridge('{"type":"account_sign_in_cancel"}');
+    const again2 = JSON.parse(await bridge('{"type":"account_sign_in"}'));
+    check("Sign In right after Cancel never opens the cancelled sign-in's page",
+      again2.reopened !== true && (await status()).test_reopened === p2.test_reopened, again2);
+    // (Had the cancelled flow already ended, that Sign In began a fresh one.)
+    await bridge('{"type":"account_sign_in_cancel"}');
+    const ended = await waitStatus((x) => x.phase === "idle");
+    check("...which ends as cancelled", ended?.phase === "idle" && ended.error === "cancelled", ended);
+  }
+
   // --- sign in again, then the QA link, then sign out
   const r6 = await signInOnce({ ui: "light" });
   const s6 = await waitStatus((x) => x.signed_in && x.account);

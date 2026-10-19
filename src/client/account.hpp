@@ -23,6 +23,17 @@
 //      server-decided capabilities.
 //   6. The Admin polls {"type":"account_status"} and reflects the account.
 //
+// ONE PENDING SIGN-IN, REOPENABLE (2026-10-19). While a sign-in waits on
+// the browser, another account_sign_in starts NOTHING new: it opens the
+// SAME pending sign-in page again (the same request_uri, the same loopback
+// listener, the same PKCE pair), so a person who closed the tab, or whose
+// browser opened behind VIRULE, can always get back to it, and two clicks
+// can never make two competing authorizations. The page stays usable for
+// the request's ten minutes (PAR); after that the flow ends ("timeout")
+// and the next account_sign_in starts a fresh one. A sign-in that is
+// exchanging its code reopens nothing. The authorize URL carries only the
+// opaque request_uri, never a token or the verifier.
+//
 // WHAT NEVER LEAVES THIS PROCESS: the refresh token, the access token, the
 // PKCE verifier and the device key. No bridge message returns any of them,
 // and nothing here logs one. account_* messages are LOCAL-ONLY (no Origin):
@@ -263,6 +274,12 @@ struct State {
     bool offline = false;
     std::string last_error;          // short machine code, never a secret
     unsigned long long flow_id = 0;  // increments per sign-in attempt
+    // The pending sign-in's authorize page while it waits on the browser
+    // (opaque request_uri only), so account_sign_in can open it again.
+    std::string authorize_url;
+    // DEVELOPMENT SEAM ONLY: how many times the pending page was opened
+    // again (reported only while a test seam is active).
+    unsigned reopened = 0;
     // DEVELOPMENT SEAM ONLY (--account-endpoint): the authorize URL the
     // browser would have opened, surfaced so a harness can play the
     // browser. Never set, never reported, in a normal run.
@@ -668,6 +685,7 @@ inline void finish_flow(unsigned long long id, const char* error) {
     st().phase = Phase::idle;
     st().last_error = error;
     st().test_authorize_url.clear();
+    st().authorize_url.clear();
 }
 
 inline void run_flow(unsigned long long id) {
@@ -698,6 +716,10 @@ inline void run_flow(unsigned long long id) {
     }
 
     const std::string url = site_origin() + "/authorize/?client_id=" + kClientId + "&request_uri=" + form_escape(request_uri);
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        if (st().flow_id == id && st().phase == Phase::browser) st().authorize_url = url;
+    }
     if (test_seam_active()) {
         // Test seam: a harness plays the browser.
         std::lock_guard<std::mutex> lock(st().m);
@@ -716,7 +738,10 @@ inline void run_flow(unsigned long long id) {
     closesocket(listener);
     if (!cb.ok) { finish_flow(id, cb.error.empty() ? "denied" : cb.error.c_str()); return; }
 
-    { std::lock_guard<std::mutex> lock(st().m); if (st().flow_id == id) st().phase = Phase::exchanging; }
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        if (st().flow_id == id) { st().phase = Phase::exchanging; st().authorize_url.clear(); }
+    }
     std::lock_guard<std::mutex> tl(token_mutex());
     const Reply tok = call(L"POST", "POST", "/v1/oauth/token",
         "grant_type=authorization_code&client_id=" + std::string(kClientId) + "&code=" + form_escape(cb.code) +
@@ -837,6 +862,7 @@ inline std::string status_json() {
         if (test_seam_active() && s.phase == Phase::browser && !s.test_authorize_url.empty()) {
             out += ",\"test_authorize_url\":\"" + s.test_authorize_url + "\"";
         }
+        if (test_seam_active()) out += ",\"test_reopened\":" + std::to_string(s.reopened);
         if (test_seam_active() && !s.test_settings_url.empty()) {
             out += ",\"test_settings_url\":\"" + s.test_settings_url + "\"";
         }
@@ -879,14 +905,36 @@ inline std::string status_json() {
 
 inline std::string start_sign_in() {
     unsigned long long id = 0;
+    std::string reopen;
     {
         std::lock_guard<std::mutex> lock(st().m);
         ensure_loaded_locked(st());
-        if (st().phase != Phase::idle) return "{\"type\":\"account_sign_in\",\"started\":true}";
-        st().phase = Phase::browser;
-        st().last_error.clear();
-        st().test_authorize_url.clear();
-        id = ++st().flow_id;
+        if (st().phase == Phase::browser && !st().authorize_url.empty()) {
+            // ONE PENDING SIGN-IN, REOPENABLE (header): the same page again.
+            reopen = st().authorize_url;
+            if (test_seam_active()) { ++st().reopened; reopen.clear(); }
+        } else if (st().phase != Phase::idle) {
+            // Still preparing the request, or exchanging the code: nothing
+            // to open yet, and nothing new is started.
+            return "{\"type\":\"account_sign_in\",\"started\":true}";
+        } else {
+            st().phase = Phase::browser;
+            st().last_error.clear();
+            st().test_authorize_url.clear();
+            st().authorize_url.clear();
+            id = ++st().flow_id;
+        }
+    }
+    if (id == 0) {
+        if (!reopen.empty()) {
+            // Off the bridge thread: the shell can take a moment.
+            std::thread([reopen] {
+                const std::wstring w = widen(reopen);
+                ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                log::client("account: sign-in page opened again");
+            }).detach();
+        }
+        return "{\"type\":\"account_sign_in\",\"started\":true,\"reopened\":true}";
     }
     g_cancel.store(false);
     std::thread([id] { run_flow(id); }).detach();
@@ -894,6 +942,12 @@ inline std::string start_sign_in() {
 }
 
 inline std::string cancel_sign_in() {
+    {
+        // A cancelled sign-in's page is never opened again, even before its
+        // flow notices the cancel.
+        std::lock_guard<std::mutex> lock(st().m);
+        st().authorize_url.clear();
+    }
     g_cancel.store(true);
     return "{\"type\":\"account_sign_in_cancel\",\"ok\":true}";
 }
