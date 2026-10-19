@@ -232,6 +232,29 @@ function killByName(name) {
   try { execFileSync("taskkill.exe", ["/IM", name, "/F", "/T"], { stdio: "ignore" }); } catch {}
 }
 
+// Every process running FROM the sandbox (the client Setup installed, and
+// the VIRULE Service Setup placed and started beside it). Matched by
+// executable path, never by name: the owner's real VIRULE Service runs
+// under the same name and must be left alone.
+function killSandboxProcesses() {
+  const ps = "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and " +
+    "$_.ExecutablePath.StartsWith($env:VIRULE_TEST_SANDBOX, [StringComparison]::OrdinalIgnoreCase) } | " +
+    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+  try {
+    execFileSync("powershell.exe", ["-NoProfile", "-Command", ps],
+      { stdio: "ignore", env: { ...process.env, VIRULE_TEST_SANDBOX: SANDBOX } });
+  } catch {}
+}
+
+function sandboxProcessRunning() {
+  const ps = "@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and " +
+    "$_.ExecutablePath.StartsWith($env:VIRULE_TEST_SANDBOX, [StringComparison]::OrdinalIgnoreCase) }).Count";
+  try {
+    return Number(execFileSync("powershell.exe", ["-NoProfile", "-Command", ps],
+      { encoding: "utf8", env: { ...process.env, VIRULE_TEST_SANDBOX: SANDBOX } }).trim()) > 0;
+  } catch { return false; }
+}
+
 // =============================================================== the test ===
 async function main() {
   console.log("VIRULE STAGING ENVIRONMENT end-to-end test");
@@ -239,6 +262,7 @@ async function main() {
   console.log(`  sandbox     : ${SANDBOX}`);
   console.log("");
 
+  killSandboxProcesses(); // a crashed earlier run's leftovers
   fs.rmSync(SANDBOX, { recursive: true, force: true });
   fs.mkdirSync(SANDBOX, { recursive: true });
   const arpSnapshot = readRealArp();
@@ -271,8 +295,10 @@ async function main() {
   // ---------------------------------------------------------------------
   console.log("2. the site bundles carry ONE environment each");
   {
+    // Every script chunk: the install flow (and with it the Setup url) is
+    // its own chunk since the 0.9.9 entry-point work (useInstallFlow-*.js).
     const stagingJs = fs.readdirSync(path.join(SITE_STAGING_DIST, "assets"))
-      .filter((f) => f.startsWith("main-") && f.endsWith(".js"))
+      .filter((f) => f.endsWith(".js"))
       .map((f) => fs.readFileSync(path.join(SITE_STAGING_DIST, "assets", f), "utf8")).join("");
     check("the staging bundle offers the STAGING Setup",
       stagingJs.includes(`${STAGING_REPO}/releases/download/client-staging/Virule-Setup.exe`));
@@ -280,7 +306,7 @@ async function main() {
       !stagingJs.includes("getvirule/virule-client/releases"));
     if (fs.existsSync(path.join(SITE_PROD_DIST, "assets"))) {
       const prodJs = fs.readdirSync(path.join(SITE_PROD_DIST, "assets"))
-        .filter((f) => f.startsWith("main-") && f.endsWith(".js"))
+        .filter((f) => f.endsWith(".js"))
         .map((f) => fs.readFileSync(path.join(SITE_PROD_DIST, "assets", f), "utf8")).join("");
       check("the production bundle offers the PRODUCTION Setup",
         prodJs.includes("getvirule/virule-client/releases/latest/download/Virule-Setup.exe"));
@@ -293,10 +319,15 @@ async function main() {
     const asset = /\/assets\/(main-[A-Za-z0-9_-]+\.js)/.exec(served.text);
     check("the deployed staging page references a bundle", !!asset);
     if (asset) {
-      const js = await getText(`${STAGING_BASE}/assets/${asset[1]}`);
+      // The entry chunk plus every chunk it imports (one level is the
+      // whole graph for this site: the entry imports its shared chunks).
+      const entry = await getText(`${STAGING_BASE}/assets/${asset[1]}`);
+      const chunks = [...new Set([...entry.text.matchAll(/["'`]\.\/([A-Za-z0-9_-]+\.js)["'`]/g)].map((m) => m[1]))];
+      let all = entry.text;
+      for (const c of chunks) all += (await getText(`${STAGING_BASE}/assets/${c}`)).text;
       check("the DEPLOYED bundle is the staging one",
-        js.text.includes(`${STAGING_REPO}/releases/download/client-staging/Virule-Setup.exe`) &&
-        !js.text.includes("getvirule/virule-client/releases"));
+        all.includes(`${STAGING_REPO}/releases/download/client-staging/Virule-Setup.exe`) &&
+        !all.includes("getvirule/virule-client/releases"), `${chunks.length} imported chunk(s)`);
     }
   }
 
@@ -401,7 +432,9 @@ async function main() {
     await shutdownWhateverHoldsThePort();
     try { setup.kill(); } catch {}
     killByName("Virule-Setup.exe");
+    killSandboxProcesses();
     await sleep(800);
+    check("nothing from the sandbox is left running", !sandboxProcessRunning());
     const now = readRealArp();
     check("the real Apps & Features entry was not touched by the sandboxed Setup",
       now === arpSnapshot);
@@ -507,6 +540,7 @@ async function main() {
     check("the real Apps & Features entry is unchanged", readRealArp() === arpSnapshot);
   }
 
+  killSandboxProcesses();
   console.log("");
   console.log(`  ${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
@@ -514,5 +548,6 @@ async function main() {
 
 main().catch((e) => {
   console.error("HARNESS ERROR:", e);
+  killSandboxProcesses();
   process.exit(1);
 });
