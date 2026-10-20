@@ -158,8 +158,9 @@ try {
   const landed = await page.content();
   check("the browser was handed to the Client's loopback page", /You are signed into the VIRULE app/.test(landed), page.url());
   const s1 = await waitStatus((x) => x.signed_in && x.account);
-  check("the Client reports the account with the service's capabilities",
-    s1?.signed_in && s1.account.email === email && s1.effective?.developer === true && s1.effective?.evaluator === false, s1);
+  // A fresh signup holds no role (developer only through Install Dev Tools).
+  check("the Client reports the account with the service's capabilities (none: signing up grants nothing)",
+    s1?.signed_in && s1.account.email === email && s1.effective?.developer === false && s1.effective?.evaluator === false, s1);
   check("no token in the Client's answer", !/refresh_token|access_token/.test(JSON.stringify(s1)));
   const sess = path.join(ROOT, "VIRULE", "client", "account.staging.dat");
   check("the staging session file exists, protected (no email in clear)", fs.existsSync(sess) && !fs.readFileSync(sess, "utf8").includes(email));
