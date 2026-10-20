@@ -1,6 +1,13 @@
-# VIRULE distribution publisher: pushes the SIGNED Virule-Setup.exe, the
-# SIGNED virule-client.exe, the SIGNED ViruleService.exe and their
-# manifest.json to the versioned GitHub Release on getvirule/virule-client.
+# VIRULE distribution publisher: pushes the CANONICAL signed
+# Virule-Setup.exe, the SIGNED virule-client.exe, the SIGNED
+# ViruleService.exe and their manifest.json to the versioned GitHub Release
+# on getvirule/virule-client.
+#
+# SETUP IS NEVER BUILT OR SIGNED FOR A RELEASE (owner ruling 2026-10-19):
+# the Setup published here is ALWAYS release\setup\production\Virule-Setup.exe,
+# verified against its pinned SHA-256 and size and its VIRULE signature
+# (helpers\canonical_setup.ps1). A missing, modified or unsigned canonical
+# Setup fails the publish; build\Release\x64\Virule-Setup.exe is never read.
 # GitHub Releases are the MVP binary distribution source; the LATEST
 # release's manifest is the mutable pointer Virule-Setup.exe and the
 # installed client follow.
@@ -47,11 +54,12 @@ $expectedSubject = 'CN=Heath Michaels'
 
 $clientExe  = Join-Path $repo 'build\Release\x64\virule-client.exe'
 $serviceExe = Join-Path $repo 'build\Release\x64\ViruleService.exe'
-$setupExe   = Join-Path $repo 'build\Release\x64\Virule-Setup.exe'
 $versionH   = Join-Path $repo 'src\shared\version.h'
 $stageDir  = Join-Path $repo 'build\publish'
 
 function Fail([string]$msg) { throw "PUBLISH FAILED: $msg" }
+
+. (Join-Path $PSScriptRoot 'canonical_setup.ps1')
 
 function Require-Signed([string]$path, [string]$label) {
     if (-not (Test-Path $path)) { Fail "$label missing: $path" }
@@ -138,7 +146,11 @@ Write-Host "OK:   client version $version (release tag $tag)"
 # ---- gate: only signed artifacts are ever published ----
 Require-Signed $clientExe  'virule-client.exe'
 Require-Signed $serviceExe 'ViruleService.exe'
-Require-Signed $setupExe   'Virule-Setup.exe'
+# Setup: the canonical binary only (pinned bytes, VIRULE signature, the
+# production release repository compiled in). Throws on any difference.
+try { $canonSetup = Get-CanonicalSetup 'Production' } catch { Fail $_.Exception.Message }
+$setupExe = $canonSetup.Path
+Write-Host "OK:   Virule-Setup.exe is the canonical production Setup (v$($canonSetup.Version))"
 
 $clientSha   = Sha256 $clientExe
 $clientSize  = (Get-Item $clientExe).Length
@@ -227,6 +239,8 @@ Verify-PublicAsset "$publicBase/$tag/virule-client.exe" $clientSha 'virule-clien
 Verify-PublicAsset "$publicBase/$tag/ViruleService.exe" $serviceSha 'ViruleService.exe'
 Verify-PublicAsset "$publicBase/$tag/manifest.json" $manifestSha 'manifest.json'
 Verify-PublicAsset "$publicBase/$tag/Virule-Setup.exe" $setupSha 'Virule-Setup.exe'
+try { $null = Assert-PublishedSetup "$publicBase/$tag/Virule-Setup.exe" 'Production' } catch { Fail $_.Exception.Message }
+Write-Host 'OK:   the published Virule-Setup.exe is the canonical signed Setup'
 # The pointer Setup actually follows: the LATEST release's manifest. GitHub
 # moves 'latest' eventually, not atomically: twice on 2026-09-16 the pointer
 # still served the previous release for about a minute after the versioned

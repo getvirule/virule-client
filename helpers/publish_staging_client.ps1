@@ -1,7 +1,15 @@
-# VIRULE STAGING client publisher: pushes the UNSIGNED staging
+# VIRULE STAGING client publisher: pushes the CANONICAL SIGNED staging
 # Virule-Setup.exe, the UNSIGNED staging virule-client.exe and
 # ViruleService.exe and their manifest.json to the FIXED `client-staging` tag
 # on the staging release repository.
+#
+# SETUP IS NEVER BUILT FOR A STAGING RELEASE (owner ruling 2026-10-19): the
+# Setup published here is ALWAYS release\setup\staging\Virule-Setup.exe,
+# signed with the VIRULE identity once and verified against its pinned
+# SHA-256 and size (helpers\canonical_setup.ps1). A missing, modified or
+# unsigned canonical Setup fails the publish, and the published copy is
+# re-downloaded and checked again. The client and the service stay unsigned
+# staging builds (kRequireAuthenticode = false in a staging Setup).
 #
 # WHY THIS IS A SEPARATE SCRIPT FROM publish.ps1. Not because the logic
 # differs, but because the two REFUSALS differ and both must stay absolute:
@@ -10,9 +18,9 @@
 #   refuses to rewrite a published client version.
 #
 #   this script refuses to publish a PRODUCTION-configured binary, and
-#   refuses to touch a production repository or tag. It never signs, never
-#   asks for a signature, and always clobbers, because a staging build is
-#   re-cut freely and nothing in the world pins its bytes.
+#   refuses to touch a production repository or tag. It never signs and
+#   always clobbers the client, service and manifest, because a staging
+#   client build is re-cut freely; Setup is the one pinned staging asset.
 #
 # The structural guard that makes the first refusal real: a staging build
 # has the staging Worker hostname compiled into it (the environment seam in
@@ -47,11 +55,12 @@ $prodHost    = 'api.virule.app'
 
 $clientExe  = Join-Path $repo 'build\Release\x64\staging\virule-client.exe'
 $serviceExe = Join-Path $repo 'build\Release\x64\staging\ViruleService.exe'
-$setupExe   = Join-Path $repo 'build\Release\x64\staging\Virule-Setup.exe'
 $versionH  = Join-Path $repo 'src\shared\version.h'
 $stageDir  = Join-Path $repo 'build\publish-staging'
 
 function Fail([string]$msg) { throw "STAGING PUBLISH FAILED: $msg" }
+
+. (Join-Path $PSScriptRoot 'canonical_setup.ps1')
 
 if ($ghRepo -eq $prodGhRepo) { Fail 'the staging release repository is the production one' }
 
@@ -143,7 +152,11 @@ Write-Host "OK:   client version $version (staging tag $tag)"
 # ---- the gate: only STAGING builds are ever published here ----
 Require-StagingBuild $clientExe  'virule-client.exe'
 Require-StagingBuild $serviceExe 'ViruleService.exe'
+# Setup: the canonical signed staging binary only. Throws on any difference.
+try { $canonSetup = Get-CanonicalSetup 'Staging' } catch { Fail $_.Exception.Message }
+$setupExe = $canonSetup.Path
 Require-StagingBuild $setupExe   'Virule-Setup.exe'
+Write-Host "OK:   Virule-Setup.exe is the canonical signed staging Setup (v$($canonSetup.Version))"
 
 $clientSha   = Sha256 $clientExe
 $clientSize  = (Get-Item $clientExe).Length
@@ -182,7 +195,7 @@ if ($view.Code -ne 0) {
     Write-Host "--    creating staging release $tag"
     $null = Invoke-Gh @('release', 'create', $tag, '-R', $ghRepo,
         '--title', 'VIRULE Client STAGING', '--prerelease',
-        '--notes', ('UNSIGNED staging build of the VIRULE Client and Virule-Setup. ' +
+        '--notes', ('Staging build of the VIRULE Client (unsigned) with the signed staging Virule-Setup. ' +
                     'It talks ONLY to the VIRULE staging services and installs ONLY ' +
                     'staging Admin packages. This tag is replaced in place on every ' +
                     'staging build; it is not a versioned release and nothing pins its bytes.'))
@@ -197,13 +210,21 @@ $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $serviceExe, '--cl
 Write-Host 'OK:   uploaded ViruleService.exe'
 $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $manifestPath, '--clobber')
 Write-Host 'OK:   uploaded manifest.json'
-$null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $setupExe, '--clobber')
-Write-Host 'OK:   uploaded Virule-Setup.exe'
+$remoteSetupOk = $false
+try { $null = Assert-PublishedSetup "$publicBase/$tag/Virule-Setup.exe" 'Staging'; $remoteSetupOk = $true } catch {}
+if ($remoteSetupOk) {
+    Write-Host 'OK:   Virule-Setup.exe already the canonical staging Setup remotely; not re-uploaded.'
+} else {
+    $null = Invoke-Gh @('release', 'upload', $tag, '-R', $ghRepo, $setupExe, '--clobber')
+    Write-Host 'OK:   uploaded the canonical Virule-Setup.exe'
+}
 
 Test-PublicAsset "$publicBase/$tag/virule-client.exe" $clientSha 'virule-client.exe'
 Test-PublicAsset "$publicBase/$tag/ViruleService.exe" $serviceSha 'ViruleService.exe'
 Test-PublicAsset "$publicBase/$tag/manifest.json" $manifestSha 'manifest.json'
 Test-PublicAsset "$publicBase/$tag/Virule-Setup.exe" $setupSha 'Virule-Setup.exe'
+try { $null = Assert-PublishedSetup "$publicBase/$tag/Virule-Setup.exe" 'Staging' } catch { Fail $_.Exception.Message }
+Write-Host 'OK:   the published Virule-Setup.exe is the canonical signed staging Setup'
 
 Write-Host ''
 Write-Host 'SUCCESS: staging client published and verified.' -ForegroundColor Green

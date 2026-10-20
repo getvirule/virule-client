@@ -32,8 +32,11 @@ repo signs; signing is centralized in `VIRULE_SECURITY\artifact-signing`
 
 ```
 client: helpers\build.ps1 -Stage client  ->  sign_client.bat
-setup : helpers\build.ps1 -Stage setup   ->  sign_client_setup.bat
 ```
+
+Setup is NOT rebuilt for releases: both publishers ship the canonical
+signed `release\setup\<environment>\Virule-Setup.exe`, pinned by SHA-256
+(`docs\ARCHITECTURE.md`, The canonical Setup).
 
 Output: `build\Release\x64\{virule-client.exe, Virule-Setup.exe}`.
 

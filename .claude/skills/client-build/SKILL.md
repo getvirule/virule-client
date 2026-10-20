@@ -53,16 +53,27 @@ node tools\residency_test.mjs [--only=1,3]  # Core Services <-> VIRULE Service r
 Never run the harnesses against the owner's installed client unless the
 task says so; site suites need the real client evicted first.
 
+## Setup is canonical (owner ruling 2026-10-19)
+
+Never build, sign or publish a fresh `Virule-Setup.exe` for a release. Both
+publishers ship `release\setup\<environment>\Virule-Setup.exe`, pinned in
+`release\setup\canonical_setup.json` and checked by
+`helpers\canonical_setup.ps1` (fails closed). `-Stage all` builds the client
+and service only. A Setup re-cut is a deliberate owner-approved act:
+`-Stage setup`, sign that file, `helpers\approve_canonical_setup.ps1`
+(`docs\ARCHITECTURE.md`, The canonical Setup).
+
 ## Publish
 
-- Production: after `sign_client` / `sign_client_service` /
-  `sign_client_setup`, `helpers\publish.ps1` (`-Validate` first). It refuses
+- Production: after `sign_client` / `sign_client_service`,
+  `helpers\publish.ps1` (`-Validate` first), with the canonical Setup. It refuses
   unsigned artifacts and refuses to rewrite a published version's client or
   service bytes: bump `src\shared\version.h` instead. The release tag is
   `v<version>`; the latest release IS the approved release. Normally driven
   by the promotion (Skill `release-production` in v2_mvp).
 - Staging: `helpers\publish_staging_client.ps1` publishes the UNSIGNED
-  staging build (client, service, Setup) to the fixed `client-staging` tag on
+  staging client and service with the canonical SIGNED staging Setup to the
+  fixed `client-staging` tag on
   `getvirule/virule-staging-releases` and refuses a production-configured
   binary. Normally driven by `release_staging.ps1` (Skill `release-staging`).
 - Core headers under `third_party\virule_core` are vendored byte-identical

@@ -524,7 +524,13 @@ overwrite a signed production artifact.
 
 **Why staging may run unsigned.** Staging exists to exercise the product
 end to end without consuming manual Microsoft Artifact Signing capacity.
-The relaxation is deliberately narrow and structural:
+THE ONE EXCEPTION is Setup, the file a person downloads and runs: the
+staging `Virule-Setup.exe` is a permanent binary signed with the VIRULE
+identity (The canonical Setup, below), because Windows 11 SmartScreen,
+Smart App Control and Defender's cloud heuristics treat an unsigned
+downloaded installer as untrusted. What stays unsigned is what that signed
+Setup downloads: the staging client and service. The relaxation is
+deliberately narrow and structural:
 
 - it lives in ONE constant, `kRequireAuthenticode`;
 - that constant is `true` in every build that does not define
@@ -554,13 +560,76 @@ cut last:
 it is the mirror image of `publish.ps1`: where the production publisher
 refuses anything unsigned, the staging publisher refuses anything that is
 not a STAGING build (it reads the compiled-in staging host out of the
-bytes) and refuses to touch a production repository or tag. Staging assets
-are always replaced with `--clobber`; nothing in the world pins them.
+bytes) and refuses to touch a production repository or tag. The client,
+service and manifest are replaced with `--clobber`; `Virule-Setup.exe` is
+the canonical SIGNED staging Setup, pinned by SHA-256 (The canonical
+Setup), and nothing else is ever published in its place.
 
 The whole staging environment is built and deployed by one script,
 `v2_mvp\helpers\release_staging.ps1`, which also proves it did not touch a
 signed production artifact and re-reads the production manifest afterwards.
 `tools/staging_env_test.mjs` is the end-to-end proof.
+
+## The canonical Setup (owner ruling 2026-10-19)
+
+`Virule-Setup.exe` is a bootstrapper, not the application: it downloads and
+verifies the approved client release of ITS environment. It is therefore a
+STABLE, SIGNED binary reused unchanged across releases. No normal release,
+staging or production, builds, signs or substitutes Setup; updating VIRULE
+never requires a new Setup.
+
+Setup is environment-specific at compile time (the client manifest URL, the
+download prefix and `kRequireAuthenticode` come from `launch_policy.hpp`): a
+production Setup fetches only the production manifest, accepts only
+`getvirule/virule-client` downloads and requires a VIRULE signature on them,
+so it cannot install staging; a staging Setup is the reverse. There are
+therefore exactly TWO canonical binaries, both signed with the VIRULE
+identity and timestamped, committed in this repository:
+
+| File | Pinned in `release/setup/canonical_setup.json` |
+|---|---|
+| `release/setup/production/Virule-Setup.exe` | Setup 0.9.0, source 474ca95, signed 2026-10-06 |
+| `release/setup/staging/Virule-Setup.exe` | the one signed staging Setup (see its pin) |
+
+`helpers/canonical_setup.ps1` is the one check, and it fails closed: a
+missing pin, a missing file, any byte or size difference, an invalid,
+foreign or untimestamped signature, or the other environment's release
+repository compiled in refuses the release. `publish.ps1` and
+`publish_staging_client.ps1` publish ONLY the canonical file (never
+`build\Release\x64\...\Virule-Setup.exe`), then re-download the public
+asset and require the pinned SHA-256 and a valid signature again;
+`release_promote.ps1`, `release_verify.ps1` and `release_staging.ps1` check
+the same pin. `build.ps1 -Stage all` builds the client and the service only.
+
+The client and the service still change freely; the staging client and
+service stay unsigned (a staging Setup does not require their signatures).
+The protocol between Setup and the client (the handoff envelope,
+`setup_takeover` / `setup_wait`, the manifest wire form) is therefore a
+compatibility contract: every client must keep serving the canonical Setups.
+
+Both Setups are PERMANENT. A Setup re-cut happens only when the owner
+explicitly authorizes a change to Setup itself, and then BOTH downloaders
+receive it together, from ONE source commit, and are signed and verified
+together: `build.ps1 -Stage setup -Environment Production` and
+`-Environment Staging`, sign both exact files with the VIRULE identity, then
+`helpers/approve_canonical_setup.ps1 -Production <file> -Staging <file>
+-SourceCommit <sha> -Replace` (it refuses to replace one environment alone),
+commit `release/setup/`, publish. The one single-environment approval ever
+allowed was the first staging pin (2026-10-19), because no staging Setup
+existed.
+
+KNOWN SOURCE DIFFERENCE (owner decision pending): the production Setup is
+0.9.0 (474ca95, 2026-10-06, preserved by owner ruling); the staging Setup
+was cut from 9c4f552 (0.9.11), whose Setup code adds the evaluator entry
+point in the handoff envelope (0.9.9) and the "Continuing…" card copy and
+palette (0.9.10). Cutting staging from 474ca95 would have removed the
+evaluator install from staging. The next authorized Setup change brings
+both to one commit.
+
+Why: on 2026-10-19 every staging client release rebuilt and published an
+UNSIGNED staging Setup, which Windows showed as "Publisher: Unknown" and
+Defender's cloud heuristics flagged (`Contebrew.A!ml`). Review:
+`VIRULE\docs\reviews\SETUP_SIGNING_2026-10-19.md`.
 
 ## Distribution (GitHub Releases, getvirule/virule-client)
 
@@ -570,7 +639,7 @@ assets are only publicly downloadable from public repositories):
 
 | Asset (per release tag `v<version>`) | Mutability |
 |---|---|
-| `Virule-Setup.exe` | replaced when Setup changes |
+| `Virule-Setup.exe` | the CANONICAL production Setup, the same bytes on every tag (see The canonical Setup) |
 | `virule-client.exe` | IMMUTABLE; a published version is never rewritten |
 | `ViruleService.exe` | IMMUTABLE (since 0.9.0); same rule as the client |
 | `manifest.json` | describes THAT release's client and service |
@@ -632,9 +701,10 @@ Since 2026-09-11 it is driven by the product-wide promotion
 (`v2_mvp\helpers\release-production.bat`, `release_promote.ps1`): the
 client ships only when `src\shared\version.h` is above the live manifest
 AND this repository's HEAD is clean, pushed, and the commit staging was
-built from and QA approved; the promotion builds Production, signs both
-artifacts, runs this publisher, then re-downloads the published Setup and
-checks its signature. A commit or push here deploys nothing.
+built from and QA approved; the promotion builds the Production client
+and service, signs both, runs this publisher with the canonical Setup
+(never rebuilt), then re-downloads the published Setup and checks it is
+the pinned, signed binary. A commit or push here deploys nothing.
 GitHub is a HOST, not a trust anchor: everything a user runs is still
 gated by the manifest hash plus the VIRULE Authenticode identity below.
 
