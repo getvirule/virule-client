@@ -59,8 +59,10 @@ Never build, sign or publish a fresh `Virule-Setup.exe` for a release. Both
 publishers ship `release\setup\<environment>\Virule-Setup.exe`, pinned in
 `release\setup\canonical_setup.json` and checked by
 `helpers\canonical_setup.ps1` (fails closed). `-Stage all` builds the client
-and service only. A Setup re-cut is a deliberate owner-approved act:
-`-Stage setup`, sign that file, `helpers\approve_canonical_setup.ps1`
+and service only. Both Setups are permanent: only an owner-authorized change
+to Setup itself re-cuts them, BOTH together from one commit (`-Stage setup`
+for each environment, sign both, `helpers\approve_canonical_setup.ps1
+-Production -Staging -SourceCommit -Replace`; it refuses one alone)
 (`docs\ARCHITECTURE.md`, The canonical Setup).
 
 ## Publish
