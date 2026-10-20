@@ -330,6 +330,9 @@ inline void sign_out_locally(State& s, const char* reason) {
     s.last_error = reason;
     store::clear_session();
     store::remove_device_key();
+    // An undelivered Install Dev Tools made while signed in belonged to
+    // this account: it never reaches the next one (account_roles.hpp).
+    roles::drop_bound_intent();
 }
 
 /** Apply a token response: persist the rotated refresh token FIRST. */
@@ -919,6 +922,13 @@ inline std::string open_settings() {
     }
     log::client(token.empty() ? "account: settings opened without a link" : "account: settings opened with a link");
     return "{\"type\":\"account_open_settings\",\"ok\":true}";
+}
+
+/** Whether an account is signed in on this installation right now. */
+inline bool signed_in() {
+    std::lock_guard<std::mutex> lock(st().m);
+    ensure_loaded_locked(st());
+    return st().signed_in;
 }
 
 /** {"type":"account_status",...}: what the Admin shows. Never a token. */

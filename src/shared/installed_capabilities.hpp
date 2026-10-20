@@ -32,7 +32,6 @@
 
 #include <string>
 
-#include "shared/account_roles.hpp"
 #include "shared/client_state.hpp"
 
 namespace vclient::capabilities {
@@ -62,9 +61,10 @@ inline Enabled enabled() {
 
 // Record one capability (additive). `changed_out` (optional) reports
 // whether it was newly enabled. False = an unknown name or a failed save.
-// Every dev_tools request is also an INSTALL DEV TOOLS: the developer
-// enrollment intent the Client delivers to the signed-in account
-// (account_roles.hpp), even when the installation already had Dev Tools.
+// INSTALLED SOFTWARE IS NOT ENROLLMENT (owner rule 2026-10-20): recording
+// dev_tools here never makes the account a developer. Only the callers
+// that carry the person's explicit Install Dev Tools also record the
+// enrollment intent (roles::mark_developer_intent, account_roles.hpp).
 inline bool enable(const std::string& name, bool* changed_out = nullptr) {
     if (changed_out) *changed_out = false;
     if (!is_known(name)) return false;
@@ -78,7 +78,6 @@ inline bool enable(const std::string& name, bool* changed_out = nullptr) {
         return true;
     });
     if (changed_out) *changed_out = ok && changed;
-    if (ok && name == "dev_tools") roles::mark_developer_intent();
     return ok;
 }
 

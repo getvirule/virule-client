@@ -537,6 +537,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // An Install Dev Tools while signed in enrolls the account at once
     // (shared/account_roles.hpp); signed out, the next sign-in delivers it.
     vclient::roles::g_on_developer_intent = []() { vclient::account::confirm_async(); };
+    vclient::roles::g_signed_in = []() { return vclient::account::signed_in(); };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
         g_exit_requested.store(true);

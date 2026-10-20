@@ -26,7 +26,12 @@
 // makes a new one; the account appearance is reflected at once, delivered,
 // arrives from another installation, waits through offline and a restart,
 // never overwrites a newer choice when replayed, and the landing page wears
-// the website's theme.
+// the website's theme. Since 2026-10-20 (the explicit-enrollment-only law):
+// an Update (a page's admin_install without enroll_developer, or the Admin
+// Settings Update), a client restart, a sign-in and a stale 0.9.12 intent
+// never make the account a developer; an Install Dev Tools made signed in
+// never reaches the account that signs in next; only capability_enable
+// dev_tools and a page's admin_install with enroll_developer enroll.
 
 import { execFileSync, spawn } from "node:child_process";
 import { createPrivateKey, generateKeyPairSync, randomBytes, sign as nodeSign } from "node:crypto";
@@ -177,7 +182,12 @@ fs.mkdirSync(ROOT, { recursive: true });
 const sandboxEnv = { ...process.env, LOCALAPPDATA: ROOT, TEMP: path.join(SANDBOX, "Temp"), TMP: path.join(SANDBOX, "Temp") };
 let child = null;
 async function startClient() {
-  child = spawn(EXE, ["--no-register", `--account-endpoint=${SEAM}`], { env: sandboxEnv, detached: true, stdio: "ignore" });
+  // The Admin manifest seam points at this server, which has none: an
+  // admin_install is accepted (and recorded) and then fails fast, never
+  // downloading a real package.
+  child = spawn(EXE, ["--no-register", `--account-endpoint=${SEAM}`, `--admin-manifest-url=${SEAM}/no-admin-manifest.json`,
+    `--self-manifest-url=${SEAM}/no-client-manifest.json`],
+    { env: sandboxEnv, detached: true, stdio: "ignore" });
   for (let i = 0; i < 40 && !(await bridgeUp()); i++) await sleep(250);
 }
 async function stopClient() {
@@ -359,6 +369,50 @@ try {
   await bridge('{"type":"account_refresh"}');
   const s6a = await waitStatus((x) => x.signed_in && x.effective?.developer === false && x.remembered?.developer === false);
   check("(setup) without the developer grant the remembered roles follow (evaluator only)", !!s6a && s6a.remembered.evaluator === true, s6a);
+
+  // --- EXPLICIT ENROLLMENT ONLY (owner rule 2026-10-20). An evaluator-only
+  // account on an installation that has Dev Tools files.
+  const devRow = () => identity.prepare("SELECT status, granted_by FROM account_capabilities WHERE account_id = ? AND capability = 'developer'").get(acctId) ?? null;
+  const rolesFile = path.join(ROOT, "VIRULE", "client", "account_roles.json");
+  const rolesText = () => (fs.existsSync(rolesFile) ? fs.readFileSync(rolesFile, "utf8") : "");
+  const PAGE = { origin: "http://localhost:5173" };
+  const upd = await bridge('{"type":"admin_install","shortcut":false,"capability":"dev_tools"}', PAGE);
+  const updLocal = await bridge('{"type":"admin_install"}');
+  await sleep(3000);
+  check("the homepage's Update (admin_install dev_tools, no enroll_developer) and the Admin's Settings Update are accepted",
+    /admin_install_started/.test(upd ?? "") && /admin_install_started/.test(updLocal ?? ""), [upd, updLocal]);
+  check("...and never enroll the account as a developer (service and local intent)",
+    devRow() === null && !/"pending_developer":true/.test(rolesText()), [devRow(), rolesText()]);
+  // A stale 0.9.12 record (version 1, which recorded an intent on every
+  // Update) is read with no intent, through a restart.
+  await stopClient();
+  fs.writeFileSync(rolesFile, '{"version":1,"pending_developer":true,"remembered":true,"developer":false,"evaluator":true}');
+  await startClient();
+  const sRestart = await waitStatus((x) => x.signed_in && x.account);
+  await bridge('{"type":"account_refresh"}');
+  await sleep(3000);
+  check("a stale version 1 intent never enrolls the account at the next start", sRestart?.signed_in === true && devRow() === null, [sRestart, devRow()]);
+  // An Install Dev Tools made signed in (undelivered: the service is
+  // unreachable) belongs to that account; sign-out drops it.
+  offline = true;
+  const enOff = JSON.parse(await bridge('{"type":"capability_enable","capability":"dev_tools"}'));
+  check("(setup) Install Dev Tools signed in, service unreachable: the intent is kept, bound to this account",
+    enOff.type === "capability_enabled" && /"pending_developer":true/.test(rolesText()) && /"pending_bound":true/.test(rolesText()), rolesText());
+  await bridge('{"type":"account_sign_out"}');
+  check("signing out drops that account's undelivered intent", (await status())?.signed_in === false && !/"pending_developer":true/.test(rolesText()), rolesText());
+  offline = false;
+  identity.prepare("UPDATE devices SET revoked_epoch = 1, revoked_reason = 'signout' WHERE revoked_epoch IS NULL").run();
+  await signInOnce();
+  const sIn = await waitStatus((x) => x.signed_in && x.account);
+  await sleep(2000);
+  check("signing in again does not make the account a developer (evaluator only)",
+    sIn?.signed_in === true && sIn.effective?.developer === false && sIn.effective.evaluator === true && devRow() === null, [sIn, devRow()]);
+  // The homepage's explicit Get VIRULE Dev Tools resumed through the client.
+  await bridge('{"type":"admin_install","shortcut":false,"capability":"dev_tools","enroll_developer":true}', PAGE);
+  check("a page's admin_install WITH enroll_developer (Get VIRULE Dev Tools) enrolls the account",
+    await (async () => { for (let i = 0; i < 40 && devRow()?.status !== "active"; i++) await sleep(250); return devRow()?.granted_by === "install-dev-tools"; })(), devRow());
+  identity.prepare("DELETE FROM account_capabilities WHERE account_id = ? AND capability = 'developer'").run(acctId);
+  await waitStatus((x) => x.signed_in && x.effective?.developer === false, 30000);
   await bridge('{"type":"capability_enable","capability":"dev_tools"}');
   const s6b = await waitStatus((x) => x.effective?.developer === true);
   check("Install Dev Tools while signed in enrolls the account as a developer and keeps the evaluator",

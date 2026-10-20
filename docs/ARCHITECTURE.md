@@ -1147,15 +1147,32 @@ the two local facts this needs in `client\account_roles.json` (its own
 file, because the pinned Setup rewrites state.json with its own field
 list):
 
-- `pending_developer`, the INSTALL DEV TOOLS INTENT: every `dev_tools`
-  request (a page's `admin_install` or the Setup envelope's INSTALL_ADMIN
-  with `dev_tools` or no capability, `capability_enable dev_tools` from a
-  page or the Admin's Settings > Install Dev Tools) records it. The Client
-  delivers it (`POST /v1/account/developer/enable`) to the signed-in
-  account at once (confirm), or right after the next sign-in before `/me`
-  is read, so the account that signs in receives the grant; cleared once
-  the service answers 200 or 403, kept while it is unreachable. While
-  signed out the request also adds Dev Tools to the remembered layout.
+- `pending_developer`, the INSTALL DEV TOOLS INTENT, recorded ONLY for the
+  person's explicit Get VIRULE Dev Tools / Install Dev Tools (EXPLICIT
+  ENROLLMENT ONLY, owner rule 2026-10-20, 0.9.13; installed software is not
+  enrollment): `capability_enable dev_tools` from a page (the homepage's
+  Get VIRULE Dev Tools on an installation without Dev Tools) or the Admin's
+  Settings > Install Dev Tools; a page's `admin_install` carrying
+  `"enroll_developer":true` (the site sends it only for a pending Get
+  VIRULE Dev Tools); and the Setup envelope's INSTALL_ADMIN `dev_tools`
+  (the site hands Setup a `dev_tools` envelope only for Get VIRULE Dev
+  Tools, and the pinned Setup normalizes the envelope, so this is the one
+  fact it can carry). NEVER recorded by a page `admin_install` without
+  `enroll_developer` (the homepage's Update and Finish installing), a local
+  `admin_install` (Settings Update), the launch update, the one-time
+  capability migration, a sign-in, or Dev Tools already recorded on the
+  installation. Recording `dev_tools` in the capability record
+  (`installed_capabilities.hpp`) is presentation and never an intent. The
+  Client delivers it (`POST /v1/account/developer/enable`) to the signed-in
+  account at once (confirm), or, when it was made SIGNED OUT, right after
+  the next sign-in before `/me` is read; one made SIGNED IN is bound to
+  that account (`pending_bound`) and dropped at sign-out, so it never
+  reaches another account. Cleared once the service answers 200 or 403,
+  kept while it is unreachable. While signed out the request also adds Dev
+  Tools to the remembered layout. The record is version 2; a version 1
+  record (0.9.12, which recorded an intent on every homepage Update and
+  delivered it as a developer grant) is read with NO intent, because a
+  real one cannot be told apart from an Update's.
 - REMEMBERED ROLES: every successful `/v1/account/me` records the account's
   effective `developer` / `evaluator`, kept through sign-out, reported as
   `account_status.remembered`.

@@ -41,7 +41,10 @@
 //      without removing dev_tools (and pushes status to pages), an
 //      unknown capability is refused, a page admin_install records
 //      dev_tools by default and evaluator when asked, persistence across
-//      a client restart.
+//      a client restart. EXPLICIT ENROLLMENT ONLY (2026-10-20): neither
+//      the migration, a local admin_install nor a page admin_install
+//      without enroll_developer records the Install Dev Tools intent;
+//      capability_enable dev_tools does.
 //   9. The Setup envelope carries the capability: Virule-Setup.exe end to
 //      end with INSTALL_ADMIN + "capability":"evaluator" records evaluator
 //      in the installed client (and nothing else).
@@ -298,6 +301,11 @@ const enabledOf = (text) => {
   return m ? `${m[1]},${m[2]}` : null;
 };
 // The same pair out of state.json ("recorded|dev_tools,evaluator").
+// The Install Dev Tools intent (shared/account_roles.hpp).
+const intentPending = (root) => {
+  try { return fs.readFileSync(path.join(root, "VIRULE", "client", "account_roles.json"), "utf8").includes('"pending_developer":true'); }
+  catch { return false; }
+};
 const stateEnabled = (root) => {
   const t = stateText(root);
   const b = (k) => (t.includes(`"${k}":true`) ? "true" : "false");
@@ -360,6 +368,7 @@ async function scenarioCapabilities() {
     check("local admin_install accepted", !!li, li ?? "none");
     await sleep(600);
     check("local admin_install recorded nothing", stateEnabled(root) === "true|false,false", stateText(root));
+    check("local admin_install (Settings Update) records no Install Dev Tools intent", !intentPending(root));
 
     // capability_enable from a page adds evaluator; every other open page
     // receives the pushed status at once.
@@ -390,6 +399,10 @@ async function scenarioCapabilities() {
     check("page admin_install accepted", !!pi, pi ?? "none");
     check("page admin_install records dev_tools (default), evaluator kept",
       await waitFor(() => stateEnabled(root) === "true|true,true", 3000), stateText(root));
+    check("page admin_install without enroll_developer (an Update) records no Install Dev Tools intent", !intentPending(root));
+    const dt = await ask(p1, '{"type":"capability_enable","capability":"dev_tools"}', "capability_enabled");
+    check("capability_enable dev_tools (an explicit Install Dev Tools) records the intent",
+      !!dt && await waitFor(() => intentPending(root), 3000), dt ?? "none");
     const st2 = await ask(local, '{"type":"status"}', "status");
     check("status reflects both", enabledOf(st2) === "true,true", st2 ?? "none");
     p1.end();
@@ -437,6 +450,7 @@ async function scenarioCapabilities() {
     check("client starts (sandbox k, Admin present, no state)", await startClient(root));
     check("migration: Admin present = dev_tools",
       await waitFor(() => stateEnabled(root) === "true|true,false", 4000), stateText(root));
+    check("migration: installed Dev Tools files record no Install Dev Tools intent", !intentPending(root));
     await stopClient();
 
     // Already recorded: never migrated again (a recorded "nothing" stays).

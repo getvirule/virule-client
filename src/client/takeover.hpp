@@ -71,6 +71,7 @@
 #include "client/bridge.hpp"
 #include "client/qa_flow.hpp"
 #include "client/result_card.hpp"
+#include "shared/account_roles.hpp"
 #include "shared/environment.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
@@ -196,6 +197,15 @@ inline void run_admin(bool shortcut, const std::string& capability) {
     } else if (changed) {
         log::client("takeover: capability " + capability + " enabled");
         bridge::push_lifecycle_status();
+    }
+    // A dev_tools envelope IS the person's explicit Install Dev Tools: the
+    // website hands Setup an INSTALL_ADMIN dev_tools envelope only for Get
+    // VIRULE Dev Tools, never for an Update, a Finish installing or an Open
+    // (v1_mvp_site useInstallFlow.tsx). The pinned Setup normalizes the
+    // envelope, so this is the one fact it can carry.
+    if (capability == "dev_tools") {
+        roles::mark_developer_intent();
+        log::client("takeover: Install Dev Tools (INSTALL_ADMIN)");
     }
 
     // THE NATIVE CONTINUATION IS UNCONDITIONAL (owner handoff rule): Setup

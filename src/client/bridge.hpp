@@ -40,8 +40,12 @@
 //   page -> client   {"type":"status"}
 //                    {"type":"qa_accept","token":"<invite token>"}
 //                    {"type":"admin_install","shortcut":true|false,
-//                     "capability":"dev_tools"|"evaluator"}
-//                                      (capability absent/unknown = dev_tools)
+//                     "capability":"dev_tools"|"evaluator",
+//                     "enroll_developer":true}
+//                                      (capability absent/unknown = dev_tools;
+//                                       enroll_developer ONLY for the
+//                                       homepage's explicit Get VIRULE Dev
+//                                       Tools, never an Update or an Open)
 //                    {"type":"admin_open"}
 //                    {"type":"capability_enable","capability":"dev_tools"|"evaluator"}
 //                    {"type":"uninstall","nonce":"<32 hex>",
@@ -121,6 +125,7 @@
 #include <string>
 #include <vector>
 
+#include "shared/account_roles.hpp"
 #include "shared/environment.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
@@ -697,6 +702,11 @@ inline void handle_client(SOCKET client) {
             // RECORDED here, as the request is accepted and before the
             // pipeline runs. A LOCAL caller updates an installation that
             // already exists and records nothing.
+            // EXPLICIT ENROLLMENT ONLY (owner rule 2026-10-20): the install
+            // or update itself never enrolls the account as a developer.
+            // Only "enroll_developer":true, which the site sends solely for
+            // the person's own Get VIRULE Dev Tools, records the Install
+            // Dev Tools intent (account_roles.hpp).
             if (g_callbacks.on_admin_install) {
                 const bool shortcut = is_page &&
                     payload.find("\"shortcut\":true") != std::string::npos;
@@ -714,6 +724,11 @@ inline void handle_client(SOCKET client) {
                     } else if (changed) {
                         log::client("bridge: capability " + capability +
                                     " enabled (admin_install)");
+                    }
+                    if (capability == "dev_tools" &&
+                        payload.find("\"enroll_developer\":true") != std::string::npos) {
+                        roles::mark_developer_intent();
+                        log::client("bridge: Install Dev Tools (admin_install)");
                     }
                 }
                 g_callbacks.on_admin_install(shortcut, is_page);
@@ -790,6 +805,10 @@ inline void handle_client(SOCKET client) {
             // Admin itself): ADD the capability, never remove another, and
             // never reinstall. Page or local alike: the record is local
             // presentation only and authorizes nothing at the service.
+            // capability_enable dev_tools is ONLY ever the person's explicit
+            // Install Dev Tools (the homepage's Get VIRULE Dev Tools on an
+            // installation without them, or the Admin's Settings > Install
+            // Dev Tools), so it also records the enrollment intent.
             std::string capability;
             (void)js::find_string_in(payload, 0, payload.size(), "capability",
                                      capability);
@@ -800,6 +819,10 @@ inline void handle_client(SOCKET client) {
             }
             if (changed) {
                 log::client("bridge: capability " + capability + " enabled");
+            }
+            if (capability == "dev_tools") {
+                roles::mark_developer_intent();
+                log::client("bridge: Install Dev Tools (capability_enable)");
             }
             if (!reply(0x1, "{\"type\":\"capability_enabled\",\"capability\":\"" +
                             capability + "\",\"enabled\":" +
