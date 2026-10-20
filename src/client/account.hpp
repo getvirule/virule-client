@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "shared/account_relay.hpp"
+#include "shared/account_roles.hpp"
 #include "shared/account_store.hpp"
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
@@ -381,9 +382,31 @@ inline bool apply_me(State& s, const std::string& body) {
     (void)json_scan::find_string_in(body, 0, body.size(), "device_id", x.device_id);
     (void)json_scan::find_string_in(body, 0, body.size(), "account_hint", x.account_hint);
     (void)apply_preferences(x, body);
+    // The tester identities linked to this account: every 32-hex id in the
+    // `qa_linked_testers` array (each tester identity is its own link).
+    const size_t ql = body.find("\"qa_linked_testers\":[");
+    if (ql != std::string::npos) {
+        const size_t qe = body.find(']', ql);
+        std::string ids;
+        for (size_t i = body.find('"', ql + 20); qe != std::string::npos && i != std::string::npos && i < qe;
+             i = body.find('"', i + 1)) {
+            const size_t j = body.find('"', i + 1);
+            if (j == std::string::npos || j > qe) break;
+            const std::string id = body.substr(i + 1, j - i - 1);
+            if (id.size() == 32 && id.find_first_not_of("0123456789abcdef") == std::string::npos)
+                ids += (ids.empty() ? "" : ",") + id;
+            i = j;
+        }
+        x.qa_linked = ids;
+        x.qa_linked_known = true;
+    }
     x.checked_epoch = (long long)time(nullptr);
     s.offline = false;
     s.last_error.clear();
+    // THE ROLES THIS VIRULE KEEPS THROUGH SIGN-OUT (account_roles.hpp): what
+    // the service just confirmed this account may exercise.
+    const bool active = x.status == "active";
+    roles::remember(active && x.cap_developer == "active", active && x.cap_evaluator == "active");
     return store::save_session(x);
 }
 
@@ -474,8 +497,35 @@ inline void deliver_appearance_locked(const store::DeviceKey& key, bool live) {
     if (!store::save_session(x)) log::client("account: could not persist the appearance");
 }
 
+/** DELIVER A PENDING INSTALL DEV TOOLS (account_roles.hpp): enroll the
+ *  signed-in account as a developer at the service. Cleared once the
+ *  service answered (200 enrolled, or 403: the account cannot be enrolled,
+ *  e.g. Dev Tools access was turned off); kept for the next contact when
+ *  it could not be reached. Caller holds token_mutex. `fresh_at`: the
+ *  access token a sign-in just received (the account is not marked signed
+ *  in until its roles are read). */
+inline void deliver_enrollment_locked(const store::DeviceKey& key, const std::string& fresh_at = "") {
+    if (!roles::load().pending_developer) return;
+    std::string at = fresh_at;
+    if (at.empty() && !access_token_locked(key, at)) return;
+    Reply r = call(L"POST", "POST", "/v1/account/developer/enable", "{}", key, at);
+    if (r.status == 401) {
+        if (!refresh_locked(key)) return;
+        { std::lock_guard<std::mutex> lock(st().m); at = st().access_token; }
+        r = call(L"POST", "POST", "/v1/account/developer/enable", "{}", key, at);
+    }
+    if (r.status == 200) {
+        roles::clear_developer_intent();
+        log::client("account: Install Dev Tools enrolled the account as a developer");
+    } else if (r.status == 403) {
+        roles::clear_developer_intent();
+        log::client("account: the service refused the developer enrollment (403)");
+    }
+}
+
 /** Re-confirm the account, its capabilities and its preferences with the
- *  service, delivering any appearance change made while offline first. */
+ *  service, delivering any appearance change made while offline and any
+ *  pending Install Dev Tools first. */
 inline void confirm_now() {
     {
         std::lock_guard<std::mutex> lock(st().m);
@@ -486,6 +536,7 @@ inline void confirm_now() {
     if (!store::device_key(key)) return;
     std::lock_guard<std::mutex> tl(token_mutex());
     deliver_appearance_locked(key, false);
+    deliver_enrollment_locked(key);
     std::string at;
     if (!access_token_locked(key, at)) return;
     Reply r = call(L"GET", "GET", "/v1/account/me", "", key, at);
@@ -528,7 +579,18 @@ inline void confirm_if_due(unsigned long long min_interval_ms) {
 // presentation only and never part of the authorization.
 inline const char* kDonePage =
     "<!doctype html><html lang=\"en\" class=\"%THEME%\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<meta name=\"referrer\" content=\"no-referrer\"><title>VIRULE</title><style>"
+    "<meta name=\"referrer\" content=\"no-referrer\"><title>VIRULE</title>"
+    // THE VIRULE FAVICON, inline: the website's own favicon.svg (v1_mvp_site
+    // public/favicon.svg, the yellow V), because the one-shot listener closes
+    // the moment this page is sent and could never answer /favicon.ico.
+    "<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E"
+    "%3Cpath fill='%23fbbf24' d='M219.389,447.842 L291.758,447.842 C306.013,447.842 315.693,440.535 320.816,425.912 L432.660,83.254 "
+    "C433.756,79.964 434.304,77.592 434.304,76.127 C434.304,72.837 433.114,70.010 430.741,67.629 C428.359,65.256 425.532,64.065 422.243,64.065 "
+    "L353.163,64.065 C346.944,64.065 342.104,65.436 338.634,68.177 C335.156,70.918 332.877,74.122 331.781,77.771 L255.574,319.003 "
+    "L179.366,77.771 C178.270,74.122 175.983,70.918 172.513,68.177 C169.035,65.436 164.195,64.065 157.985,64.065 L88.905,64.065 "
+    "C85.615,64.065 82.780,65.256 80.407,67.629 C78.025,70.010 76.843,72.837 76.843,76.127 C76.843,77.592 77.391,79.964 78.488,83.254 "
+    "L190.332,425.912 C195.446,440.535 205.134,447.842 219.389,447.842 Z'/%3E%3C/svg%3E\">"
+    "<style>"
     // Smoky Blue (STYLE_GUIDE 3.1-3.3), the website's page field,
     // primary ink and muted ink in each theme; the canonical 44px V mark
     // (17.2), identical in both.
@@ -558,7 +620,7 @@ struct Callback {
 inline void http_reply(SOCKET c, int status, const std::string& html) {
     const std::string head = "HTTP/1.1 " + std::to_string(status) + (status == 200 ? " OK" : " Not Found") +
         "\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\n"
-        "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
+        "X-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src data:\r\n"
         "Connection: close\r\nContent-Length: " + std::to_string(html.size()) + "\r\n\r\n";
     const std::string all = head + html;
     (void)send(c, all.data(), (int)all.size(), 0);
@@ -761,6 +823,9 @@ inline void run_flow(unsigned long long id) {
     }
     std::string at;
     { std::lock_guard<std::mutex> lock(st().m); at = st().access_token; }
+    // An Install Dev Tools made while signed out goes to THIS account now,
+    // before its roles are read (account_roles.hpp).
+    deliver_enrollment_locked(key, at);
     const Reply me = call(L"GET", "GET", "/v1/account/me", "", key, at);
     std::lock_guard<std::mutex> lock(st().m);
     if (me.status == 200) (void)apply_me(st(), me.body);
@@ -774,10 +839,20 @@ inline void run_flow(unsigned long long id) {
 
 // ------------------------------------------------------ bridge surface --
 
-/** Whether a local QA credential exists that is not yet linked here. */
-inline bool qa_credential_present() {
+/** Whether THIS installation holds a QA tester credential, bound to this
+ *  machine (the only kind link_qa can prove), that is not yet linked to the
+ *  signed-in account. Each tester identity is its own link
+ *  (VIRULE_BACKEND docs/ACCOUNTS.md, the QA link), so a second game's or
+ *  organization's credential is offered even once the account holds the
+ *  qa_tester capability. A session saved before the linked list was kept
+ *  falls back to the capability alone until /me answers. */
+inline bool qa_link_offered(const store::Session& s) {
+    if (!s.qa_linked_known && s.cap_qa == "active") return false;
+    const std::string me = machine_identity::public_key_hex();
+    const std::string linked = "," + s.qa_linked + ",";
     for (const auto& e : qa_credential::load(paths::security_dir())) {
-        if (e.tester_id.size() == 32 && e.machine_key.size() == 64 && e.signature.size() == 128) return true;
+        if (e.tester_id.size() != 32 || e.machine_key != me || e.signature.size() != 128) continue;
+        if (linked.find("," + e.tester_id + ",") == std::string::npos) return true;
     }
     return false;
 }
@@ -878,7 +953,7 @@ inline std::string status_json() {
                 ",\"effective\":{\"developer\":" + (eff(s.session.cap_developer) ? "true" : "false") +
                 ",\"evaluator\":" + (eff(s.session.cap_evaluator) ? "true" : "false") + "}" +
                 ",\"checked\":" + std::to_string(s.session.checked_epoch) +
-                ",\"qa_link_available\":" + (s.session.cap_qa != "active" && qa_credential_present() ? "true" : "false") +
+                ",\"qa_link_available\":" + (qa_link_offered(s.session) ? "true" : "false") +
                 // The account's EXPLICIT appearance as this installation
                 // knows it: a choice made here and not yet delivered wins
                 // over the last confirmed one. "" = never chosen (follow
@@ -894,6 +969,15 @@ inline std::string status_json() {
         // that uses the service only when the account's capability above
         // allows it too.
         out += ",\"enabled\":" + capabilities::enabled_json();
+        // The roles the service last confirmed for the account signed in
+        // here, kept through sign-out (account_roles.hpp; client 0.9.12):
+        // a signed-out Admin keeps that layout. Absent = no account has
+        // been confirmed on this installation yet (the entry point decides).
+        const roles::Record rr = roles::load();
+        if (rr.remembered) {
+            out += std::string(",\"remembered\":{\"developer\":") + (rr.developer ? "true" : "false") +
+                ",\"evaluator\":" + (rr.evaluator ? "true" : "false") + "}";
+        }
         out += "}";
     }
     // Stale snapshot: re-confirm. An undelivered appearance change: try

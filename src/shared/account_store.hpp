@@ -256,6 +256,11 @@ struct Session {
     // The service's opaque account hint (32 hex): the website account page
     // is opened with it so a browser signed in to ANOTHER account says so.
     std::string account_hint;
+    // The QA tester identities the service has linked to THIS account
+    // (`qa_linked_testers` of /v1/account/me), comma-joined 32-hex ids;
+    // qa_linked_known is false for a session file written before it was kept.
+    std::string qa_linked;
+    bool qa_linked_known = false;
 };
 
 inline std::string session_json(const Session& s) {
@@ -271,7 +276,9 @@ inline std::string session_json(const Session& s) {
         "\",\"appearance\":\"" + s.appearance +
         "\",\"pending_appearance\":\"" + s.pending_appearance +
         "\",\"account_hint\":\"" + s.account_hint +
-        "\",\"checked\":" + std::to_string(s.checked_epoch) +
+        "\",\"qa_linked\":\"" + s.qa_linked +
+        "\",\"qa_linked_known\":" + (s.qa_linked_known ? "1" : "0") +
+        ",\"checked\":" + std::to_string(s.checked_epoch) +
         ",\"appearance_version\":" + std::to_string(s.appearance_version) +
         ",\"pending_base\":" + std::to_string(s.pending_base) + "}";
 }
@@ -321,6 +328,9 @@ inline bool load_session(Session& s) {
     if (out.appearance != "light" && out.appearance != "dark") out.appearance.clear();
     if (out.pending_appearance != "light" && out.pending_appearance != "dark") out.pending_appearance.clear();
     (void)json_scan::find_string_in(text, 0, text.size(), "account_hint", out.account_hint);
+    long long qk = 0;
+    if (json_scan::find_string_in(text, 0, text.size(), "qa_linked", out.qa_linked) &&
+        json_scan::find_number_in(text, 0, text.size(), "qa_linked_known", qk)) out.qa_linked_known = qk == 1;
     dmp::detail::secure_zero(text.data(), text.size());
     if (!ok || out.refresh_token.empty()) return false;
     s = std::move(out);

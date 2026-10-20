@@ -230,6 +230,13 @@ try {
   const pageSignIn = await bridge('{"type":"account_sign_in"}', { origin: "http://localhost:5173" });
   check("a web page cannot start a sign-in", pageSignIn === '{"type":"error"}' && (await status()).phase === "idle");
 
+  // --- INSTALL DEV TOOLS BEFORE SIGNING IN (owner ruling 2026-10-20): the
+  // developer enrollment intent waits for the account that signs in next.
+  const en0 = JSON.parse(await bridge('{"type":"capability_enable","capability":"dev_tools"}'));
+  const s0b = await status();
+  check("Install Dev Tools signed out records the capability and no remembered roles yet",
+    en0.enabled?.dev_tools === true && s0b.signed_in === false && s0b.remembered === undefined, [en0, s0b]);
+
   // --- sign in
   const r1 = await signInOnce({ forged: true });
   check("sign-in starts and reaches the browser phase", r1.started.started === true && r1.s.phase === "browser");
@@ -240,10 +247,17 @@ try {
   check("and keeps waiting for the real one", r1.forgedResults.stillWaiting === true);
   check("the listener answers nothing but /callback", r1.forgedResults.otherPath === 404);
   check("the real redirect lands on the Client's page", r1.ok.status === 200 && /You are signed into the VIRULE app/.test(r1.ok.text));
+  check("the Client's page carries the VIRULE favicon inline (the listener is gone before /favicon.ico)",
+    /<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml,/.test(r1.ok.text) && /%23fbbf24/.test(r1.ok.text));
   const s1 = await waitStatus((x) => x.signed_in && x.account);
   check("the Client reports the account and its server-decided capabilities",
     s1?.signed_in && s1.account.email === EMAIL && s1.capabilities.developer === "active" && s1.capabilities.evaluator === "none" &&
     s1.effective.developer === true && s1.effective.evaluator === false, s1);
+  check("the Install Dev Tools made signed out enrolled THIS account as a developer at sign-in",
+    identity.prepare("SELECT c.granted_by g FROM account_capabilities c JOIN accounts a ON a.id = c.account_id WHERE a.email_norm = ? AND c.capability = 'developer'")
+      .get(EMAIL.toLowerCase())?.g === "install-dev-tools" &&
+    !/"pending_developer":true/.test(fs.readFileSync(path.join(ROOT, "VIRULE", "client", "account_roles.json"), "utf8")));
+  check("the confirmed roles are remembered (developer only)", s1.remembered?.developer === true && s1.remembered?.evaluator === false, s1.remembered);
   const raw = JSON.stringify(s1);
   const dbTokens = identity.prepare("SELECT token_hash FROM refresh_tokens").all().length;
   check("no bridge answer carries a token or key", !/refresh_token|access_token|seed|private/.test(raw));
@@ -277,6 +291,8 @@ try {
   await bridge('{"type":"account_refresh"}');
   const s4 = await waitStatus((x) => x.signed_in === false);
   check("a device revoked on the website is signed out by the Client", s4?.signed_in === false && s4.error === "signed_out_by_service", s4);
+  check("signed out, the last account's roles stay remembered (developer + evaluator)",
+    s4?.remembered?.developer === true && s4.remembered.evaluator === true, s4?.remembered);
   check("and its local session file is gone", !fs.existsSync(sessFile));
   check("a service sign-out also deletes the device key (it belonged to that authorization)", !fs.existsSync(devFile));
 
@@ -338,6 +354,15 @@ try {
   const r6 = await signInOnce({ ui: "light" });
   const s6 = await waitStatus((x) => x.signed_in && x.account);
   check("signing in again works after a revocation", s6?.signed_in === true);
+  // INSTALL DEV TOOLS WHILE SIGNED IN enrolls the account at once.
+  identity.prepare("DELETE FROM account_capabilities WHERE account_id = ? AND capability = 'developer'").run(acctId);
+  await bridge('{"type":"account_refresh"}');
+  const s6a = await waitStatus((x) => x.signed_in && x.effective?.developer === false && x.remembered?.developer === false);
+  check("(setup) without the developer grant the remembered roles follow (evaluator only)", !!s6a && s6a.remembered.evaluator === true, s6a);
+  await bridge('{"type":"capability_enable","capability":"dev_tools"}');
+  const s6b = await waitStatus((x) => x.effective?.developer === true);
+  check("Install Dev Tools while signed in enrolls the account as a developer and keeps the evaluator",
+    s6b?.effective?.developer === true && s6b.effective.evaluator === true && s6b.remembered?.developer === true, s6b);
   check("the landing page wears the website's theme (ui=light), the same copy",
     r6.ok.status === 200 && /<html lang="en" class="l">/.test(r6.ok.text) && /You are signed into the VIRULE app/.test(r6.ok.text));
   const liveJkt = identity.prepare("SELECT dpop_jkt FROM devices WHERE revoked_epoch IS NULL").get()?.dpop_jkt;
@@ -418,6 +443,21 @@ try {
   check("the account now shows the QA tester capability and no further link offer", s7?.capabilities.qa_tester === "active" && s7.qa_link_available === false, s7);
   check("the QA credential file is untouched (QA keeps working without the account)",
     JSON.parse(fs.readFileSync(path.join(ROOT, "VIRULE", "security", "qa_tester.cred"), "utf8")).credentials[0].signature === sig);
+  // A SECOND tester identity (another organization's invitation) on this
+  // machine is its own link: offered although the account already holds
+  // qa_tester, linked, then no longer offered.
+  const org2 = randomBytes(16).toString("hex"), tester2 = randomBytes(16).toString("hex");
+  const sig2 = nodeSign(null, Buffer.from(`virule-qa-tester.v2|${org2}|${tester2}|${devMachine.public_key}|${bound}`), servicePriv).toString("hex");
+  fs.writeFileSync(path.join(ROOT, "VIRULE", "security", "qa_tester.cred"), JSON.stringify({ version: 1, credentials: [
+    { organization_id: org, tester_id: tester, machine_key: devMachine.public_key, bound_utc: bound, signature: sig, organization_name: "Test Org" },
+    { organization_id: org2, tester_id: tester2, machine_key: devMachine.public_key, bound_utc: bound, signature: sig2, organization_name: "Second Org" }] }));
+  const sQa2 = await status();
+  check("a second, unlinked tester identity is offered although the account is a QA tester", sQa2.qa_link_available === true, sQa2);
+  const link2 = JSON.parse(await bridge('{"type":"account_link_qa"}'));
+  check("linking again links it (the first link is idempotent)", link2.ok === true && link2.linked === 2, link2);
+  const s7b = await waitStatus((x) => x.qa_link_available === false);
+  check("with both identities linked nothing more is offered", s7b?.qa_link_available === false &&
+    identity.prepare("SELECT COUNT(*) n FROM account_qa_links WHERE tester_id IN (?, ?)").get(tester, tester2).n === 2, s7b);
 
   // --- a password change on the website signs this installation out with
   // no restart (2026-10-16): its tokens are refused from the change on.

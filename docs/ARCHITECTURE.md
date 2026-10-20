@@ -9,7 +9,9 @@ update-health sections were written against v0.8.6 (2026-10-01); residency
 placement against v0.9.0 (2026-10-06); evaluation evidence delivery
 against the 2026-10-14 tree; the VIRULE account against v0.9.4 (2026-10-15);
 installed capabilities, the message table, the handoff envelope and the
-takeover against v0.9.9 (2026-10-16).
+takeover against v0.9.9 (2026-10-16); account roles, the QA link offer,
+the sign-in answer page's favicon and the shutdown drain against 0.9.12
+(2026-10-20).
 The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
@@ -122,7 +124,7 @@ in both components).
 | page | `{"type":"surface_ack"}` | the page states its next feedback view is rendered and active (the Setup takeover's browser acknowledgement) |
 | page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
-| local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe) |
+| local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe; since 0.9.12 an event wakes the serve loop so draining starts at once, not at its next 1 s poll, narrowing the race with Setup's fixed 2 s wait before it replaces the exe) |
 | local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below |
 | local | `{"type":"update_health"}` | answers `{"type":"update_health","blocked":bool}` from the persisted update-connectivity record (see "Update connectivity health"); a read only, it never makes a request (v0.8.6) |
 | local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch |
@@ -130,7 +132,7 @@ in both components).
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
-| local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4); ALWAYS, signed in or out, `enabled{dev_tools,evaluator}`, the installed capabilities (v0.9.9). Never a token |
+| local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4); ALWAYS, signed in or out, `enabled{dev_tools,evaluator}`, the installed capabilities (v0.9.9), and `remembered{developer,evaluator}`, the roles last confirmed for an account here (0.9.12; absent until an account was confirmed on this installation). Never a token |
 | local | `{"type":"account_sign_in"}` / `{"type":"account_sign_in_cancel"}` | start (idempotent) / cancel the browser sign-in |
 | local | `{"type":"account_sign_out"}` | revoke at the service (bounded), then forget locally |
 | local | `{"type":"account_refresh"}` | re-confirm the account and capabilities with the service (asynchronous) |
@@ -220,7 +222,9 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   page the listener serves is Smoky Blue with the canonical mark, light or
   dark: the authorize page appends `ui=light|dark` (its own resolved theme)
   to the redirect, and without it the browser's preference decides; `ui` is
-  presentation only. Ten-minute bound; Cancel ends it. ONE PENDING
+  presentation only. The page carries the VIRULE favicon inline (a `data:`
+  URI of the website's `favicon.svg`; its CSP adds `img-src data:`), because
+  the one-shot listener closes right after answering (0.9.12). Ten-minute bound; Cancel ends it. ONE PENDING
   SIGN-IN, REOPENABLE (0.9.11): another `account_sign_in` while the browser
   step waits starts nothing new; it opens the SAME authorize page again (the
   same request_uri, listener and PKCE pair; answer `{started: true,
@@ -279,6 +283,13 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
 - QA link: reads `qa_tester.cred`, proves the credential's machine key
   (dev_machine.cred), sends both under the DPoP authorization. The QA
   credential is never changed; QA keeps working without any account.
+  `qa_link_available` (0.9.12) is true when this installation holds a QA
+  tester credential bound to THIS machine whose tester id is not among the
+  account's `qa_linked_testers` (parsed from `/v1/account/me` and kept in
+  the session), even when the account already holds `qa_tester`; a session
+  saved before the list was kept falls back to the capability alone until
+  `/me` answers. It is a menu-offer flag only: confirmed participation is
+  the account's `qa_tester` capability and `qa_linked_testers`.
 - Development seam: `--account-endpoint=http(s)://127.0.0.1:<port>` (loopback
   only) points the service and site at a test server and replaces opening the
   browser with a `test_authorize_url` in the status. Proof:
@@ -1105,17 +1116,19 @@ the fallback for a client that died mid-teardown without sending it. A
 failed removal keeps the latch AND the registrations
 (Windows-recoverable) and offers Try again on the card.
 
-## Installed capabilities (0.9.9)
+## Installed capabilities (0.9.9) and account roles (0.9.12)
 
 `src/shared/installed_capabilities.hpp`, persisted in `client\state.json`
 (`enabled_recorded`, `enabled_dev_tools`, `enabled_evaluator`). VIRULE is
 ONE installation (one Virule-Setup.exe, one managed Admin package) whose
-capabilities are acquired through ENTRY POINTS (owner ruling 2026-10-16):
+ENTRY POINT record is acquired through ENTRY POINTS (owner ruling 2026-10-16):
 
-- the homepage "Get VIRULE Dev Tools" entry enables `dev_tools` (the Admin
-  shows Games, Evaluations, Campaigns);
+- the homepage "Get VIRULE Dev Tools" entry enables `dev_tools`;
 - an evaluator's "Install VIRULE" entry (the website account page) enables
-  `evaluator` (the Admin shows Assignments).
+  `evaluator`.
+
+The record decides the Admin's workspaces only for an installation no
+account was ever confirmed on (ADMIN NAVIGATION below).
 
 The entry point determines the capability, and the existing handoff carries
 it: a page's `admin_install` (recorded as the request is accepted), the
@@ -1125,10 +1138,40 @@ exists (no reinstall). Capabilities are ADDITIVE: receiving one never
 removes another. The Admin reads the record from `account_status`, the
 website from `status`, both as `enabled{dev_tools,evaluator}`.
 
-LOCAL PRESENTATION ONLY, NEVER AUTHORIZATION. The record grants nothing at
-the VIRULE service, which enforces the account's capabilities on every
-call. Navigation in the Admin requires BOTH the local capability and, where
-the workspace uses the service, the account's capability.
+ROLES ARE THE ACCOUNT'S (owner ruling 2026-10-20, replacing "the
+installation and the account together" of 2026-10-16). The service grants
+`developer` only through Install Dev Tools and `evaluator` only through the
+evaluator approval and accepted invitation; signing up grants nothing
+(VIRULE_BACKEND `docs/ACCOUNTS.md`). `src/shared/account_roles.hpp` keeps
+the two local facts this needs in `client\account_roles.json` (its own
+file, because the pinned Setup rewrites state.json with its own field
+list):
+
+- `pending_developer`, the INSTALL DEV TOOLS INTENT: every `dev_tools`
+  request (a page's `admin_install` or the Setup envelope's INSTALL_ADMIN
+  with `dev_tools` or no capability, `capability_enable dev_tools` from a
+  page or the Admin's Settings > Install Dev Tools) records it. The Client
+  delivers it (`POST /v1/account/developer/enable`) to the signed-in
+  account at once (confirm), or right after the next sign-in before `/me`
+  is read, so the account that signs in receives the grant; cleared once
+  the service answers 200 or 403, kept while it is unreachable. While
+  signed out the request also adds Dev Tools to the remembered layout.
+- REMEMBERED ROLES: every successful `/v1/account/me` records the account's
+  effective `developer` / `evaluator`, kept through sign-out, reported as
+  `account_status.remembered`.
+
+ADMIN NAVIGATION (`ui/account.ts` `workspacesFor`). Signed in, the
+account's service-confirmed roles decide: developer only = GAMES,
+EVALUATIONS, CAMPAIGNS; evaluator only = ASSIGNMENTS; both = all four; an
+account with neither role sees the local Dev Tools. Signed out: the
+remembered roles of the last account confirmed here, else the entry point
+record (`evaluator` alone = Assignments; `dev_tools` or nothing recorded =
+Dev Tools). EVALUATIONS is part of every Dev Tools layout, signed out too,
+where MY EVALUATIONS asks the person to sign in and holds no record.
+
+LOCAL PRESENTATION ONLY, NEVER AUTHORIZATION. Neither record grants
+anything at the VIRULE service, which enforces the account's capabilities
+on every call.
 
 MIGRATION, one time, at client startup (after the installed-version
 reconciliation): an installation with no record gains `dev_tools` when the
@@ -1136,7 +1179,7 @@ managed Admin is installed (every Admin installed before 0.9.9 came
 through the Dev Tools entry point) and never `evaluator`. The migration
 only adds, so a capability recorded in the moments before it ran is kept.
 
-Every uninstall removes it with the client state directory, so a reinstall
+Every uninstall removes both records with the client state directory, so a reinstall
 starts fresh. QA is untouched: a QA invitation keeps its per-game QA
 credential flow and records nothing here (QA credentials are not
 capabilities of this record).

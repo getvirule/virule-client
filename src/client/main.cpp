@@ -95,6 +95,12 @@ namespace {
 enum class RunState { Starting, Serving, Draining, Uninstalling };
 std::atomic<RunState> g_state{ RunState::Starting };
 std::atomic<bool> g_exit_requested{ false };
+// Signaled with g_exit_requested by Setup's shutdown, so the serve loop
+// starts draining AT ONCE instead of at its next one-second wake: Setup
+// replaces this exe on a fixed two-second wait after the reply
+// (setup/main.cpp stop_running_client) without seeing the process end,
+// and every millisecond of that wait belongs to the exit.
+HANDLE g_exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
 // The evidence test transport seam (--evidence-test-endpoint=); honored only
 // in a staging build or a redirected sandbox (shared/evidence_queue.hpp).
@@ -528,9 +534,13 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     callbacks.on_uninstall = [](bool delete_data) {
         begin_uninstall_async(delete_data);
     };
+    // An Install Dev Tools while signed in enrolls the account at once
+    // (shared/account_roles.hpp); signed out, the next sign-in delivers it.
+    vclient::roles::g_on_developer_intent = []() { vclient::account::confirm_async(); };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
         g_exit_requested.store(true);
+        if (g_exit_event) SetEvent(g_exit_event);
     };
     callbacks.on_setup_takeover = [](const std::string& payload) {
         vclient::takeover::on_setup_takeover(payload);
@@ -683,7 +693,8 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
 
     unsigned long long last_swap_attempt_tick = 0;
     for (;;) {
-        Sleep(1000);
+        if (g_exit_event) WaitForSingleObject(g_exit_event, 1000);
+        else Sleep(1000);
         if (g_exit_requested.load()) break;
 
         // THE SELF-UPDATE SWAP MONITOR: a verified staged client waits
