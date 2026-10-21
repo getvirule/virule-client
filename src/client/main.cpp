@@ -61,6 +61,7 @@
 #include "client/service_install.hpp"
 #include "client/service_watch.hpp"
 #include "client/takeover.hpp"
+#include "client/transfers.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
 #include "shared/environment.hpp"
@@ -106,6 +107,109 @@ HANDLE g_exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 // in a staging build or a redirected sandbox (shared/evidence_queue.hpp).
 std::wstring g_evidence_test_endpoint;
 HANDLE g_evidence_stop = nullptr;
+
+// GAME DISTRIBUTION (client/transfers.hpp; docs/ARCHITECTURE.md "Game
+// distribution"): the transfer thread. One forced pass at startup (the
+// recovery after a crash or a restart), then a blocked wait on
+// Local\VIRULE.Transfers.Wake, the earliest retry, or the stop event. An
+// uninstall pauses it. Every service call is this installation's DPoP
+// authorization (client/account.hpp transfer_headers); nothing here holds
+// a token for longer than one request.
+HANDLE g_transfer_stop = nullptr;
+HANDLE g_transfer_wake = nullptr;
+
+struct AccountTransferService final : vclient::transfers::Service {
+    bool signed_in(std::string& email_out) override { return vclient::account::signed_in_email(email_out); }
+    vclient::transfers::Reply call(const char* method, const std::string& path, const std::string& body,
+                                   const std::string& content_type, const std::vector<vclient::transfers::Header>& headers) override {
+        namespace acct = vclient::account;
+        vclient::transfers::Reply r;
+        const acct::Endpoint e = acct::api_endpoint();
+        const std::wstring wmethod = acct::widen(method);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::wstring h;
+            if (!acct::transfer_headers(method, path, h, attempt == 1)) { r.status = 0; return r; }
+            if (!content_type.empty()) h += L"Content-Type: " + acct::widen(content_type) + L"\r\n";
+            for (const auto& x : headers) h += acct::widen(x.name) + L": " + acct::widen(x.value) + L"\r\n";
+            vclient::http::Timeouts t;
+            t.send_ms = 120000;
+            t.receive_ms = 120000;
+            (void)vclient::http::request(wmethod.c_str(), e.host.c_str(), e.port, e.secure, acct::widen(path),
+                                         h, body, 256 * 1024, r.status, r.body, t);
+            if (r.status != 401) break;
+        }
+        return r;
+    }
+    bool get_range_to_file(const std::string& path, std::uint64_t from, std::uint64_t to, FILE* out,
+                           std::uint64_t& bytes_out, unsigned long& status_out,
+                           const std::function<bool()>& keep_going) override {
+        namespace acct = vclient::account;
+        const acct::Endpoint e = acct::api_endpoint();
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::wstring h;
+            if (!acct::transfer_headers("GET", path, h, attempt == 1)) { status_out = 0; return false; }
+            h += L"Range: bytes=" + std::to_wstring(from) + L"-" + std::to_wstring(to) + L"\r\n";
+            unsigned long long got = 0;
+            const bool okd = vclient::http::request_to_file(e.host.c_str(), e.port, e.secure, acct::widen(path), h,
+                                                            to - from + 1, out, got, status_out, keep_going);
+            bytes_out = got;
+            if (status_out != 401) return okd;
+        }
+        return false;
+    }
+    std::string machine_key() override { return vclient::machine_identity::public_key_hex(); }
+};
+AccountTransferService g_transfer_service;
+
+// A Build for Evaluation whose build or packaging stage lost its owner (the
+// Admin closed): start the Admin host headless to finish it, never while an
+// Admin is running (its singleton says so).
+bool resume_delivery_headless(const virule::core::evaluation_distribution::Job& job) {
+    if (job.admin_host_exe.empty() || job.admin_data_root.empty()) return false;
+    HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\VIRULE.AdminHost.Singleton");
+    if (m) { CloseHandle(m); return false; }
+    const std::wstring exe = vclient::account::widen(job.admin_host_exe);
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(std::filesystem::path(exe), ec) || ec) return false;
+    std::wstring cmd = L"\"" + exe + L"\" --data-root=\"" + vclient::account::widen(job.admin_data_root) +
+                       L"\" --resume-delivery=" + vclient::account::widen(job.id);
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+void start_transfers() {
+    namespace tr = vclient::transfers;
+    g_transfer_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_transfer_stop) {
+        vclient::log::client("transfers: stop event unavailable; driver not started");
+        return;
+    }
+    g_transfer_wake = vclient::evidence::create_wake_event(virule::core::evaluation_distribution::kWakeEventName);
+    auto* cfg = new tr::DriverConfig{};
+    cfg->root = vclient::paths::virule_data_root();
+    cfg->service = &g_transfer_service;
+    cfg->stop_event = g_transfer_stop;
+    cfg->paused = [] {
+        return vclient::bridge::g_uninstalling.load() ||
+               vclient::lifecycle::uninstall_intent_active();
+    };
+    cfg->log = [](const std::string& t) { vclient::log::client(t); };
+    cfg->resume_headless = resume_delivery_headless;
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID p) -> DWORD {
+            auto* c = (tr::DriverConfig*)p;
+            tr::run_driver(*c, g_transfer_wake);
+            delete c;
+            return 0;
+        },
+        cfg, 0, nullptr);
+    if (h) CloseHandle(h); else delete cfg;
+}
 
 // EVALUATION EVIDENCE DELIVERY (EVALUATION_VIRULE.md section 6): the
 // dedicated evidence thread. One forced recovery pass now, then a blocked
@@ -450,6 +554,21 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         if (type == "account_api") return acct::api_call(payload);
         return std::string();
     };
+    callbacks.transfer_message = [](const std::string& type, const std::string& payload) -> std::string {
+        namespace tr = vclient::transfers;
+        const auto root = vclient::paths::virule_data_root();
+        if (type == "transfer_control") {
+            const std::string answer = tr::control(payload, root);
+            if (g_transfer_wake) SetEvent(g_transfer_wake);
+            return answer;
+        }
+        if (type == "transfer_wake") {
+            if (g_transfer_wake) SetEvent(g_transfer_wake);
+            return "{\"type\":\"transfer_wake\",\"ok\":true}";
+        }
+        if (type == "transfer_status") return tr::status_json(root);
+        return std::string();
+    };
     callbacks.on_qa_accept = [](const std::string& token) {
         // A page is driving the redemption: any standalone Setup
         // conclusion is revoked (the browser owns the flow).
@@ -666,6 +785,11 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // restart and a Windows restart: the startup pass is the recovery).
     start_evidence_delivery();
 
+    // Game distribution: Build for Evaluation's upload and the evaluator's
+    // install are carried by this process (client/transfers.hpp), whether
+    // or not the Admin is running; the startup pass is the recovery.
+    start_transfers();
+
     // THE LIFECYCLE STATUS WATCHER (P1 status push, 2026-09-04): while any
     // virule.app page is connected, re-read the lifecycle core (the admin
     // block + the uninstalling flag) once a second and push a status frame
@@ -745,6 +869,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // backoff governs any retry.
     if (g_exit_requested.load()) vclient::residency::announce_client_exit_intent();
     if (g_evidence_stop) SetEvent(g_evidence_stop);
+    if (g_transfer_stop) SetEvent(g_transfer_stop);
     vclient::bridge::stop_listening();
 }
 

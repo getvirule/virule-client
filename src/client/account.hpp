@@ -1190,6 +1190,49 @@ inline std::string link_qa() {
  * could not be reached), "bad_request" or "too_large". A refused refresh
  * signs this installation out, as anywhere.
  */
+/** The signed-in account's email (lower case); false when signed out. */
+inline bool signed_in_email(std::string& out) {
+    std::lock_guard<std::mutex> lock(st().m);
+    ensure_loaded_locked(st());
+    if (!st().signed_in) return false;
+    out = st().session.email;
+    for (auto& c : out) c = (char)tolower((unsigned char)c);
+    return true;
+}
+
+/**
+ * THE TRANSFER DRIVER'S AUTHORIZATION (client/transfers.hpp): the DPoP
+ * proof and Authorization header for one request of THIS installation's
+ * account, refreshing the access token when it lapsed. Each request gets
+ * its own proof (a fresh jti), so a 20 GB upload is hundreds of proofs and
+ * never one replayed. False when signed out or the token cannot be had.
+ */
+inline bool transfer_headers(const char* method, const std::string& path, std::wstring& headers_out, bool retry_refresh = false) {
+    headers_out.clear();
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        ensure_loaded_locked(st());
+        if (!st().signed_in) return false;
+    }
+    store::DeviceKey key;
+    if (!store::device_key(key)) return false;
+    std::lock_guard<std::mutex> tl(token_mutex());
+    std::string at;
+    if (retry_refresh) {
+        if (!refresh_locked(key)) return false;
+        std::lock_guard<std::mutex> lock(st().m);
+        at = st().access_token;
+    } else if (!access_token_locked(key, at)) {
+        return false;
+    }
+    if (at.empty()) return false;
+    const Endpoint e = api_endpoint();
+    const std::string proof = dpop_proof(key, method, e.origin + path, at);
+    if (proof.empty()) return false;
+    headers_out = L"DPoP: " + widen(proof) + L"\r\nAuthorization: DPoP " + widen(at) + L"\r\n";
+    return true;
+}
+
 inline std::string api_call(const std::string& message) {
     namespace relay = vclient::account_relay;
     const relay::Request req = relay::parse(message);

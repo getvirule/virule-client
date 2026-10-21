@@ -72,6 +72,9 @@
 //                    {"type":"account_set_appearance","appearance":"light"|"dark"}
 //                                                      (explicit account appearance)
 //                    {"type":"account_open_settings"}  (website account page, this account)
+//                    {"type":"transfer_control","assignment_id","action":"pause"|"resume"|"retry"}
+//                    {"type":"transfer_wake"} / {"type":"transfer_status"}   (game distribution,
+//                                                      client/transfers.hpp)
 //                    {"type":"account_api","method","path","body"}  (the evaluation relay:
 //                                                       /v1/evaluations and /v1/assignments only)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
@@ -226,6 +229,12 @@ struct Callbacks {
     // explicit appearance choice. Gets the message type and the whole
     // payload; answers the FULL JSON reply; never a token.
     std::function<std::string(const std::string& type, const std::string& payload)> account_message;
+    // The transfer messages (client/transfers.hpp), LOCAL ONLY: the Admin
+    // host pausing, resuming or retrying an evaluator's install
+    // (transfer_control), waking the driver after it wrote a job
+    // (transfer_wake), or reading every job (transfer_status). Answers the
+    // FULL JSON reply.
+    std::function<std::string(const std::string& type, const std::string& payload)> transfer_message;
 };
 
 // Listener ownership: 0 unresolved, 1 this process listens, 2 the port is
@@ -931,6 +940,15 @@ inline void handle_client(SOCKET client) {
             const std::string answer = g_callbacks.account_message
                 ? g_callbacks.account_message(type, payload) : std::string();
             if (answer.empty() || answer.size() > (type == "account_api" ? kMaxLocalFrameBytes : kMaxFrameBytes)) {
+                if (!reply(0x1, "{\"type\":\"error\"}")) return;
+            } else {
+                if (!reply(0x1, answer)) return;
+            }
+        } else if (!is_page && (type == "transfer_control" || type == "transfer_wake" || type == "transfer_status")) {
+            // Game distribution (client/transfers.hpp). LOCAL ONLY.
+            const std::string answer = g_callbacks.transfer_message
+                ? g_callbacks.transfer_message(type, payload) : std::string();
+            if (answer.empty() || answer.size() > kMaxLocalFrameBytes) {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             } else {
                 if (!reply(0x1, answer)) return;

@@ -368,6 +368,67 @@ inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
     return true;
 }
 
+// One GET of a byte range appended to `out` (the evaluator's package
+// download, client/transfers.hpp): caller-supplied headers (DPoP, Range),
+// the 206 answer's bytes written as they arrive, `bytes_out` what was
+// written, `status_out` 0 exactly when no HTTP response was received.
+// `keep_going` false ABORTS the read (a pause, a stop); the caller keeps
+// the file and resumes from its length. Nothing here logs.
+inline bool request_to_file(const wchar_t* host, unsigned short port, bool secure,
+                            const std::wstring& path, const std::wstring& headers,
+                            unsigned long long max_bytes, FILE* out,
+                            unsigned long long& bytes_out, unsigned long& status_out,
+                            const std::function<bool()>& keep_going) {
+    status_out = 0;
+    bytes_out = 0;
+    HINTERNET hsession = WinHttpOpen(L"ViruleClient/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hsession) return false;
+    WinHttpSetTimeouts(hsession, 10000, 10000, 30000, 60000);
+    bool ok = false;
+    bool failed = false;
+    HINTERNET hconnect = WinHttpConnect(hsession, host, port, 0);
+    if (hconnect) {
+        HINTERNET hrequest = WinHttpOpenRequest(hconnect, L"GET", path.c_str(), nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
+        if (hrequest) {
+            DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+            WinHttpSetOption(hrequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof(redirect));
+            if (WinHttpSendRequest(hrequest,
+                    headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
+                    headers.empty() ? 0 : static_cast<DWORD>(-1L),
+                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(hrequest, nullptr)) {
+                DWORD status = 0;
+                DWORD sz = sizeof(status);
+                if (WinHttpQueryHeaders(hrequest,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
+                    status_out = status;
+                    ok = (status == 206);
+                }
+                if (ok) {
+                    std::string chunk;
+                    DWORD avail = 0;
+                    while (WinHttpQueryDataAvailable(hrequest, &avail) && avail > 0) {
+                        if (bytes_out + avail > max_bytes) { failed = true; break; }
+                        chunk.resize(avail);
+                        DWORD read = 0;
+                        if (!WinHttpReadData(hrequest, chunk.data(), avail, &read) || read == 0) break;
+                        if (fwrite(chunk.data(), 1, read, out) != read) { failed = true; break; }
+                        bytes_out += read;
+                        if (keep_going && !keep_going()) { failed = true; break; }
+                    }
+                }
+            }
+            WinHttpCloseHandle(hrequest);
+        }
+        WinHttpCloseHandle(hconnect);
+    }
+    WinHttpCloseHandle(hsession);
+    return ok && !failed;
+}
+
 // One bounded request with caller-supplied headers (the account service:
 // form-encoded OAuth posts, DPoP proofs, Authorization: DPoP). Same failure
 // contract as http_post_json: `status_out` is 0 exactly when NO HTTP

@@ -140,6 +140,9 @@ in both components).
 | local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
 | local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
 | local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` (at most four `/[A-Za-z0-9_-]+` segments) made here under this installation's DPoP authorization; the body is the message's LAST field, raw JSON. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
+| local | `{"type":"transfer_control","assignment_id":"<32 hex>","action":"pause"\|"resume"\|"retry"}` | GAME DISTRIBUTION (v0.9.14): pause, resume or re-queue the evaluator's install job for that assignment (see "Game distribution"); answers `{"type":"transfer_control","ok":bool}`; a malformed id or action answers `error` |
+| local | `{"type":"transfer_wake"}` | signal the transfer driver to run a pass now (the Admin host wrote or changed a job record); answers `{"type":"transfer_wake","ok":true}` |
+| local | `{"type":"transfer_status"}` | answers `{"type":"transfer_status","jobs":[...],"truncated":bool}`: every job record under `%LOCALAPPDATA%\VIRULE\transfers` as it stands (bounded); a read only |
 
 Client pushes to every connected page: `{"type":"qa_result","token","state"}`,
 `{"type":"admin_result","state","version"}`,
@@ -1391,6 +1394,78 @@ process-launch surface: install runs only the pipeline above against the
 approved manifest (package SHA-256 + Authenticode + signer identity are
 the trust decision, exactly Virule-Setup's), and open launches only the
 managed installation the client itself placed.
+
+## Game distribution (2026-10-20, client 0.9.14)
+
+Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` sections 3 and 9a
+(and `VIRULE_BACKEND/docs/EVALUATIONS.md`, "Hosted evaluation builds"). The
+job record, its states and the figures (the 20 GB cap on contents, 32 MiB
+parts, 64 MiB ranges, the wake event, the `transfers\` folder) are
+`virule/core/evaluation_distribution.hpp`, vendored byte-identical from
+v2_mvp. Engine and driver: `src/client/transfers.hpp`; wiring:
+`start_transfers()` and `AccountTransferService` in `src/client/main.cpp`.
+
+THE DRIVER is a dedicated thread started in `serve()` on every client. One
+forced pass at startup (the recovery after a crash, a kill or a Windows
+restart), then a blocked wait on `Local\VIRULE.Transfers.Wake` (the Admin
+host signals it after packaging a build or writing an install), the
+earliest retry, or its stop event. An uninstall pauses it. It moves every
+job under `%LOCALAPPDATA%\VIRULE	ransfers\<job id>\job.json` whose stage is
+the Client's, one at a time:
+
+- `upload` (Build for Evaluation; the Admin host hands it over as
+  `packaged`): open or resume the service's upload session for the build
+  (`POST /v1/evaluations/games/<uuid>/uploads`; the same build always
+  answers the same session), READ BACK which parts the service holds
+  (`GET /uploads/<session>`), send every missing 32 MiB part with its
+  SHA-256 and MD5 (`PUT /uploads/<session>/parts/<n>`; 409 `integrity` =
+  send again; 410 = renew the storage upload under the same session and
+  send everything again; 404 = open the session again), complete it
+  (`POST .../complete`; 409 `incomplete` = read back and continue), then
+  `done`: the service holds the hosted build. The package file's size
+  must still be the packaged one, else the job fails (`The package changed
+  since it was built. Build it again.`).
+- `install` (the Admin's Install writes it `queued` with the installs
+  location, the game folder and the partial file's path): ask for the
+  download (`POST /v1/assignments/<id>/download`: the revision, its size
+  and SHA-256; a revision other than the job's starts the download over),
+  fetch 64 MiB ranges appended to the partial file (a restart resumes from
+  its length), verify the whole package's SHA-256 (a mismatch removes the
+  file, reports `failed` to the service and fails the job with its reason),
+  extract into `<installs>\.virule-staging\<game>` and swap it into
+  `<installs>\<game uuid>` by one rename (a previous revision's folder goes
+  only then), write the assignment ticket (`GET /v1/assignments/<id>/ticket`,
+  plus `install_path` and `launch_exe`) and the evaluator credential
+  (`POST /v1/assignments/credential {machine_key}`, this installation's
+  dev_machine identity) the wrapper verifies at launch, report the
+  verified completion (`POST .../complete {sha256, bytes}`), then
+  `installed`.
+- A job still `building` or `packaging` is the Admin host's. When its
+  process is gone and no Admin is running (`Local\VIRULE.AdminHost.Singleton`
+  absent), the driver starts the host headless
+  (`ViruleAdminHost.exe --data-root=<dir> --resume-delivery=<job id>`,
+  from the paths the job records), at most every five minutes per job.
+
+GUARANTEES (`tests	ransfers`, `tools	ransfer_test.mjs`): the record is
+written atomically after every step; a part the service holds is never
+sent again; one session per build; retry never gives up (10 s, 1 min,
+5 min, 15 min, 30 min, then 30 min forever; a 409/410/404 is handled, not
+backed off); a job belongs to the account that started it (`account_email`,
+bound at the first attempt when the host did not know it) and waits
+untouched under another account or signed out; nothing is reported
+installed or done without the service's own acknowledgement; an install
+never touches anything but its own folder.
+
+AUTHORIZATION: every service call is this installation's DPoP proof
+(`account::transfer_headers`, a fresh proof per request, the access token
+refreshed on 401), never the relay. Part uploads carry the raw bytes
+(`http::request`); ranged downloads stream to the file (`http::request_to_file`).
+
+LOCAL MESSAGES (control connections only): `transfer_control`
+(`{"assignment_id","action":"pause"|"resume"|"retry"}`: a pause is recorded
+on the job and honored at the next range, a resume clears it, a retry
+re-queues a failed install; answers `{"type":"transfer_control","ok":true}`),
+`transfer_wake` (signal the driver), `transfer_status` (every job, bounded).
 
 ## Evaluation evidence delivery (2026-10-14)
 
