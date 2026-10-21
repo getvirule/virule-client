@@ -49,6 +49,15 @@
 //   - an install never overwrites anything but its own folder
 //     (<installs>\<game uuid>), staged beside it and swapped in by one
 //     rename; a previous revision's folder is replaced only at that moment;
+//   - AN UPDATE (2026-10-21: the same job moved on to a newer revision) never
+//     touches the installation while its game or panels are up (the
+//     wrapper's presence, evaluation_evidence.hpp session_running), keeps
+//     every file of the installed game the new package does not carry (its
+//     saves), and swaps with a way back: if the new folder cannot be put in
+//     place the previous one is put back, so the evaluator is never left
+//     without a game;
+//   - a game removes itself (removing -> removed) only after its report was
+//     acknowledged, never while it runs, and only its own folder;
 //   - nothing is reported installed without the verified completion the
 //     service acknowledged.
 //
@@ -682,6 +691,61 @@ inline bool refresh_launch_chain(const DriverConfig& cfg, const std::string& ass
     return r.ok;
 }
 
+// An update waiting for the game to close is looked at again this soon.
+inline constexpr std::int64_t kWhileRunningSeconds = 15;
+
+// Every regular file under `from` that `to` does not have, copied there at
+// the same relative path (the installed game's own files on an update).
+// Links are never followed; a file that cannot be copied fails the step
+// (nothing is replaced then).
+inline bool carry_over(const fs::path& from, const fs::path& to, std::string& why) {
+    std::error_code ec;
+    fs::recursive_directory_iterator it(from, fs::directory_options::skip_permission_denied, ec), end;
+    if (ec) { why = "The installed game could not be read."; return false; }
+    for (; it != end; it.increment(ec)) {
+        if (ec) { why = "The installed game could not be read."; return false; }
+        std::error_code sec;
+        const auto st = it->symlink_status(sec);
+        if (sec || fs::is_symlink(st)) { if (fs::is_directory(st)) it.disable_recursion_pending(); continue; }
+        if (!fs::is_regular_file(st)) continue;
+        const fs::path rel = fs::relative(it->path(), from, sec);
+        if (sec || rel.empty()) continue;
+        const fs::path target = to / rel;
+        if (fs::exists(target, sec)) continue;
+        fs::create_directories(target.parent_path(), sec);
+        fs::copy_file(it->path(), target, fs::copy_options::none, sec);
+        if (sec) { why = "A save or setting of the installed game could not be kept."; return false; }
+    }
+    return true;
+}
+
+// THE GAME REMOVES ITSELF (2026-10-21; UIUX.md Assignments: "after a
+// successful report submission and confirmed upload the game removes
+// itself"): only after the report's receipt (evidence_queue run_requests'
+// acknowledgment, main.cpp), never while it runs, and only its own folder
+// (<installs>\<game uuid>, as the job names it).
+inline void run_removal(const DriverConfig& cfg, ed::Job& j) {
+    if (ev::session_running(j.assignment_id)) {
+        j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
+        save(cfg, j);
+        return;
+    }
+    std::error_code ec;
+    const fs::path dst = path_of(j.install_dir);
+    const fs::path root = path_of(j.install_root);
+    // Only the job's own folder, directly inside the installs location.
+    if (!dst.empty() && !root.empty() && dst.parent_path() == root && dst.filename().string() == j.game_uuid) {
+        fs::remove_all(dst, ec);
+        if (ec && fs::exists(dst)) { defer(cfg, j, "The game could not be removed yet."); return; }
+    }
+    if (!j.temp_path.empty()) fs::remove(path_of(j.temp_path), ec);
+    j.state = "removed";
+    j.error.clear();
+    j.attempts = 0;
+    save(cfg, j);
+    log(cfg, j.id + " removed after the report was acknowledged");
+}
+
 inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
     if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
     if (j.account_email != email) return;
@@ -787,6 +851,15 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
     if (j.state == "extracting") {
         const fs::path dst = path_of(j.install_dir);
         const fs::path staging = path_of(j.install_root) / L".virule-staging" / dst.filename();
+        const bool updating = fs::exists(dst, ec);
+        // NEVER WHILE IT RUNS: an update waits for the game and its panels
+        // to close (looked at again shortly, not on the failure ladder).
+        if (updating && ev::session_running(j.assignment_id)) {
+            j.error = "Close the game to finish the update.";
+            j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
+            save(cfg, j);
+            return;
+        }
         fs::remove_all(staging, ec);
         fs::create_directories(staging, ec);
         std::string why;
@@ -801,16 +874,44 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             fail(cfg, j, "The installed game has no " + j.launch_exe + ".");
             return;
         }
-        // One rename into place; a previous revision's folder goes only now.
-        if (fs::exists(dst, ec)) {
-            const fs::path old = path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".old");
+        if (updating) {
+            // THE GAME'S OWN FILES STAY: everything in the installed folder
+            // the new package does not carry (saves, settings the game
+            // wrote, the wrapper's log) is copied into the new folder before
+            // it replaces the old one. What the package carries is the
+            // developer's new version.
+            if (!carry_over(dst, staging, why)) {
+                fs::remove_all(staging, ec);
+                defer(cfg, j, why);
+                return;
+            }
+            if (ev::session_running(j.assignment_id)) {   // started meanwhile
+                fs::remove_all(staging, ec);
+                j.error = "Close the game to finish the update.";
+                j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
+                save(cfg, j);
+                return;
+            }
+        }
+        // One rename into place, WITH A WAY BACK: the previous folder steps
+        // aside, the new one moves in, and only then does the previous one
+        // go; if the new one cannot move in, the previous one is put back.
+        const fs::path old = path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".old");
+        if (updating) {
             fs::remove_all(old, ec);
             fs::rename(dst, old, ec);
-            if (ec) { fs::remove_all(staging, ec); fail(cfg, j, "The previous installation could not be replaced."); return; }
-            fs::remove_all(old, ec);
+            if (ec) { fs::remove_all(staging, ec); defer(cfg, j, "The previous installation is in use. Close the game and try again."); return; }
         }
         fs::rename(staging, dst, ec);
-        if (ec) { fs::remove_all(staging, ec); fail(cfg, j, "The game could not be placed in its folder."); return; }
+        if (ec) {
+            std::error_code back;
+            if (updating) fs::rename(old, dst, back);
+            fs::remove_all(staging, ec);
+            if (updating && !back) { defer(cfg, j, "The update could not be put in place. The installed game is unchanged."); return; }
+            fail(cfg, j, "The game could not be placed in its folder.");
+            return;
+        }
+        if (updating) fs::remove_all(old, ec);
         if (!write_launch_chain(cfg, j)) return;
         const Reply done = cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/complete",
             "{\"sha256\":\"" + j.package_sha256 + "\",\"bytes\":" + std::to_string(j.package_bytes) + "}", "application/json", {});
@@ -876,6 +977,7 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
         }
         if (!signed_in) continue;   // the job waits for its account
         if (ed::is_upload(j)) run_upload(cfg, j, email);
+        else if (ed::is_install(j) && j.state == "removing") run_removal(cfg, j);
         else if (ed::is_install(j)) run_install(cfg, j, email);
         if (!ed::is_terminal(j) && j.next_attempt_utc > t) {
             pr.next_due_utc = pr.next_due_utc ? std::min(pr.next_due_utc, j.next_attempt_utc) : j.next_attempt_utc;
@@ -906,6 +1008,19 @@ inline void run_driver(const DriverConfig& cfg, HANDLE wake) {
         if (w == WAIT_OBJECT_0) break;
         if (w == WAIT_FAILED) Sleep(1000);
     }
+}
+
+// The report was acknowledged (main.cpp, from the evidence driver): the
+// assignment's installed game starts removing itself. True when a job was
+// set to remove.
+inline bool begin_removal(const fs::path& root, const std::string& assignment_id) {
+    ed::Job j;
+    if (!ed::install_for_assignment(root, assignment_id, j)) return false;
+    if (j.state == "removed" || j.state == "removing") return false;
+    j.state = "removing";
+    j.next_attempt_utc = 0;
+    j.updated_utc = utc_now();
+    return ed::write_job(root, j);
 }
 
 // The bridge's transfer_status (local only): every job, bounded.

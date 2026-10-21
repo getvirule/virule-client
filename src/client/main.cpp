@@ -67,6 +67,7 @@
 #include "shared/client_state.hpp"
 #include "shared/environment.hpp"
 #include "shared/evidence_queue.hpp"
+#include "client/evaluation_inbox.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
@@ -121,6 +122,18 @@ HANDLE g_evidence_stop = nullptr;
 // a token for longer than one request.
 HANDLE g_transfer_stop = nullptr;
 HANDLE g_transfer_wake = nullptr;
+
+// THE DEVELOPER'S EVALUATION INBOX (client/evaluation_inbox.hpp): its own
+// thread, woken only by communication the Client already has (startup, the
+// scheduled check's cadence, a changed Evaluations read through the relay).
+HANDLE g_inbox_stop = nullptr;
+HANDLE g_inbox_wake = nullptr;
+// What the developer's last relayed Evaluations read answered (a hash): a
+// different answer is news worth one inbox pass.
+std::atomic<std::uint64_t> g_last_view_hash{ 0 };
+// This process's identity in the change counter's generation, so an Admin
+// never mistakes a restarted Client's count for the same one.
+const unsigned long long g_boot_id = GetTickCount64() ^ ((unsigned long long)GetCurrentProcessId() << 32);
 
 struct AccountTransferService final : vclient::transfers::Service {
     bool signed_in(std::string& email_out) override { return vclient::account::signed_in_email(email_out); }
@@ -238,9 +251,29 @@ void start_evidence_delivery() {
     }
     struct Arg { ev::DriverConfig cfg; std::unique_ptr<ev::Transport> transport; };
     auto* arg = new Arg{};
+    // THE REAL DELIVERY (2026-10-21): this installation's DPoP calls, the
+    // same ones the transfer driver makes (AccountTransferService).
+    ev::ServiceCall service = [](const char* method, const std::string& path, const std::string& body,
+                                 const std::string& content_type,
+                                 const std::vector<std::pair<std::string, std::string>>& headers) {
+        std::vector<vclient::transfers::Header> h;
+        for (const auto& x : headers) h.push_back({ x.first, x.second });
+        const vclient::transfers::Reply r = g_transfer_service.call(method, path, body, content_type, h);
+        return ev::ServiceReply{ r.status, r.body };
+    };
     arg->transport = ev::select_transport(g_evidence_test_endpoint, vclient::env::kStaging,
                                           vclient::paths::environment_redirected(),
-                                          [](const std::string& t) { vclient::log::client(t); });
+                                          [](const std::string& t) { vclient::log::client(t); },
+                                          service, [] { return vclient::account::signed_in(); });
+    // A REPORT ACKNOWLEDGED: the game removes itself (client/transfers.hpp
+    // begin_removal), never while it runs.
+    arg->cfg.on_ack = [](const std::string& kind, const std::string& assignment_id) {
+        if (kind != "report") return;
+        if (vclient::transfers::begin_removal(vclient::paths::virule_data_root(), assignment_id)) {
+            vclient::log::client("evidence: report acknowledged; the game of " + assignment_id + " removes itself");
+            if (g_transfer_wake) SetEvent(g_transfer_wake);
+        }
+    };
     arg->cfg.root = ev::ee::root_under(vclient::paths::virule_data_root());
     arg->cfg.transport = arg->transport.get();
     arg->cfg.stop_event = g_evidence_stop;
@@ -258,6 +291,33 @@ void start_evidence_delivery() {
         },
         arg, 0, nullptr);
     if (h) CloseHandle(h); else delete arg;
+}
+
+// THE DEVELOPER'S EVALUATION INBOX: one pass now (the startup recovery),
+// then only on a wake.
+void start_inbox() {
+    namespace ib = vclient::evaluation_inbox;
+    g_inbox_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_inbox_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_inbox_stop) return;
+    auto* cfg = new ib::Config{};
+    cfg->root = vclient::paths::virule_data_root();
+    cfg->service = &g_transfer_service;
+    cfg->stop_event = g_inbox_stop;
+    cfg->wake = g_inbox_wake;
+    cfg->paused = [] {
+        return vclient::bridge::g_uninstalling.load() || vclient::lifecycle::uninstall_intent_active();
+    };
+    cfg->log = [](const std::string& t) { vclient::log::client(t); };
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID p) -> DWORD {
+            auto* c = (ib::Config*)p;
+            ib::run_driver(*c);
+            delete c;
+            return 0;
+        },
+        cfg, 0, nullptr);
+    if (h) CloseHandle(h); else delete cfg;
 }
 
 std::string narrow(const std::wstring& w) {
@@ -563,7 +623,17 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         if (type == "account_link_qa") return acct::link_qa();
         if (type == "account_set_appearance") return acct::set_appearance(payload);
         if (type == "account_open_settings") return acct::open_settings();
-        if (type == "account_api") return acct::api_call(payload);
+        if (type == "account_api") {
+            const std::string answer = acct::api_call(payload);
+            // The developer's own Evaluations read answered something new
+            // (an acceptance, a delivery): one inbox pass rides it.
+            if (payload.find("\"GET\"") != std::string::npos && payload.find("\"/v1/evaluations\"") != std::string::npos &&
+                answer.find("\"status\":200") != std::string::npos) {
+                const std::uint64_t h = std::hash<std::string>{}(answer);
+                if (g_last_view_hash.exchange(h) != h && g_inbox_wake) SetEvent(g_inbox_wake);
+            }
+            return answer;
+        }
         return std::string();
     };
     callbacks.transfer_message = [](const std::string& type, const std::string& payload) -> std::string {
@@ -579,6 +649,12 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
             return "{\"type\":\"transfer_wake\",\"ok\":true}";
         }
         if (type == "transfer_status") return tr::status_json(root);
+        if (type == "evaluation_changes") {
+            // THE CHANGE COUNTER (shared/evidence_queue.hpp): the Admin
+            // reads it locally and reads again what changed.
+            return "{\"type\":\"evaluation_changes\",\"generation\":\"" + std::to_string(g_boot_id) + ":" +
+                   std::to_string(vclient::evidence::change_counter().load()) + "\"}";
+        }
         if (type == "game_art") {
             const tr::DriverConfig* cfg = tr::control_config();
             return vclient::game_art::handle(payload, root, cfg ? cfg->service : nullptr);
@@ -784,12 +860,19 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
                     vclient::admin_install::kUpdateCheckFreshMs, true);
                 vclient::self_update::refresh_check(
                     vclient::self_update::kCheckFreshMs);
+                ULONGLONG last_inbox = GetTickCount64();
                 for (;;) {
                     Sleep(60000);
                     vclient::admin_install::refresh_update_check(
                         vclient::admin_install::kUpdateCheckPeriodMs, true);
                     vclient::self_update::refresh_check(
                         vclient::self_update::kCheckPeriodMs);
+                    // The developer's evaluation inbox rides the same quiet
+                    // cadence as the scheduled check (no polling of its own).
+                    if (GetTickCount64() - last_inbox >= vclient::admin_install::kUpdateCheckPeriodMs) {
+                        last_inbox = GetTickCount64();
+                        if (g_inbox_wake) SetEvent(g_inbox_wake);
+                    }
                 }
             },
             nullptr, 0, nullptr)) {
@@ -805,6 +888,10 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // install are carried by this process (client/transfers.hpp), whether
     // or not the Admin is running; the startup pass is the recovery.
     start_transfers();
+
+    // The developer's evaluation evidence, fetched in the background
+    // (client/evaluation_inbox.hpp); the startup pass is its recovery.
+    start_inbox();
 
     // AN ADMIN UPDATE THE PREVIOUS CLIENT COULD NOT RUN (0.9.15): the
     // record it left is honored once, now that this (newer) client serves
@@ -914,6 +1001,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // backoff governs any retry.
     if (g_exit_requested.load()) vclient::residency::announce_client_exit_intent();
     if (g_evidence_stop) SetEvent(g_evidence_stop);
+    if (g_inbox_stop) SetEvent(g_inbox_stop);
     if (g_transfer_stop) SetEvent(g_transfer_stop);
     vclient::bridge::stop_listening();
 }

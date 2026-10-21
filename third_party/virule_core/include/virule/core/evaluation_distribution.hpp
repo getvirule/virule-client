@@ -30,6 +30,12 @@
 //
 // UPLOAD STATES   building -> packaging -> packaged -> uploading -> registering -> done | failed
 // INSTALL STATES  queued -> downloading (paused) -> verifying -> extracting -> installed | failed
+//                 installed -> queued (an UPDATE: the same job moves on to a newer revision;
+//                              the installed revision stays on disk until the verified
+//                              replacement is swapped in, and the game's own files that
+//                              the new package does not carry, its saves, are kept)
+//                 installed -> removing -> removed (the report acknowledged: the game
+//                              removes itself, never while it runs)
 //
 // Whoever resumes a job after a crash restarts the stage it was in from
 // the job's immutable inputs (the build output, the package), never from a
@@ -152,7 +158,7 @@ inline bool is_upload(const Job& j) { return j.kind == "upload"; }
 inline bool is_install(const Job& j) { return j.kind == "install"; }
 
 inline bool is_terminal(const Job& j) {
-    return j.state == "done" || j.state == "failed" || j.state == "installed";
+    return j.state == "done" || j.state == "failed" || j.state == "installed" || j.state == "removed";
 }
 
 inline std::string parts_json(const std::vector<std::int64_t>& v) {

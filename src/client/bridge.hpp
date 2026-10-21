@@ -948,7 +948,7 @@ inline void handle_client(SOCKET client) {
                 if (!reply(0x1, answer)) return;
             }
         } else if (!is_page && (type == "transfer_control" || type == "transfer_wake" || type == "transfer_status" ||
-                                type == "game_art")) {
+                                type == "game_art" || type == "evaluation_changes")) {
             // Game distribution (client/transfers.hpp) and game art
             // (client/game_art.hpp, 0.9.16). LOCAL ONLY.
             const std::string answer = g_callbacks.transfer_message

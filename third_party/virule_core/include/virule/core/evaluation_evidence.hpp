@@ -13,6 +13,8 @@
 //   .incoming\<package_id>\   being written by the wrapper (the session owns it)
 //   outbox\<package_id>\      handed off: package.json + <seq>.jpg (the Client owns it)
 //   receipts\<package_id>.json  the service acknowledged it
+//   requests\, progress\      the early completion, the report and the
+//                             service's progress (2026-10-21; "requests" below)
 //
 // HANDOFF IS ONE DIRECTORY RENAME. The wrapper stages .incoming\<id>
 // (moves the capture files in, writes package.json, flushes and hashes
@@ -874,6 +876,175 @@ inline bool write_file_atomic(const std::filesystem::path& p, const std::string&
 }
 
 #endif // _WIN32
+
+// =========================================== requests (2026-10-21) =======
+// THE TWO OTHER THINGS THE CLIENT DELIVERS FOR AN ASSIGNMENT, beside its
+// session packages, with the same ownership rule: whoever writes the
+// request file hands it over, the Client owns it from then on, and nothing
+// is reported done without the service's answer written as a receipt first.
+//
+//   requests\<assignment>.early.json    the EARLY COMPLETION (the wrapper's
+//                                       post-session panel writes it)
+//   requests\<assignment>.report.json   the EVALUATION REPORT (the Admin host
+//                                       writes it at Submit Evaluation)
+//   receipts\<assignment>.early.json    the service recorded the early completion
+//   receipts\<assignment>.report.json   the service accepted the report (the
+//                                       assignment is completed)
+//   delivery\<assignment>.<kind>.json   the Client's delivery state of a request
+//   progress\<assignment>.json          the service's own progress of the
+//                                       assignment, as its last answer stated it
+//
+// Every file name is longer than a package's `<32 hex>.json`, so the
+// package scans above never read one of these. A request is ONE document,
+// replaced atomically (a new report replaces an unsent or refused one), and
+// the Client posts its `body` member to the service exactly as written.
+
+inline constexpr const char* kEarlyFormat = "virule-evaluation-early-completion.v1";
+inline constexpr const char* kReportFormat = "virule-evaluation-report.v1";
+
+// The owner's two early-completion reasons (owner brief 2026-10-21).
+inline constexpr const char* kEarlyReasonCompletedGame = "completed_game";
+inline constexpr const char* kEarlyReasonEndOfContent = "end_of_content";
+inline bool is_early_reason(const std::string& r) {
+    return r == kEarlyReasonCompletedGame || r == kEarlyReasonEndOfContent;
+}
+inline constexpr size_t kEarlyExplanationMax = 2000;   // the service's EARLY_EXPLANATION_MAX
+
+inline std::filesystem::path requests_dir(const Root& r) { return r.dir / L"requests"; }
+inline std::filesystem::path progress_dir(const Root& r) { return r.dir / L"progress"; }
+inline std::filesystem::path early_request_path(const Root& r, const std::string& assignment_id) {
+    return requests_dir(r) / std::filesystem::path(assignment_id + ".early.json");
+}
+inline std::filesystem::path report_request_path(const Root& r, const std::string& assignment_id) {
+    return requests_dir(r) / std::filesystem::path(assignment_id + ".report.json");
+}
+inline std::filesystem::path early_receipt_path(const Root& r, const std::string& assignment_id) {
+    return receipts_dir(r) / std::filesystem::path(assignment_id + ".early.json");
+}
+inline std::filesystem::path report_receipt_path(const Root& r, const std::string& assignment_id) {
+    return receipts_dir(r) / std::filesystem::path(assignment_id + ".report.json");
+}
+inline std::filesystem::path request_delivery_path(const Root& r, const std::string& assignment_id, const char* kind) {
+    return r.dir / L"delivery" / std::filesystem::path(assignment_id + "." + kind + ".json");
+}
+inline std::filesystem::path progress_path(const Root& r, const std::string& assignment_id) {
+    return progress_dir(r) / std::filesystem::path(assignment_id + ".json");
+}
+
+// The early completion as the wrapper records it. `body` is what the
+// service receives: {request_id, reason, explanation}.
+struct EarlyRequest {
+    std::string request_id, assignment_id, reason, explanation, created_utc;
+};
+
+inline std::string early_body_json(const EarlyRequest& e) {
+    using json::quote;
+    return "{\"request_id\":" + quote(e.request_id) + ",\"reason\":" + quote(e.reason) +
+        ",\"explanation\":" + quote(e.explanation) + "}";
+}
+
+inline std::string early_request_json(const EarlyRequest& e) {
+    using json::quote;
+    return "{\"format\":" + quote(kEarlyFormat) + ",\"assignment_id\":" + quote(e.assignment_id) +
+        ",\"created_utc\":" + quote(e.created_utc) + ",\"body\":" + early_body_json(e) + "}\n";
+}
+
+inline bool parse_early_request(std::string_view text, EarlyRequest& e) {
+    e = EarlyRequest{};
+    std::string format;
+    if (!json::get_string(text, "format", format) || format != kEarlyFormat) return false;
+    if (!json::get_string(text, "assignment_id", e.assignment_id) || !is_hex32(e.assignment_id)) return false;
+    e.created_utc = json::opt_string(text, "created_utc");
+    std::string_view body;
+    if (!json::member(text, "body", body)) return false;
+    if (!json::get_string(body, "request_id", e.request_id) || !is_hex32(e.request_id)) return false;
+    if (!json::get_string(body, "reason", e.reason) || !is_early_reason(e.reason)) return false;
+    if (!json::get_string(body, "explanation", e.explanation) || e.explanation.empty()) return false;
+    return true;
+}
+
+// The request's raw `body` member (what the Client posts), or "".
+inline std::string request_body(std::string_view text) {
+    std::string_view body;
+    if (!json::member(text, "body", body) || body.empty() || body.front() != '{') return {};
+    return std::string(body);
+}
+
+// The report as the Admin host records it: {format, assignment_id,
+// submission_id, created_utc, packages:[...], body:{...service body...}}.
+inline bool report_request_ids(std::string_view text, std::string& assignment_id, std::string& submission_id) {
+    std::string format;
+    assignment_id.clear();
+    submission_id.clear();
+    if (!json::get_string(text, "format", format) || format != kReportFormat) return false;
+    if (!json::get_string(text, "assignment_id", assignment_id) || !is_hex32(assignment_id)) return false;
+    if (!json::get_string(text, "submission_id", submission_id) || !is_hex32(submission_id)) return false;
+    return !request_body(text).empty();
+}
+
+#if defined(_WIN32)
+// THE SESSION'S PRESENCE (2026-10-21). While an evaluation wrapper serves an
+// assignment (from its first look at the assignment through its post-session
+// panel) it holds this named mutex. The VIRULE Client never replaces that
+// assignment's installation while it exists (a mandatory update waits for
+// the game and its panels to close), and the Admin reads it as running. The
+// system releases it with the process, so a crash never leaves it held.
+inline std::wstring running_mutex_name(const std::string& assignment_id) {
+    return L"Local\\VIRULE.Evaluation.Running." + std::wstring(assignment_id.begin(), assignment_id.end());
+}
+
+inline bool session_running(const std::string& assignment_id) {
+    if (!is_hex32(assignment_id)) return false;
+    HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, running_mutex_name(assignment_id).c_str());
+    if (h) { CloseHandle(h); return true; }
+    return GetLastError() == ERROR_ACCESS_DENIED;   // it exists, held by another integrity level
+}
+
+// The wrapper's handoff of an early completion: one atomic write into the
+// requests folder (replacing nothing that was acknowledged: a receipt means
+// the assignment's one early completion stands), then the wake event.
+enum class EarlyHandoff { HandedOff, AlreadyRecorded, Failed };
+
+inline EarlyHandoff hand_off_early(const Root& root, const EarlyRequest& e) {
+    if (root.dir.empty() || !is_hex32(e.assignment_id) || !is_hex32(e.request_id) || !is_early_reason(e.reason) ||
+        e.explanation.empty() || e.explanation.size() > kEarlyExplanationMax * 4) {
+        return EarlyHandoff::Failed;
+    }
+    if (exists_quiet(early_receipt_path(root, e.assignment_id))) return EarlyHandoff::AlreadyRecorded;
+    if (!write_file_atomic(early_request_path(root, e.assignment_id), early_request_json(e))) return EarlyHandoff::Failed;
+    (void)signal_wake();
+    return EarlyHandoff::HandedOff;
+}
+#endif
+
+// THE DEVELOPER'S RECEIVED EVIDENCE (2026-10-21), fetched by the developer's
+// VIRULE Client from the service in the background and taken into the
+// Admin's durable workspace (evaluation_evidence_store import) once the
+// evaluation is delivered:
+//   received\<evaluation_id>\evaluation.json   {evaluation_id, game_uuid, status,
+//                                              delivered_utc, contest_until_utc}
+//   received\<evaluation_id>\<package_id>\     package.json + captures, every file
+//                                              verified against its SHA-256
+//   received\<evaluation_id>\<package_id>.done the package arrived whole: {package_id,
+//                                              sha256}; kept after the Admin took the
+//                                              files, so nothing is fetched twice
+inline std::filesystem::path received_root(const Root& r) { return r.dir / L"received"; }
+inline std::filesystem::path received_dir(const Root& r, const std::string& evaluation_id) {
+    return received_root(r) / std::filesystem::path(evaluation_id);
+}
+inline std::filesystem::path received_package_dir(const Root& r, const std::string& evaluation_id, const std::string& package_id) {
+    return received_dir(r, evaluation_id) / std::filesystem::path(package_id);
+}
+inline std::filesystem::path received_marker_path(const Root& r, const std::string& evaluation_id, const std::string& package_id) {
+    return received_dir(r, evaluation_id) / std::filesystem::path(package_id + ".done");
+}
+
+// An early completion this computer knows of for the assignment: recorded
+// by the service (a receipt), or handed over and not yet answered (a
+// request). The post-session panel offers the link only while neither exists.
+inline bool early_known(const Root& root, const std::string& assignment_id) {
+    return exists_quiet(early_receipt_path(root, assignment_id)) || exists_quiet(early_request_path(root, assignment_id));
+}
 
 // ===================================================== delivery state ====
 

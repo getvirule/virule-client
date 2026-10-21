@@ -32,12 +32,24 @@
 //     checked again on the ladder in case it was a transient read failure;
 //   - nothing is reported delivered without a receipt.
 //
-// TRANSPORTS. ProductionTransport is DEFERRED (no backend endpoint exists):
-// it answers `unavailable` without any network call, so every package stays
-// pending. TestTransport is loopback HTTP against --evidence-test-endpoint=,
-// honored only in a staging build or a redirected-LOCALAPPDATA sandbox; its
-// receipts carry simulated:true. Its wire protocol is documented above the
-// class.
+// TRANSPORTS. ServiceTransport (2026-10-21) is the real delivery: the
+// session's package.json, then every capture it lists, each one request of
+// this installation's DPoP authorization to the VIRULE service
+// (VIRULE_BACKEND src/evaluations/evidence.ts), the service verifying every
+// file against the SHA-256 the package lists before it acknowledges it.
+// Signed out it answers `unavailable` without any network call. TestTransport
+// is loopback HTTP against --evidence-test-endpoint=, honored only in a
+// staging build or a redirected-LOCALAPPDATA sandbox; its receipts carry
+// simulated:true. Its wire protocol is documented above the class.
+//
+// REQUESTS (2026-10-21). After the packages, each pass delivers the
+// assignment's EARLY COMPLETION and its REPORT (evaluation_evidence.hpp
+// "requests"), each to its receipt with the same rules: never reported done
+// without the service's answer, retried on the ladder, a permanent refusal
+// kept (with the service's sentence) until a new request replaces it. The
+// service's own progress of the assignment, which every completing answer
+// carries, is kept in progress\<assignment>.json, and every change bumps the
+// in-process CHANGE COUNTER the Admin reads locally (evaluation_changes).
 //
 // DRIVER. run_driver() is the Client's dedicated evidence thread: one forced
 // pass at startup (recovery after a crash or a Windows restart), then a
@@ -45,6 +57,7 @@
 // next_attempt, OR the stop event. Idle costs nothing.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
@@ -194,6 +207,13 @@ struct Answer {
     bool complete = false;
     std::string receipt_id;
     std::string error;
+    std::string progress;            // the service's progress of the assignment (raw JSON), when it said
+};
+
+// One answer of the service to a request (an early completion, a report).
+struct ServiceReply {
+    unsigned long status = 0;        // 0 = no HTTP answer
+    std::string body;
 };
 
 class Transport {
@@ -202,7 +222,19 @@ public:
     virtual const char* name() const = 0;
     virtual bool simulated() const = 0;
     virtual Answer deliver(const Offer& offer) = 0;
+    // Requests (early completion, report): false = this transport cannot
+    // carry them (they stay pending).
+    virtual bool post_request(const std::string& /*path*/, const std::string& /*body*/, ServiceReply& /*out*/) { return false; }
+    // False = signed out: requests wait without a network call.
+    virtual bool ready() { return true; }
 };
+
+// THE CHANGE COUNTER: every change this process makes to the evaluation
+// records on this computer (a receipt, a request acknowledged or refused,
+// the service's progress, evidence fetched for the developer). The Admin
+// reads it locally and reads again what changed.
+inline std::atomic<std::uint64_t>& change_counter() { static std::atomic<std::uint64_t> n{ 0 }; return n; }
+inline void note_change() { change_counter().fetch_add(1); }
 
 // DEFERRED: no evidence endpoint exists in virule-api (contract section 9,
 // item 2). No network call is made; every package stays pending.
@@ -255,6 +287,7 @@ inline bool parse_answer(std::string_view text, Answer& a) {
     a.complete = false;
     if (j::member(text, "complete", raw) && !j::as_bool(raw, a.complete)) return false;
     a.receipt_id = j::opt_string(text, "receipt_id");
+    if (j::member(text, "progress", raw) && !raw.empty() && raw.front() == '{') a.progress = std::string(raw);
     a.kind = Answer::Kind::Answered;
     return true;
 }
@@ -382,6 +415,125 @@ private:
     http::Url url_;
 };
 
+// THE SERVICE TRANSPORT (2026-10-21; VIRULE_BACKEND src/evaluations/
+// evidence.ts). `call` is one request of this installation's DPoP
+// authorization (main.cpp: the account's transfer headers, refreshed on a
+// 401); `signed_in` says whether one can be made. The wire:
+//
+//   POST /v1/assignments/<a>/evidence/<package>               package.json, raw
+//   PUT  /v1/assignments/<a>/evidence/<package>/files/<file>  one capture, raw
+//
+// each with `x-virule-file-sha256`, every answer
+//   {package_id, acked:[...], complete, receipt_id?, progress?}
+// A file the storage did not reproduce (409 integrity) is sent again once;
+// anything else ends the attempt (the ladder retries), the acked set kept.
+using ServiceCall = std::function<ServiceReply(const char* method, const std::string& path, const std::string& body,
+                                               const std::string& content_type,
+                                               const std::vector<std::pair<std::string, std::string>>& headers)>;
+
+inline std::string read_whole_file(const fs::path& p, std::int64_t max_bytes, bool& ok) {
+    ok = false;
+    std::error_code ec;
+    const auto size = fs::file_size(p, ec);
+    if (ec || (std::int64_t)size > max_bytes) return {};
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return {};
+    std::string data((size_t)size, '\0');
+    if (size > 0 && !in.read(data.data(), (std::streamsize)size)) return {};
+    ok = true;
+    return data;
+}
+
+inline std::string service_error(const ServiceReply& r) {
+    if (r.status == 0) return "Couldn't reach our servers right now.";
+    std::string m;
+    std::string_view raw;
+    if (ee::json::member(r.body, "error", raw)) m = ee::json::opt_string(raw, "message");
+    return m.empty() ? "the service answered " + std::to_string(r.status) : m;
+}
+
+inline std::string service_code(const ServiceReply& r) {
+    std::string_view raw;
+    return ee::json::member(r.body, "error", raw) ? ee::json::opt_string(raw, "code") : std::string();
+}
+
+class ServiceTransport final : public Transport {
+public:
+    ServiceTransport(ServiceCall call, std::function<bool()> signed_in)
+        : call_(std::move(call)), signed_in_(std::move(signed_in)) {}
+    const char* name() const override { return "service"; }
+    bool simulated() const override { return false; }
+    bool ready() override { return !signed_in_ || signed_in_(); }
+
+    bool post_request(const std::string& path, const std::string& body, ServiceReply& out) override {
+        if (!call_) return false;
+        out = call_("POST", path, body, "application/json", {});
+        return true;
+    }
+
+    Answer deliver(const Offer& offer) override {
+        Answer result;
+        if (!call_ || !ready()) {
+            result.kind = Answer::Kind::Unavailable;
+            result.error = "signed out";
+            return result;
+        }
+        std::set<std::string> acked(offer.already_acked.begin(), offer.already_acked.end());
+        const auto finish = [&](Answer a) {
+            a.acked.assign(acked.begin(), acked.end());
+            return a;
+        };
+        const std::string base = "/v1/assignments/" + offer.assignment_id + "/evidence/" + offer.package_id;
+        Answer last;
+        const auto send = [&](const char* method, const std::string& path, const OfferFile& f, const char* type) -> bool {
+            bool readable = false;
+            const std::string bytes = read_whole_file(f.path, 64 * 1024 * 1024, readable);
+            if (!readable || (std::int64_t)bytes.size() != f.bytes) {
+                last = Answer{};
+                last.kind = Answer::Kind::Failed;
+                last.error = "could not read " + f.file;
+                return false;
+            }
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                const ServiceReply r = call_(method, path, bytes, type, { { "x-virule-file-sha256", f.sha256 } });
+                last = Answer{};
+                if ((r.status == 200 || r.status == 201) && parse_answer(r.body, last)) {
+                    acked.insert(last.acked.begin(), last.acked.end());
+                    return true;
+                }
+                if (r.status == 409 && service_code(r) == "integrity" && attempt == 0) continue;
+                last = Answer{};
+                last.kind = Answer::Kind::Failed;
+                last.error = service_error(r);
+                return false;
+            }
+            return false;
+        };
+        // package.json first, always: it registers the session (a repeat
+        // answers what the service holds, so a resumed delivery reads back).
+        const OfferFile* head = nullptr;
+        for (const auto& f : offer.files) if (f.file == ee::kPackageFileName) head = &f;
+        if (!head) {
+            Answer a;
+            a.kind = Answer::Kind::Failed;
+            a.error = "no package.json";
+            return finish(a);
+        }
+        if (!send("POST", base, *head, "application/json")) return finish(last);
+        if (last.complete) return finish(last);
+        for (const auto& f : offer.files) {
+            if (f.file == ee::kPackageFileName || acked.count(f.file)) continue;
+            if (!send("PUT", base + "/files/" + f.file, f, "image/jpeg")) return finish(last);
+            if (last.complete) return finish(last);
+        }
+        return finish(last);
+    }
+
+private:
+    ServiceCall call_;
+    std::function<bool()> signed_in_;
+};
+
 // ---- transport selection (the --evidence-test-endpoint= seam)
 
 // The test endpoint is honored ONLY in a staging build or a sandbox whose
@@ -401,7 +553,8 @@ inline bool parse_test_endpoint(const std::wstring& s, http::Url& out) {
 
 inline std::unique_ptr<Transport> select_transport(const std::wstring& test_endpoint,
                                                    bool staging_build, bool redirected,
-                                                   const Log& log) {
+                                                   const Log& log, ServiceCall service = {},
+                                                   std::function<bool()> signed_in = {}) {
     if (!test_endpoint.empty()) {
         http::Url u;
         if (!test_endpoint_permitted(staging_build, redirected)) {
@@ -413,6 +566,7 @@ inline std::unique_ptr<Transport> select_transport(const std::wstring& test_endp
             return std::make_unique<TestTransport>(u);
         }
     }
+    if (service) return std::make_unique<ServiceTransport>(std::move(service), std::move(signed_in));
     return std::make_unique<ProductionTransport>();
 }
 
@@ -585,6 +739,8 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
             // The receipt first, durably; then the payload goes.
             if (ee::acknowledge(r, rc)) {
                 remove_state(r, id);
+                if (!ans.progress.empty()) (void)ee::write_file_atomic(ee::progress_path(r, pkg.assignment_id), ans.progress + "\n");
+                note_change();
                 ++res.delivered;
                 if (log) log("evidence: " + id + " acknowledged (receipt " + ans.receipt_id +
                              (rc.simulated ? ", simulated)" : ")"));
@@ -619,6 +775,165 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
         if (name.size() != 37 || name.compare(32, 5, ".json") != 0) continue;
         const std::string id = name.substr(0, 32);
         if (!ee::exists_quiet(ee::outbox_dir(r, id))) remove_state(r, id);
+    }
+    return res;
+}
+
+// ---- requests: the early completion and the report (2026-10-21)
+
+struct RequestState {
+    std::string id;                  // the request it is about (request_id / submission_id)
+    std::int64_t attempts = 0, failures = 0, next_attempt_utc = 0;
+    std::string last_error, code;
+    bool refused = false;            // the service said no for good: kept until a new request
+};
+
+inline std::string request_state_json(const RequestState& s) {
+    using ee::json::quote;
+    return "{\"id\":" + quote(s.id) + ",\"attempts\":" + std::to_string(s.attempts) + ",\"failures\":" +
+        std::to_string(s.failures) + ",\"next_attempt_utc\":" + std::to_string(s.next_attempt_utc) +
+        ",\"last_error\":" + quote(s.last_error) + ",\"code\":" + quote(s.code) +
+        ",\"refused\":" + (s.refused ? "true" : "false") + "}\n";
+}
+
+inline RequestState load_request_state(const ee::Root& r, const std::string& assignment_id, const char* kind) {
+    RequestState s;
+    const std::string text = ee::read_document(ee::request_delivery_path(r, assignment_id, kind));
+    if (text.empty()) return s;
+    s.id = ee::json::opt_string(text, "id");
+    s.attempts = ee::json::opt_int(text, "attempts");
+    s.failures = ee::json::opt_int(text, "failures");
+    s.next_attempt_utc = ee::json::opt_int(text, "next_attempt_utc");
+    s.last_error = ee::json::opt_string(text, "last_error");
+    s.code = ee::json::opt_string(text, "code");
+    (void)ee::json::get_bool(text, "refused", s.refused);
+    return s;
+}
+
+// What the pass did with the requests (tests and logs).
+struct RequestResult {
+    int acknowledged = 0, refused = 0, pending = 0;
+    std::int64_t next_due_utc = 0;
+};
+
+using AcknowledgedFn = std::function<void(const std::string& kind, const std::string& assignment_id)>;
+
+// One pass over the requests folder. `on_ack` hears every acknowledgment
+// (main.cpp: a report acknowledged starts the game's removal).
+inline RequestResult run_requests(const ee::Root& r, Transport& transport, std::int64_t now, bool force,
+                                  const Log& log, const AcknowledgedFn& on_ack = {}) {
+    RequestResult res;
+    if (r.dir.empty()) return res;
+    struct Item { std::string assignment, kind; fs::path path; };
+    std::vector<Item> items;
+    std::error_code ec;
+    for (fs::directory_iterator it(ee::requests_dir(r), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() < 33 || !ee::is_hex32(name.substr(0, 32))) continue;
+        const std::string rest = name.substr(32);
+        if (rest == ".early.json") items.push_back({ name.substr(0, 32), "early", it->path() });
+        else if (rest == ".report.json") items.push_back({ name.substr(0, 32), "report", it->path() });
+    }
+    // Early completions before reports: a report written after an early
+    // completion needs it recorded first.
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.kind != b.kind ? a.kind == "early" : a.assignment < b.assignment;
+    });
+    const auto schedule = [&](RequestState& st, const Item& it) {
+        ++st.failures;
+        st.next_attempt_utc = now + backoff_seconds(st.failures);
+        (void)ee::write_file_atomic(ee::request_delivery_path(r, it.assignment, it.kind.c_str()), request_state_json(st));
+        ++res.pending;
+        if (res.next_due_utc == 0 || st.next_attempt_utc < res.next_due_utc) res.next_due_utc = st.next_attempt_utc;
+    };
+    for (const auto& it : items) {
+        const bool early = it.kind == "early";
+        const fs::path receipt = early ? ee::early_receipt_path(r, it.assignment) : ee::report_receipt_path(r, it.assignment);
+        const std::string text = ee::read_document(it.path);
+        std::string id;
+        if (early) {
+            ee::EarlyRequest e;
+            if (!ee::parse_early_request(text, e) || e.assignment_id != it.assignment) continue;
+            id = e.request_id;
+        } else {
+            std::string aid;
+            if (!ee::report_request_ids(text, aid, id) || aid != it.assignment) continue;
+        }
+        if (ee::exists_quiet(receipt)) {
+            // The receipt is the fact: the request only goes.
+            fs::remove(it.path, ec);
+            continue;
+        }
+        RequestState st = load_request_state(r, it.assignment, it.kind.c_str());
+        if (st.id != id) st = RequestState{ id };
+        if (st.refused) { ++res.refused; continue; }
+        if (!force && st.next_attempt_utc > now && st.next_attempt_utc - now <= kBackoffCap) {
+            ++res.pending;
+            if (res.next_due_utc == 0 || st.next_attempt_utc < res.next_due_utc) res.next_due_utc = st.next_attempt_utc;
+            continue;
+        }
+        if (!transport.ready()) { ++res.pending; continue; }   // signed out: waits for an account, no ladder
+        const std::string body = ee::request_body(text);
+        const std::string path = "/v1/assignments/" + it.assignment + (early ? "/early-completion" : "/report");
+        ServiceReply reply;
+        ++st.attempts;
+        if (!transport.post_request(path, body, reply)) {
+            st.last_error = "this transport carries no requests";
+            schedule(st, it);
+            continue;
+        }
+        const std::string code = service_code(reply);
+        std::string_view progress;
+        if (ee::json::member(reply.body, "progress", progress) && !progress.empty() && progress.front() == '{') {
+            (void)ee::write_file_atomic(ee::progress_path(r, it.assignment), std::string(progress) + "\n");
+        }
+        const bool stands = early ? (reply.status == 409 && code == "exists") : (reply.status == 409 && code == "already_submitted");
+        if (reply.status == 200 || reply.status == 201 || stands) {
+            // The receipt, from the record the service holds (on `exists` /
+            // `already_submitted`, the one that stands).
+            std::string_view rec;
+            std::string doc;
+            using ee::json::quote;
+            if (early && ee::json::member(reply.body, "early_completion", rec)) {
+                doc = "{\"assignment_id\":" + quote(it.assignment) + ",\"request_id\":" + quote(id) +
+                      ",\"reason\":" + quote(ee::json::opt_string(rec, "reason")) +
+                      ",\"explanation\":" + quote(ee::json::opt_string(rec, "explanation")) +
+                      ",\"recorded_utc\":" + quote(ee::json::opt_string(rec, "recorded_utc")) + "}\n";
+            } else if (!early && ee::json::member(reply.body, "report", rec)) {
+                doc = "{\"assignment_id\":" + quote(it.assignment) + ",\"submission_id\":" + quote(id) +
+                      ",\"submitted_utc\":" + quote(ee::json::opt_string(rec, "submitted_utc")) + "}\n";
+            }
+            if (doc.empty() || !ee::write_file_atomic(receipt, doc)) {
+                st.last_error = doc.empty() ? "the answer carried no record" : "the receipt could not be written";
+                schedule(st, it);
+                continue;
+            }
+            fs::remove(it.path, ec);
+            fs::remove(ee::request_delivery_path(r, it.assignment, it.kind.c_str()), ec);
+            ++res.acknowledged;
+            note_change();
+            if (log) log("evidence: " + it.assignment + " " + it.kind + (stands ? " already recorded" : " acknowledged"));
+            if (on_ack) on_ack(it.kind, it.assignment);
+            continue;
+        }
+        st.last_error = service_error(reply);
+        st.code = code;
+        // Waiting on something the service will have soon (a session still
+        // arriving), or on the network: the ladder. A refusal of the request
+        // itself (malformed, not allowed, not eligible) is kept as refused,
+        // with the service's sentence, until a new request replaces it.
+        const bool later = reply.status == 0 || reply.status >= 500 || reply.status == 429 || reply.status == 401 ||
+                           code == "session_required" || code == "evidence_pending";
+        if (later) {
+            schedule(st, it);
+            if (log) log("evidence: " + it.assignment + " " + it.kind + " pending (" + st.last_error + ")");
+            continue;
+        }
+        st.refused = true;
+        (void)ee::write_file_atomic(ee::request_delivery_path(r, it.assignment, it.kind.c_str()), request_state_json(st));
+        ++res.refused;
+        note_change();
+        if (log) log("evidence: " + it.assignment + " " + it.kind + " refused (" + std::to_string(reply.status) + " " + code + ")");
     }
     return res;
 }
@@ -733,6 +1048,7 @@ struct DriverConfig {
     std::function<bool()> paused;             // true = an uninstall is running
     Log log;
     std::function<std::int64_t()> now;        // UTC seconds; default time()
+    AcknowledgedFn on_ack;                    // a request acknowledged (main.cpp)
 };
 
 // The evidence thread's whole life. Returns when stop_event is set.
@@ -752,12 +1068,18 @@ inline void run_driver(const DriverConfig& cfg) {
         }
         const std::int64_t t = now();
         const PassResult r = run_pass(cfg.root, *cfg.transport, t, force, cfg.log, &once);
+        const RequestResult q = run_requests(cfg.root, *cfg.transport, t, force, cfg.log, cfg.on_ack);
         force = false;
         DWORD wait_ms = INFINITE;
-        if (r.next_due_utc > 0) {
-            const std::int64_t s = std::clamp<std::int64_t>(r.next_due_utc - t, 1, kBackoffCap);
+        std::int64_t due = r.next_due_utc;
+        if (q.next_due_utc > 0 && (due == 0 || q.next_due_utc < due)) due = q.next_due_utc;
+        if (due > 0) {
+            const std::int64_t s = std::clamp<std::int64_t>(due - t, 1, kBackoffCap);
             wait_ms = (DWORD)(s * 1000);
         }
+        // A request waiting for an account is looked at again each minute
+        // (a sign-in wakes nothing here).
+        if (q.pending > 0 && !cfg.transport->ready()) wait_ms = (std::min)(wait_ms, (DWORD)kPollWithoutWakeMs);
         if (!wake) wait_ms = std::min<DWORD>(wait_ms, kPollWithoutWakeMs);
         HANDLE hs[2] = { cfg.stop_event, wake };
         const DWORD w = WaitForMultipleObjects(wake ? 2 : 1, hs, FALSE, wait_ms);

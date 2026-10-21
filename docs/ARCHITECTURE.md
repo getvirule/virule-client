@@ -11,7 +11,9 @@ against the 2026-10-14 tree; the VIRULE account against v0.9.4 (2026-10-15);
 installed capabilities, the message table, the handoff envelope and the
 takeover against v0.9.9 (2026-10-16); account roles, the QA link offer,
 the sign-in answer page's favicon and the shutdown drain against 0.9.12
-(2026-10-20).
+(2026-10-20); evidence delivery to the service, the requests, the
+developer's evaluation inbox, the game update and removal, and
+`evaluation_changes` against 0.9.17 (2026-10-21).
 The compiled constant in
 `src/shared/version.h` is the version authority; a version tag below marks
 when a contract was introduced, never the current release.
@@ -131,6 +133,7 @@ in both components).
 | local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
+| local | `{"type":"evaluation_changes"}` | answers `{"type":"evaluation_changes","generation":"<boot>:<n>"}` (0.9.17): a counter this process bumps on every evidence receipt, request answer and fetched developer package; the Admin reads it to learn locally that its own Client changed an evaluation, never by asking the service (see "Evaluation evidence delivery") |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
 | local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4); ALWAYS, signed in or out, `enabled{dev_tools,evaluator}`, the installed capabilities (v0.9.9), and `remembered{developer,evaluator}`, the roles last confirmed for an account here (0.9.12; absent until an account was confirmed on this installation). Never a token |
 | local | `{"type":"account_sign_in"}` / `{"type":"account_sign_in_cancel"}` | start (idempotent) / cancel the browser sign-in |
@@ -1483,6 +1486,20 @@ the Client's, one at a time:
   dev_machine identity) the wrapper verifies at launch, report the
   verified completion (`POST .../complete {sha256, bytes}`), then
   `installed`.
+- THE UPDATE (0.9.17; the service requires the newer build): the Admin
+  host moves the same job back to `queued` for the new revision. The
+  download and verification run as above while the installed game stays on
+  disk and playable; the swap NEVER runs while the wrapper's presence is
+  held (`Local\VIRULE.Evaluation.Running.<assignment>`), looking again every
+  15 s. Every file of the installed folder the new package does not carry
+  (saves, settings) is carried into the staged one first; then the
+  installed folder steps aside, the staged one moves in, and only then is
+  the previous one deleted; if the move in fails, the previous folder is
+  put back and the job fails with its reason.
+- `removing` (0.9.17): once the service acknowledged the evaluator's
+  report, the job of that assignment is moved to `removing`: when no
+  session of it is running, its own game folder (and only that) is
+  deleted, then `removed`, a terminal state.
 - A job still `building` or `packaging` is the Admin host's. When its
   process is gone and no Admin is running (`Local\VIRULE.AdminHost.Singleton`
   absent), the driver starts the host headless
@@ -1547,7 +1564,7 @@ so a cached image is never stale. Answers `{"type":"game_art","ok":true,
 ...}` or `ok:false` with a plain message; the Admin keeps its placeholder.
 Proof: `tests/transfers` (`test_game_art`).
 
-## Evaluation evidence delivery (2026-10-14)
+## Evaluation evidence delivery (2026-10-14; the service since 0.9.17)
 
 Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 6. Format,
 layout, handoff and receipt: `virule/core/evaluation_evidence.hpp`, vendored
@@ -1565,6 +1582,10 @@ rest of the data root):
 | `outbox\<id>\` (`package.json` + frames) | the Client, from the rename on |
 | `delivery\<id>.json` | Client-written delivery state `{attempts, failures, next_attempt_utc, last_error, damaged, acked}`, atomic |
 | `receipts\<id>.json` | Client-written receipt; the Admin reads it to unlock writing |
+| `progress\<assignment>.json` | Client-written: the service's progress for the assignment as its last answer stated it (0.9.17) |
+| `requests\<assignment>.early.json` / `.report.json` | the wrapper's early completion / the Admin host's report, until answered (0.9.17) |
+| `receipts\<assignment>.early.json` / `.report.json` | Client-written: the service's answer to the request (0.9.17) |
+| `received\<evaluation>\` | the DEVELOPER's Client: `evaluation.json` and each fetched package (`<package>\`, `.done` once whole), until the Admin imports it (0.9.17) |
 
 THE DRIVER is a dedicated thread started in `serve()` on every client. It
 runs one FORCED pass at startup (the recovery after a crash, a kill or a
@@ -1600,9 +1621,16 @@ GUARANTEES, each covered by `tests/evidence`:
 
 TRANSPORTS:
 
-- PRODUCTION is DEFERRED (no evidence endpoint exists): it answers
-  `unavailable` with no network call, so every package stays `pending`
-  (logged once per package per process). Evaluation writing stays locked.
+- THE SERVICE (0.9.17, `ServiceTransport`): signed in, under this
+  installation's DPoP authorization (`AccountTransferService`), package.json
+  as `POST /v1/assignments/<a>/evidence/<id>` with its SHA-256, then each
+  file the answer does not hold as `PUT .../files/<file>`; the answer's
+  `acked`, `complete` and `receipt_id` are the acknowledgment, and its
+  `progress` is written to `progress\<assignment>.json`. An `integrity`
+  answer sends that file once more, then waits on the ladder. Signed out
+  it sends nothing (unavailable). A deployment without the service's
+  evaluation records (production today) answers 503: every package stays
+  `pending` and writing stays locked.
 - TEST: loopback HTTP JSON against `--evidence-test-endpoint=http://127.0.0.1:<port>/<path>`,
   honored ONLY in a staging build or while `paths::environment_redirected()`
   is true, and only for a `127.0.0.1`/`localhost` url; otherwise it is
@@ -1619,3 +1647,26 @@ TRANSPORTS:
 `evidence_status` (bridge, local-only) reads the outbox, the receipts and
 the delivery state; damaged rows first, then pending, then acknowledged,
 bounded to the 4 KB frame with complete `counts` and `truncated`.
+
+REQUESTS (0.9.17): after the packages, each pass delivers the early
+completion and the report under `requests\` to the service
+(`/early-completion`, `/report`), oldest first. A 2xx, or the service's
+`exists` / `already_submitted` with its record, writes the receipt and
+removes the request; a refusal of the request itself (400, another 409) is
+kept with the service's sentence until a newer request replaces it;
+`session_required`, `evidence_pending`, 5xx and no answer wait on the
+ladder. An acknowledged REPORT starts the game's removal (the assignment's
+install job, "Game distribution").
+
+THE DEVELOPER'S EVALUATION INBOX (0.9.17, `src/client/evaluation_inbox.hpp`,
+`start_inbox()`): its own thread, no polling of its own. It runs once at
+startup, then when woken: the relayed `GET /v1/evaluations` answered
+something new (its hash moved: an acceptance, a delivery), or the
+scheduled update check's six-hour cadence came round. One pass reads `GET
+/v1/evaluations/evidence` (the signed-in account's evaluations only), writes
+`received\<evaluation>\evaluation.json`, and fetches only the files of
+each package it does not hold (`<file>.part`, its SHA-256 checked, then
+renamed; `.done` once whole). A failure waits on the same ladder. The Admin
+imports a DELIVERED evaluation's packages into its workspace and frees the
+Client's copy. Signed out it does nothing; nothing private is in any
+public manifest.

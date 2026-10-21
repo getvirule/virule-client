@@ -33,6 +33,8 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -560,6 +562,181 @@ static int run_status(int argc, char** argv) {
     return 0;
 }
 
+// ---- 2026-10-21: the service transport, the progress cache, the requests
+
+// A stand-in for the service's evidence routes (VIRULE_BACKEND
+// src/evaluations/evidence.ts): it verifies every file's digest header
+// against the bytes, acknowledges only what verified, and completes the
+// package once every listed file is held.
+struct FakeService {
+    std::map<std::string, std::string> held;          // file -> sha256
+    std::vector<std::string> wire;                    // "METHOD path"
+    std::set<std::string> listed;                     // what package.json lists (set at registration)
+    int corrupt_next = 0;                             // answer 409 integrity this many times
+    bool down = false;
+    std::string progress = "{\"session_ms\":600000,\"sessions\":1}";
+    ev::ServiceReply operator()(const char* method, const std::string& path, const std::string& body,
+                                const std::string&, const std::vector<std::pair<std::string, std::string>>& headers) {
+        wire.push_back(std::string(method) + " " + path);
+        if (down) return { 0, "" };
+        std::string sha;
+        for (const auto& h : headers) if (h.first == "x-virule-file-sha256") sha = h.second;
+        const std::string file = path.find("/files/") == std::string::npos ? "package.json" : path.substr(path.rfind('/') + 1);
+        std::string actual;
+        std::int64_t n = 0;
+        {
+            const fs::path tmp = fs::temp_directory_path() / "virule-evidence-tests" / "fake-service.bin";
+            std::ofstream(tmp, std::ios::binary).write(body.data(), (std::streamsize)body.size());
+            ee::sha256_file(tmp, actual, n);
+        }
+        if (corrupt_next > 0 && file != "package.json") { --corrupt_next; return { 409, "{\"error\":{\"code\":\"integrity\",\"message\":\"again\"}}" }; }
+        if (actual != sha) return { 409, "{\"error\":{\"code\":\"integrity\",\"message\":\"digest\"}}" };
+        if (file == "package.json") {
+            ee::Package p;
+            if (!ee::parse_package(body, p)) return { 400, "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\"}}" };
+            listed.clear();
+            for (const auto& f : ee::package_files(p)) listed.insert(f.file);
+        }
+        held[file] = sha;
+        bool complete = held.count("package.json") > 0;
+        for (const auto& f : listed) if (!held.count(f)) complete = false;
+        std::string acked = "[";
+        for (const auto& kv : held) { if (acked.size() > 1) acked += ","; acked += "\"" + kv.first + "\""; }
+        acked += "]";
+        return { 200, "{\"package_id\":\"x\",\"acked\":" + acked + ",\"complete\":" + (complete ? "true" : "false") +
+                       (complete ? ",\"receipt_id\":\"svc-receipt\",\"progress\":" + progress : std::string()) + "}" };
+    }
+};
+
+static void test_service_transport() {
+    SECTION("service transport: package.json first, each capture verified, receipt and progress");
+    const ee::Root r = fresh_root("service");
+    const std::string id = make_package(r, kAssignment, 3);
+    FakeService svc;
+    svc.corrupt_next = 1;   // the first capture's first try did not arrive intact
+    bool signed_in = false;
+    ev::ServiceTransport t([&](const char* m, const std::string& p, const std::string& b, const std::string& ct,
+                               const std::vector<std::pair<std::string, std::string>>& h) { return svc(m, p, b, ct, h); },
+                           [&] { return signed_in; });
+    // Signed out: nothing is sent, the package stays pending.
+    auto res = ev::run_pass(r, t, T0, true, nullptr);
+    CHECK(res.pending == 1 && svc.wire.empty());
+    signed_in = true;
+    const auto before = ev::change_counter().load();
+    res = ev::run_pass(r, t, T0 + 1, true, nullptr);
+    CHECK(res.delivered == 1);
+    CHECK(!svc.wire.empty() && svc.wire[0] == "POST /v1/assignments/" + kAssignment + "/evidence/" + id);
+    int puts = 0;
+    for (const auto& w : svc.wire) if (w.rfind("PUT ", 0) == 0) ++puts;
+    CHECK(puts == 4);   // three captures, one sent again after the storage refused it
+    ee::Receipt rc;
+    CHECK(ee::read_receipt(r, id, rc) && rc.receipt_id == "svc-receipt" && !rc.simulated);
+    CHECK(!ee::exists_quiet(ee::outbox_dir(r, id)));
+    CHECK(read_all(ee::progress_path(r, kAssignment)).find("\"sessions\":1") != std::string::npos);
+    CHECK(ev::change_counter().load() > before);
+    // The service unreachable: kept, never reported.
+    const std::string id2 = make_package(r, kAssignment, 1);
+    svc.down = true;
+    res = ev::run_pass(r, t, T0 + 2, true, nullptr);
+    CHECK(res.pending == 1 && !ee::exists_quiet(ee::receipt_path(r, id2)));
+    // A partial acknowledgment survives and only the rest is sent later.
+    svc.down = false;
+    svc.held.clear();
+    res = ev::run_pass(r, t, T0 + 4000, true, nullptr);
+    CHECK(res.delivered == 1 && ee::exists_quiet(ee::receipt_path(r, id2)));
+}
+
+struct RequestFake final : ev::Transport {
+    std::vector<ev::ServiceReply> answers;   // consumed in order; the last repeats
+    std::vector<std::string> paths, bodies;
+    bool up = true;
+    const char* name() const override { return "requests"; }
+    bool simulated() const override { return false; }
+    ev::Answer deliver(const ev::Offer&) override { ev::Answer a; a.kind = ev::Answer::Kind::Unavailable; return a; }
+    bool ready() override { return up; }
+    bool post_request(const std::string& path, const std::string& body, ev::ServiceReply& out) override {
+        paths.push_back(path);
+        bodies.push_back(body);
+        out = answers.empty() ? ev::ServiceReply{} : answers.front();
+        if (answers.size() > 1) answers.erase(answers.begin());
+        return true;
+    }
+};
+
+static std::string report_doc(const std::string& assignment, const std::string& submission) {
+    return std::string("{\"format\":\"") + ee::kReportFormat + "\",\"assignment_id\":\"" + assignment +
+        "\",\"submission_id\":\"" + submission + "\",\"created_utc\":\"2026-10-21T00:00:00Z\",\"body\":{\"submission_id\":\"" +
+        submission + "\",\"overall\":7}}\n";
+}
+
+static void test_requests() {
+    SECTION("requests: early completion and report to their receipts, refusals kept, signed out waits");
+    const ee::Root r = fresh_root("requests");
+    ee::EarlyRequest e;
+    e.request_id = random_hex32();
+    e.assignment_id = kAssignment;
+    e.reason = "completed_game";
+    e.explanation = "I saw the credits.";
+    e.created_utc = "2026-10-21T00:00:00Z";
+    CHECK(ee::hand_off_early(r, e) == ee::EarlyHandoff::HandedOff);
+    CHECK(ee::early_known(r, kAssignment));
+    RequestFake t;
+    t.up = false;
+    auto q = ev::run_requests(r, t, T0, true, nullptr);
+    CHECK(q.pending == 1 && t.paths.empty());   // signed out: no call
+    t.up = true;
+    t.answers = {
+        { 409, "{\"error\":{\"code\":\"session_required\",\"message\":\"Your session hasn't been received yet.\"}}" },
+        { 201, "{\"early_completion\":{\"reason\":\"completed_game\",\"explanation\":\"I saw the credits.\",\"recorded_utc\":\"2026-10-21T00:01:00Z\"},\"progress\":{\"sessions\":1}}" },
+    };
+    q = ev::run_requests(r, t, T0, true, nullptr);
+    CHECK(q.pending == 1 && q.next_due_utc > T0 && !ee::exists_quiet(ee::early_receipt_path(r, kAssignment)));
+    CHECK(t.paths.size() == 1 && t.paths[0] == "/v1/assignments/" + kAssignment + "/early-completion");
+    CHECK(t.bodies[0].find("\"reason\":\"completed_game\"") != std::string::npos && t.bodies[0].find(e.request_id) != std::string::npos);
+    q = ev::run_requests(r, t, T0 + 5, false, nullptr);
+    CHECK(t.paths.size() == 1);   // not due yet: the ladder is honored
+    std::vector<std::string> acks;
+    q = ev::run_requests(r, t, T0 + 100, false, nullptr, [&](const std::string& k, const std::string& a) { acks.push_back(k + ":" + a); });
+    CHECK(q.acknowledged == 1 && ee::exists_quiet(ee::early_receipt_path(r, kAssignment)));
+    CHECK(!ee::exists_quiet(ee::early_request_path(r, kAssignment)));
+    CHECK(read_all(ee::early_receipt_path(r, kAssignment)).find("I saw the credits.") != std::string::npos);
+    CHECK(read_all(ee::progress_path(r, kAssignment)).find("\"sessions\":1") != std::string::npos);
+    CHECK(acks.size() == 1 && acks[0] == "early:" + kAssignment);
+    CHECK(ee::hand_off_early(r, e) == ee::EarlyHandoff::AlreadyRecorded);   // the one early completion stands
+
+    // A report the service refuses (a field it will not take): kept, with its sentence.
+    const std::string s1 = random_hex32();
+    CHECK(ee::write_file_atomic(ee::report_request_path(r, kAssignment), report_doc(kAssignment, s1)));
+    t.answers = { { 400, "{\"error\":{\"code\":\"invalid_request\",\"message\":\"Every section is required.\"}}" } };
+    q = ev::run_requests(r, t, T0 + 200, true, nullptr);
+    CHECK(q.refused == 1);
+    CHECK(read_all(ee::request_delivery_path(r, kAssignment, "report")).find("Every section is required.") != std::string::npos);
+    const size_t calls = t.paths.size();
+    q = ev::run_requests(r, t, T0 + 5000, true, nullptr);
+    CHECK(t.paths.size() == calls && q.refused == 1);   // a refused request is not sent again
+    // A corrected submission replaces it; evidence still arriving waits; then accepted.
+    const std::string s2 = random_hex32();
+    CHECK(ee::write_file_atomic(ee::report_request_path(r, kAssignment), report_doc(kAssignment, s2)));
+    t.answers = {
+        { 409, "{\"error\":{\"code\":\"evidence_pending\",\"message\":\"Your sessions are still being received.\"}}" },
+        { 201, "{\"report\":{\"submitted_utc\":\"2026-10-21T00:05:00Z\",\"overall\":7}}" },
+    };
+    q = ev::run_requests(r, t, T0 + 6000, true, nullptr);
+    CHECK(q.pending == 1 && !ee::exists_quiet(ee::report_receipt_path(r, kAssignment)));
+    acks.clear();
+    q = ev::run_requests(r, t, T0 + 9000, true, nullptr, [&](const std::string& k, const std::string& a) { acks.push_back(k + ":" + a); });
+    CHECK(q.acknowledged == 1 && ee::exists_quiet(ee::report_receipt_path(r, kAssignment)));
+    CHECK(read_all(ee::report_receipt_path(r, kAssignment)).find(s2) != std::string::npos);
+    CHECK(acks.size() == 1 && acks[0] == "report:" + kAssignment);
+    // A lost acknowledgment: the request again answers already_submitted, which settles it.
+    const ee::Root r2 = fresh_root("requests-lost-ack");
+    CHECK(ee::write_file_atomic(ee::report_request_path(r2, kOtherAssignment), report_doc(kOtherAssignment, random_hex32())));
+    RequestFake t2;
+    t2.answers = { { 409, "{\"error\":{\"code\":\"already_submitted\",\"message\":\"x\"},\"report\":{\"submitted_utc\":\"2026-10-21T00:00:00Z\"}}" } };
+    q = ev::run_requests(r2, t2, T0, true, nullptr);
+    CHECK(q.acknowledged == 1 && ee::exists_quiet(ee::report_receipt_path(r2, kOtherAssignment)));
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "seed") == 0) return run_seed(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "signal") == 0) return run_signal(argc, argv);
@@ -576,6 +753,8 @@ int main(int argc, char** argv) {
     test_transport_selection();
     test_status_shape();
     test_wake_and_driver();
+    test_service_transport();
+    test_requests();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

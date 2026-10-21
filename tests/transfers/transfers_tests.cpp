@@ -262,6 +262,132 @@ struct MemoryService final : tr::Service {
     std::string machine_key() override { return machine; }
 };
 
+// AN UPDATE AND THE REMOVAL (2026-10-21): the same install job moved on to
+// a newer revision waits while the game runs, keeps the installed game's own
+// files (its saves) and replaces the rest; a report acknowledged starts the
+// removal, which also waits while the game runs and removes only its folder.
+struct AckService final : tr::Service {
+    std::string machine = std::string(64, '1');
+    int completes = 0;
+    bool signed_in(std::string& out) override { out = "eva@example.com"; return true; }
+    tr::Reply call(const char* method, const std::string& path, const std::string& body,
+                   const std::string&, const std::vector<tr::Header>&) override {
+        tr::Reply r;
+        r.status = 200;
+        if (std::string(method) == "GET" && path.find("/ticket") != std::string::npos) {
+            const std::string aid = path.substr(std::string("/v1/assignments/").size(), 32);
+            r.body = "{\"ticket\":{\"assignment_id\":\"" + aid + "\",\"evaluator_id\":\"" + std::string(32, 'e') +
+                     "\",\"game_uuid\":\"" + std::string(32, '7') + "\",\"accepted_utc\":\"2026-10-20T10:00:00Z\",\"signature\":\"" +
+                     std::string(128, 'f') + "\"}}";
+            return r;
+        }
+        if (path == "/v1/assignments/credential") {
+            std::string key;
+            (void)vclient::json_scan::find_string_in(body, 0, body.size(), "machine_key", key);
+            r.body = "{\"credential\":{\"evaluator_id\":\"" + std::string(32, 'e') + "\",\"machine_key\":\"" + key +
+                     "\",\"bound_utc\":\"2026-10-20T10:00:00Z\",\"signature\":\"" + std::string(128, 'c') + "\"}}";
+            return r;
+        }
+        if (path.size() > 9 && path.compare(path.size() - 9, 9, "/complete") == 0) { ++completes; r.body = "{\"ok\":true}"; return r; }
+        r.status = 404;
+        return r;
+    }
+    bool get_range_to_file(const std::string&, std::uint64_t, std::uint64_t, FILE*, std::uint64_t&, unsigned long& status_out,
+                           const std::function<bool()>&) override { status_out = 0; return false; }
+    std::string machine_key() override { return machine; }
+};
+
+static void write_zip(const fs::path& zp, const std::vector<std::pair<std::string, std::string>>& files) {
+    mz_zip_archive zip{};
+    FILE* zf = nullptr;
+    _wfopen_s(&zf, zp.wstring().c_str(), L"wb");
+    mz_zip_writer_init_cfile(&zip, zf, MZ_ZIP_FLAG_WRITE_ZIP64);
+    for (const auto& f : files) {
+        mz_zip_writer_add_mem(&zip, f.first.c_str(), f.second.data(), f.second.size(), MZ_NO_COMPRESSION);
+    }
+    mz_zip_writer_finalize_archive(&zip);
+    mz_zip_writer_end(&zip);
+    fclose(zf);
+}
+
+static std::string slurp(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static void test_update_and_removal() {
+    SECTION("an update waits while the game runs, keeps its saves, replaces the rest; the removal after the report");
+    const fs::path root = temp_root("update");
+    const std::string assignment = "c" + std::string(31, '0');
+    const std::string game(32, '7');
+    const fs::path installs = root / "games";
+    const fs::path dst = installs / game;
+    fs::create_directories(dst / "saves");
+    std::ofstream(dst / "Game.exe", std::ios::binary) << "old exe";
+    std::ofstream(dst / "data.bin", std::ios::binary) << "old data";
+    std::ofstream(dst / "saves" / "slot1.sav", std::ios::binary) << "the evaluator's save";
+    const fs::path zp = root / "update.zip";
+    write_zip(zp, { { "Game.exe", "new exe" }, { "data.bin", "new data" }, { "extra/new.txt", "added" } });
+    std::string sha;
+    tr::sha256_file_hex(zp, sha);
+    ed::Job j;
+    j.id = ed::random_hex32();
+    j.kind = "install";
+    j.state = "extracting";
+    j.account_email = "eva@example.com";
+    j.assignment_id = assignment;
+    j.game_uuid = game;
+    j.revision_id = std::string(32, '2');
+    j.download_id = std::string(32, 'd');
+    j.package_sha256 = sha;
+    j.launch_exe = "Game.exe";
+    j.install_root = utf8(installs);
+    j.install_dir = utf8(dst);
+    j.temp_path = utf8(zp);
+    j.created_utc = "2026-10-21T10:00:00Z";
+    ed::write_job(root, j);
+    AckService svc;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string&) {};
+
+    // The game is up (the wrapper's presence): nothing on disk changes.
+    HANDLE presence = CreateMutexW(nullptr, FALSE, ev::running_mutex_name(assignment).c_str());
+    CHECK(presence != nullptr && ev::session_running(assignment));
+    tr::detail::run_install(cfg, j, "eva@example.com");
+    ed::Job back;
+    CHECK(ed::read_job(root, j.id, back) && back.state == "extracting" && back.error.find("Close the game") != std::string::npos);
+    CHECK(back.next_attempt_utc > 0);
+    CHECK(slurp(dst / "Game.exe") == "old exe");
+    CloseHandle(presence);
+    CHECK(!ev::session_running(assignment));
+
+    // Closed: the update lands.
+    tr::detail::run_install(cfg, back, "eva@example.com");
+    CHECK(ed::read_job(root, j.id, back) && back.state == "installed");
+    CHECK(slurp(dst / "Game.exe") == "new exe");
+    CHECK(slurp(dst / "data.bin") == "new data");
+    CHECK(slurp(dst / "extra" / "new.txt") == "added");
+    CHECK(slurp(dst / "saves" / "slot1.sav") == "the evaluator's save");   // THE SAVE IS KEPT
+    CHECK(svc.completes == 1);
+    std::error_code ec;
+    CHECK(!fs::exists(installs / ".virule-staging" / (game + ".old"), ec));
+
+    // The report acknowledged: the game removes itself, never while it runs.
+    CHECK(tr::begin_removal(root, assignment));
+    CHECK(ed::read_job(root, j.id, back) && back.state == "removing" && !ed::is_terminal(back));
+    presence = CreateMutexW(nullptr, FALSE, ev::running_mutex_name(assignment).c_str());
+    tr::detail::run_removal(cfg, back);
+    CHECK(ed::read_job(root, j.id, back) && back.state == "removing" && fs::exists(dst, ec));
+    CloseHandle(presence);
+    tr::detail::run_removal(cfg, back);
+    CHECK(ed::read_job(root, j.id, back) && back.state == "removed" && ed::is_terminal(back));
+    CHECK(!fs::exists(dst, ec) && fs::exists(installs, ec));   // only its own folder
+    CHECK(!tr::begin_removal(root, assignment));                // once
+    fs::remove_all(root, ec);
+}
+
 static void test_launch_chain() {
     SECTION("transfer_control verify: the launch chain of an installed assignment is made current");
     const fs::path root = temp_root("chain");
@@ -586,6 +712,7 @@ int main(int argc, char** argv) {
     test_digests_and_zip();
     test_controls();
     test_launch_chain();
+    test_update_and_removal();
     test_game_art();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
