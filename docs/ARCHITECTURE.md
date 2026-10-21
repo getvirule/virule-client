@@ -1531,6 +1531,22 @@ identity.`, the service's refusal). The Admin host calls it from
 refuse, then selects again before launching. Proof: `tests/transfers`
 (`test_launch_chain`).
 
+GAME ART (0.9.16, `src/client/game_art.hpp`; the service side is
+VIRULE_BACKEND `src/evaluations/art.ts`). A game's box art is held by the
+service so every installation of its developer and the evaluator of an
+accepted assignment show it without the game package. Local bridge message
+`{"type":"game_art","action":"upload","game_uuid","path"}`: the Admin's
+local art file, read here (at most 16 MiB; PNG, JPEG, WebP, BMP or ICO by
+its bytes), hashed and stored (`PUT /v1/evaluations/games/<uuid>/art`,
+`x-virule-art-sha256`); `{"type":"game_art","action":"fetch","game_uuid",
+"sha256"[,"assignment_id"]}`: the image as a local file, from the cache or
+downloaded (the developer's game route, or the evaluator's
+`/v1/assignments/<id>/art`), its SHA-256 verified before it is kept. THE
+CACHE is `%LOCALAPPDATA%\VIRULE\art\<sha256>.<ext>`, content-addressed,
+so a cached image is never stale. Answers `{"type":"game_art","ok":true,
+...}` or `ok:false` with a plain message; the Admin keeps its placeholder.
+Proof: `tests/transfers` (`test_game_art`).
+
 ## Evaluation evidence delivery (2026-10-14)
 
 Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 6. Format,

@@ -44,6 +44,7 @@
 #include "shared/http_client.hpp"
 #include "shared/paths.hpp"
 #include "client/transfers.hpp"
+#include "client/game_art.hpp"
 
 namespace fs = std::filesystem;
 namespace ed = virule::core::evaluation_distribution;
@@ -471,6 +472,108 @@ static int run_status(int argc, char** argv) {
     return 0;
 }
 
+// GAME ART (client/game_art.hpp, 0.9.16): the service stand-in holds one
+// image per game; a ranged GET answers it 206 (the route honors Range).
+struct ArtService final : tr::Service {
+    std::string held, held_sha, last_put_path, last_put_sha;
+    int puts = 0, gets = 0;
+    std::string corrupt;   // when set, a GET answers these bytes instead
+    bool signed_in(std::string& out) override { out = "dev@example.com"; return true; }
+    tr::Reply call(const char* method, const std::string& path, const std::string& body,
+                   const std::string&, const std::vector<tr::Header>& headers) override {
+        tr::Reply r;
+        if (std::string(method) == "PUT" && path.size() > 4 && path.compare(path.size() - 4, 4, "/art") == 0) {
+            ++puts;
+            last_put_path = path;
+            for (const auto& h : headers) if (h.name == "x-virule-art-sha256") last_put_sha = h.value;
+            held = body;
+            held_sha = last_put_sha;
+            r.status = 200;
+            r.body = "{\"art\":{\"sha256\":\"" + held_sha + "\"},\"replaced\":true}";
+            return r;
+        }
+        r.status = 404;
+        r.body = "{\"error\":{\"code\":\"not_found\",\"message\":\"No such game.\"}}";
+        return r;
+    }
+    bool get_range_to_file(const std::string& path, std::uint64_t, std::uint64_t, FILE* out, std::uint64_t& bytes_out,
+                           unsigned long& status_out, const std::function<bool()>&) override {
+        ++gets;
+        last_put_path = path;
+        if (held.empty()) { status_out = 404; return false; }
+        const std::string& b = corrupt.empty() ? held : corrupt;
+        bytes_out = fwrite(b.data(), 1, b.size(), out);
+        status_out = 206;
+        return bytes_out == b.size();
+    }
+    std::string machine_key() override { return std::string(64, '1'); }
+};
+
+static void test_game_art() {
+    SECTION("game_art: the developer's art is stored by digest; the service's art is fetched, verified and cached");
+    namespace ga = vclient::game_art;
+    const fs::path root = temp_root("art");
+    const std::string game(32, 'a');
+    ArtService svc;
+    // A PNG of known bytes on the developer's computer (a path with a space).
+    std::string png("\x89PNG\r\n\x1a\n", 8);
+    for (int i = 0; i < 3000; ++i) png.push_back(static_cast<char>((i * 31) & 0xff));
+    const fs::path art_file = root / L"box art.png";
+    { std::ofstream f(art_file, std::ios::binary); f.write(png.data(), static_cast<std::streamsize>(png.size())); }
+    const std::string sha = tr::sha256_hex(png);
+
+    CHECK(ga::handle("{\"type\":\"game_art\",\"action\":\"upload\",\"game_uuid\":\"" + game + "\",\"path\":\"x\"}", root, nullptr)
+              .find("\"ok\":false") != std::string::npos);
+    CHECK(ga::handle("{\"type\":\"game_art\",\"action\":\"steal\"}", root, &svc) == "{\"type\":\"error\"}");
+    CHECK(ga::handle("{\"type\":\"game_art\",\"action\":\"upload\",\"game_uuid\":\"nope\",\"path\":\"x\"}", root, &svc) == "{\"type\":\"error\"}");
+
+    // Not an image: refused here, nothing sent.
+    const fs::path text_file = root / L"notes.txt";
+    { std::ofstream f(text_file, std::ios::binary); f << "these are not pixels"; }
+    const std::string refused = ga::handle("{\"type\":\"game_art\",\"action\":\"upload\",\"game_uuid\":\"" + game +
+                                           "\",\"path\":" + ev::json::quote(utf8(text_file)) + "}", root, &svc);
+    CHECK(refused.find("\"ok\":false") != std::string::npos && svc.puts == 0);
+
+    // Upload: the file's own digest travels with it; the bytes are cached.
+    const std::string up = ga::handle("{\"type\":\"game_art\",\"action\":\"upload\",\"game_uuid\":\"" + game +
+                                      "\",\"path\":" + ev::json::quote(utf8(art_file)) + "}", root, &svc);
+    CHECK(up.find("\"ok\":true") != std::string::npos && up.find(sha) != std::string::npos);
+    CHECK(svc.puts == 1 && svc.last_put_path == "/v1/evaluations/games/" + game + "/art" && svc.last_put_sha == sha && svc.held == png);
+    const fs::path cached = root / L"art" / fs::path(std::wstring(sha.begin(), sha.end()) + L".png");
+    CHECK(fs::exists(cached) && fs::file_size(cached) == png.size());
+
+    // Fetch on this computer: the cache answers, nothing is downloaded.
+    const std::string here = ga::handle("{\"type\":\"game_art\",\"action\":\"fetch\",\"game_uuid\":\"" + game +
+                                        "\",\"sha256\":\"" + sha + "\"}", root, &svc);
+    CHECK(here.find("\"ok\":true") != std::string::npos && here.find("art") != std::string::npos && svc.gets == 0);
+
+    // ANOTHER COMPUTER (an empty root): downloaded, verified, cached.
+    const fs::path other = temp_root("art-other");
+    const std::string there = ga::handle("{\"type\":\"game_art\",\"action\":\"fetch\",\"game_uuid\":\"" + game +
+                                         "\",\"sha256\":\"" + sha + "\"}", other, &svc);
+    CHECK(there.find("\"ok\":true") != std::string::npos && svc.gets == 1 && svc.last_put_path == "/v1/evaluations/games/" + game + "/art");
+    const fs::path other_cached = other / L"art" / fs::path(std::wstring(sha.begin(), sha.end()) + L".png");
+    CHECK(fs::exists(other_cached) && fs::file_size(other_cached) == png.size());
+    CHECK(!fs::exists(other / L"art" / fs::path(std::wstring(sha.begin(), sha.end()) + L".part")));
+
+    // The evaluator: through their own assignment's route.
+    const fs::path evaluator_pc = temp_root("art-evaluator");
+    const std::string asg(32, 'c');
+    const std::string ev_fetch = ga::handle("{\"type\":\"game_art\",\"action\":\"fetch\",\"game_uuid\":\"" + game +
+                                            "\",\"sha256\":\"" + sha + "\",\"assignment_id\":\"" + asg + "\"}", evaluator_pc, &svc);
+    CHECK(ev_fetch.find("\"ok\":true") != std::string::npos && svc.last_put_path == "/v1/assignments/" + asg + "/art");
+
+    // Bytes that do not match the digest are never cached.
+    const fs::path tampered_pc = temp_root("art-tampered");
+    svc.corrupt = png;
+    svc.corrupt[100] ^= 0x55;
+    const std::string bad = ga::handle("{\"type\":\"game_art\",\"action\":\"fetch\",\"game_uuid\":\"" + game +
+                                       "\",\"sha256\":\"" + sha + "\"}", tampered_pc, &svc);
+    CHECK(bad.find("\"ok\":false") != std::string::npos && bad.find("does not match") != std::string::npos);
+    std::error_code ec;
+    CHECK(!fs::exists(tampered_pc / L"art", ec) || fs::is_empty(tampered_pc / L"art", ec));
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "package") == 0) return run_package(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "install") == 0) return run_install(argc, argv);
@@ -483,6 +586,7 @@ int main(int argc, char** argv) {
     test_digests_and_zip();
     test_controls();
     test_launch_chain();
+    test_game_art();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

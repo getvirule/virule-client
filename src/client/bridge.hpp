@@ -75,6 +75,8 @@
 //                    {"type":"transfer_control","assignment_id","action":"pause"|"resume"|"retry"|"verify"}
 //                    {"type":"transfer_wake"} / {"type":"transfer_status"}   (game distribution,
 //                                                      client/transfers.hpp)
+//                    {"type":"game_art","action":"upload"|"fetch",...}  (0.9.16: a game's box
+//                                                      art, client/game_art.hpp)
 //                    {"type":"account_api","method","path","body"}  (the evaluation relay:
 //                                                       /v1/evaluations and /v1/assignments only)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
@@ -945,8 +947,10 @@ inline void handle_client(SOCKET client) {
             } else {
                 if (!reply(0x1, answer)) return;
             }
-        } else if (!is_page && (type == "transfer_control" || type == "transfer_wake" || type == "transfer_status")) {
-            // Game distribution (client/transfers.hpp). LOCAL ONLY.
+        } else if (!is_page && (type == "transfer_control" || type == "transfer_wake" || type == "transfer_status" ||
+                                type == "game_art")) {
+            // Game distribution (client/transfers.hpp) and game art
+            // (client/game_art.hpp, 0.9.16). LOCAL ONLY.
             const std::string answer = g_callbacks.transfer_message
                 ? g_callbacks.transfer_message(type, payload) : std::string();
             if (answer.empty() || answer.size() > kMaxLocalFrameBytes) {

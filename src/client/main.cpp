@@ -62,6 +62,7 @@
 #include "client/service_watch.hpp"
 #include "client/takeover.hpp"
 #include "client/transfers.hpp"
+#include "client/game_art.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
 #include "shared/environment.hpp"
@@ -578,6 +579,10 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
             return "{\"type\":\"transfer_wake\",\"ok\":true}";
         }
         if (type == "transfer_status") return tr::status_json(root);
+        if (type == "game_art") {
+            const tr::DriverConfig* cfg = tr::control_config();
+            return vclient::game_art::handle(payload, root, cfg ? cfg->service : nullptr);
+        }
         return std::string();
     };
     callbacks.on_qa_accept = [](const std::string& token) {
