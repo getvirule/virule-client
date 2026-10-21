@@ -72,7 +72,7 @@
 //                    {"type":"account_set_appearance","appearance":"light"|"dark"}
 //                                                      (explicit account appearance)
 //                    {"type":"account_open_settings"}  (website account page, this account)
-//                    {"type":"transfer_control","assignment_id","action":"pause"|"resume"|"retry"}
+//                    {"type":"transfer_control","assignment_id","action":"pause"|"resume"|"retry"|"verify"}
 //                    {"type":"transfer_wake"} / {"type":"transfer_status"}   (game distribution,
 //                                                      client/transfers.hpp)
 //                    {"type":"account_api","method","path","body"}  (the evaluation relay:
@@ -230,10 +230,11 @@ struct Callbacks {
     // payload; answers the FULL JSON reply; never a token.
     std::function<std::string(const std::string& type, const std::string& payload)> account_message;
     // The transfer messages (client/transfers.hpp), LOCAL ONLY: the Admin
-    // host pausing, resuming or retrying an evaluator's install
-    // (transfer_control), waking the driver after it wrote a job
-    // (transfer_wake), or reading every job (transfer_status). Answers the
-    // FULL JSON reply.
+    // host pausing, resuming or retrying an evaluator's install, or making
+    // an installed assignment's launch chain current before Play
+    // (transfer_control; "verify", 0.9.15), waking the driver after it
+    // wrote a job (transfer_wake), or reading every job (transfer_status).
+    // Answers the FULL JSON reply.
     std::function<std::string(const std::string& type, const std::string& payload)> transfer_message;
 };
 

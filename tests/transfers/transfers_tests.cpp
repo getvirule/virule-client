@@ -48,6 +48,7 @@
 namespace fs = std::filesystem;
 namespace ed = virule::core::evaluation_distribution;
 namespace tr = vclient::transfers;
+namespace ev = virule::core::evaluation_evidence;
 
 static int g_passed = 0;
 static int g_failed = 0;
@@ -217,6 +218,115 @@ static void test_controls() {
     fs::remove_all(root);
 }
 
+// THE LAUNCH CHAIN MADE CURRENT (0.9.15; transfers.hpp ensure_launch_chain,
+// transfer_control "verify"): the ticket and the evaluator credential the
+// wrapper verifies at launch, written at install and written AGAIN before a
+// launch when this computer's machine key is no longer the one the held
+// credential was bound to (the Admin re-issues dev_machine.cred on its
+// first run). The machine key is read at every call, never remembered.
+struct MemoryService final : tr::Service {
+    std::string machine;
+    int ticket_calls = 0;
+    int credential_calls = 0;
+    std::string evaluator = std::string(32, 'e');
+    std::string last_credential_body;
+    bool signed_in(std::string& out) override { out = "eva@example.com"; return true; }
+    tr::Reply call(const char* method, const std::string& path, const std::string& body,
+                   const std::string&, const std::vector<tr::Header>&) override {
+        tr::Reply r;
+        if (std::string(method) == "GET" && path.find("/ticket") != std::string::npos) {
+            ++ticket_calls;
+            const std::string aid = path.substr(std::string("/v1/assignments/").size(), 32);
+            r.status = 200;
+            r.body = "{\"ticket\":{\"assignment_id\":\"" + aid + "\",\"evaluator_id\":\"" + evaluator +
+                     "\",\"game_uuid\":\"" + std::string(32, '7') + "\",\"accepted_utc\":\"2026-10-20T10:00:00Z\",\"signature\":\"" +
+                     std::string(128, 'f') + "\"}}";
+            return r;
+        }
+        if (std::string(method) == "POST" && path == "/v1/assignments/credential") {
+            ++credential_calls;
+            last_credential_body = body;
+            std::string key;
+            (void)vclient::json_scan::find_string_in(body, 0, body.size(), "machine_key", key);
+            r.status = 200;
+            r.body = "{\"credential\":{\"evaluator_id\":\"" + evaluator + "\",\"machine_key\":\"" + key +
+                     "\",\"bound_utc\":\"2026-10-20T10:00:00Z\",\"signature\":\"" + std::string(128, 'c') + "\"}}";
+            return r;
+        }
+        r.status = 404;
+        return r;
+    }
+    bool get_range_to_file(const std::string&, std::uint64_t, std::uint64_t, FILE*, std::uint64_t&, unsigned long& status_out,
+                           const std::function<bool()>&) override { status_out = 0; return false; }
+    std::string machine_key() override { return machine; }
+};
+
+static void test_launch_chain() {
+    SECTION("transfer_control verify: the launch chain of an installed assignment is made current");
+    const fs::path root = temp_root("chain");
+    const std::string assignment(32, 'b');
+    const std::string k1(64, '1'), k2(64, '2');
+    MemoryService svc;
+    svc.machine = k1;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string&) {};
+    const std::string verify = "{\"type\":\"transfer_control\",\"assignment_id\":\"" + assignment + "\",\"action\":\"verify\"}";
+
+    // No driver configuration (the harness's control mode): a truthful no.
+    tr::control_config() = nullptr;
+    CHECK(tr::control(verify, root).find("\"ok\":false") != std::string::npos);
+    tr::control_config() = &cfg;
+    // Not installed: nothing to verify, and the record is only read.
+    ed::Job j;
+    j.id = ed::random_hex32();
+    j.kind = "install";
+    j.state = "downloading";
+    j.assignment_id = assignment;
+    j.install_dir = utf8(root / "games" / std::string(32, '7'));
+    j.launch_exe = "Game.exe";
+    j.revision_id = std::string(32, '9');
+    j.created_utc = "2026-10-20T10:00:00Z";
+    ed::write_job(root, j);
+    const std::string a0 = tr::control(verify, root);
+    CHECK(a0.find("\"ok\":false") != std::string::npos && a0.find("isn't installed") != std::string::npos);
+    CHECK(svc.ticket_calls == 0 && svc.credential_calls == 0);
+    ed::Job same;
+    CHECK(ed::read_job(root, j.id, same) && same.state == "downloading");
+
+    // Installed: the ticket is asked and written, the credential issued for
+    // THIS computer's key.
+    j.state = "installed";
+    ed::write_job(root, j);
+    CHECK(tr::control(verify, root).find("\"ok\":true") != std::string::npos);
+    CHECK(svc.ticket_calls == 1 && svc.credential_calls == 1);
+    const std::string ticket = ev::read_document(tr::detail::ticket_path(root, assignment));
+    const std::string cred = ev::read_document(tr::detail::credential_path(root));
+    CHECK(ticket.find("\"assignment_id\":\"" + assignment + "\"") != std::string::npos &&
+          ticket.find("\"install_path\":") != std::string::npos && ticket.find("\"launch_exe\":\"Game.exe\"") != std::string::npos);
+    CHECK(cred.find("\"machine_key\":\"" + k1 + "\"") != std::string::npos);
+    // The same key again: the held credential stays (no second issue).
+    CHECK(tr::control(verify, root).find("\"ok\":true") != std::string::npos);
+    CHECK(svc.ticket_calls == 2 && svc.credential_calls == 1);
+    // The machine key changed under the credential (the Admin re-issued
+    // dev_machine.cred): the credential is issued again for the NEW key.
+    svc.machine = k2;
+    CHECK(tr::control(verify, root).find("\"ok\":true") != std::string::npos);
+    CHECK(svc.credential_calls == 2);
+    CHECK(svc.last_credential_body.find(k2) != std::string::npos);
+    CHECK(ev::read_document(tr::detail::credential_path(root)).find("\"machine_key\":\"" + k2 + "\"") != std::string::npos);
+    // No machine identity at all: a plain, non-retryable refusal; nothing written over the held files.
+    svc.machine.clear();
+    const std::string a3 = tr::control(verify, root);
+    CHECK(a3.find("\"ok\":false") != std::string::npos && a3.find("no VIRULE identity") != std::string::npos);
+    CHECK(ev::read_document(tr::detail::credential_path(root)).find("\"machine_key\":\"" + k2 + "\"") != std::string::npos);
+    // The job record was never touched by any of it.
+    CHECK(ed::read_job(root, j.id, same) && same.state == "installed" && same.error.empty());
+    tr::control_config() = nullptr;
+    fs::remove_all(root);
+}
+
 // ------------------------------------------------------------ helpers ----
 
 static bool redirected_or_die() {
@@ -372,6 +482,7 @@ int main(int argc, char** argv) {
     test_job_record();
     test_digests_and_zip();
     test_controls();
+    test_launch_chain();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

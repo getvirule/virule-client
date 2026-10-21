@@ -69,6 +69,7 @@
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
+#include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/machine_identity.hpp"
 #include "shared/manifest_request.hpp"
@@ -183,6 +184,108 @@ inline std::atomic<bool> g_busy{ false };
 // safe takeover point after this operation, so nothing here changes the
 // Admin update's timing or feedback.
 inline std::function<void()> g_on_user_operation;
+
+// THE ADMIN UPDATE RESUMES AFTER THE CLIENT'S OWN SWAP (0.9.15; VIRULE
+// docs: the Admin depends on the Client, and the two never run as an
+// incompatible pair). The approved Admin manifest names the Client it
+// needs (`minimumClientVersion`, published from the Admin's one definition
+// virule/core/client_requirement.hpp). When this client is OLDER than that:
+//
+//   - the check still records the approved Admin version (Settings offers
+//     the update as usual) and the requirement (`g_required_client`), and
+//     starts this client's own self-update check at once, so the staged
+//     client swaps at the next safe point (seconds on an idle machine): the
+//     next Settings ask, or the next launch, finds a current client and
+//     the Admin update simply works. No six-hour wait, no Windows restart.
+//   - an Admin install/update the person asks for meanwhile (Settings
+//     Update, virule.app, update-on-launch) does NOT install an Admin this
+//     client cannot serve: the pipeline refuses it (the manifest gate
+//     below) and instead RECORDS the request (paths::pending_admin_update_file:
+//     the desktop-shortcut choice, the native-feedback choice, when, and
+//     which client recorded it), asks for the self-update now
+//     (g_on_client_update_required, installed by main.cpp: the synchronous
+//     staging and the swap as soon as this operation has released the
+//     safe point), and answers "client_update". The NEW client, at
+//     startup (resume_pending_update), runs that Admin update itself:
+//     the Admin is closed gracefully, the native "Updating…" card shows,
+//     the verified pipeline runs, the Admin relaunches. The Admin's
+//     Settings overlay keeps waiting through the swap because `status`
+//     reports `updating:true` while the record stands (status_json).
+//   - a record is honored once and only while fresh (kPendingAdminUpdateMaxAgeS);
+//     a client that finds its own version named in the record (its swap
+//     failed or was rolled back) does not ask again: the update fails
+//     visibly and stays offered, never a loop.
+inline std::function<void()> g_on_client_update_required;
+// When this process started (static initialization): a record this very
+// version wrote AFTER that is this process's own operation waiting for its
+// swap, not a leftover of a failed one.
+inline const long long g_started_utc = (long long)time(nullptr);
+inline std::mutex g_required_client_mutex;
+inline std::string g_required_client;          // "" = the manifest names none
+inline std::string g_client_update_asked_for;  // the requirement already asked for
+constexpr long long kPendingAdminUpdateMaxAgeS = 30ll * 60ll;
+
+struct PendingAdminUpdate {
+    bool present = false;
+    bool shortcut = false;
+    bool native_feedback = false;
+    bool launch_after = false;    // the update-on-launch handoff: open the Admin once updated
+    long long requested_utc = 0;
+    std::string recorded_by;      // the client version that wrote it
+};
+// What the operation in flight asked for, for the pipeline's backstop gate.
+inline std::atomic<bool> g_native_feedback_requested{ false };
+inline std::atomic<bool> g_launch_after_requested{ false };
+
+inline PendingAdminUpdate load_pending_admin_update() {
+    PendingAdminUpdate p;
+    const auto file = paths::pending_admin_update_file();
+    if (file.empty()) return p;
+    std::ifstream in(file, std::ios::binary);
+    if (!in) return p;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.size() > 4096) return p;
+    long long version = 0;
+    if (!json_scan::find_number_in(text, 0, text.size(), "version", version) || version != 1) return p;
+    p.shortcut = text.find("\"shortcut\":true") != std::string::npos;
+    p.native_feedback = text.find("\"native_feedback\":true") != std::string::npos;
+    p.launch_after = text.find("\"launch_after\":true") != std::string::npos;
+    (void)json_scan::find_number_in(text, 0, text.size(), "requested_utc", p.requested_utc);
+    (void)json_scan::find_string_in(text, 0, text.size(), "recorded_by", p.recorded_by);
+    p.present = p.requested_utc > 0;
+    return p;
+}
+
+inline bool save_pending_admin_update(bool shortcut, bool native_feedback, bool launch_after) {
+    const auto file = paths::pending_admin_update_file();
+    if (file.empty()) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::string body = "{\"version\":1,\"shortcut\":";
+    body += shortcut ? "true" : "false";
+    body += ",\"native_feedback\":";
+    body += native_feedback ? "true" : "false";
+    body += ",\"launch_after\":";
+    body += launch_after ? "true" : "false";
+    body += ",\"requested_utc\":" + std::to_string((long long)time(nullptr));
+    body += ",\"recorded_by\":\"" VIRULE_CLIENT_VERSION_STRING "\"}";
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(body.data(), (std::streamsize)body.size());
+    return out.good();
+}
+
+inline void clear_pending_admin_update() {
+    std::error_code ec;
+    std::filesystem::remove(paths::pending_admin_update_file(), ec);
+}
+
+// A fresh record exists: an Admin update is owed once this client has
+// replaced itself (or, on the new client, is about to run).
+inline bool pending_admin_update_fresh() {
+    const PendingAdminUpdate p = load_pending_admin_update();
+    return p.present && (long long)time(nullptr) - p.requested_utc < kPendingAdminUpdateMaxAgeS;
+}
 
 // UNINSTALL WINS (owner decision 2026-09-04): an explicit uninstall that
 // finds an update in flight cancels it back to a known-good filesystem
@@ -447,7 +550,9 @@ inline std::string status_json() {
     // "Updating…" state instead of contradicting a live update; it also
     // covers the swap instant where installed/version read transitional.
     out += ",\"updating\":";
-    out += g_busy.load() ? "true" : "false";
+    // An Admin update owed after this client's own swap is still ONE
+    // transaction in flight (the Settings overlay keeps waiting on it).
+    out += (g_busy.load() || pending_admin_update_fresh()) ? "true" : "false";
     out += "}";
     return out;
 }
@@ -946,6 +1051,12 @@ struct Manifest {
     std::string url;
     std::string sha256;
     long long size = 0;
+    // The Client this Admin release needs (`minimumClientVersion`; "" =
+    // none named) and whether THIS client is older than it (0.9.15: the
+    // manifest is still read and the approved version still known; the
+    // pipeline is what refuses an Admin this client cannot serve).
+    std::string minimum_client;
+    bool client_too_old = false;
 };
 
 inline bool is_hex64(const std::string& s) {
@@ -1169,25 +1280,77 @@ inline bool fetch_manifest(Manifest& out, std::string& why, bool scheduled = fal
         why = "manifest size missing or out of bounds";
         return false;
     }
+    // THE CLIENT THE ADMIN NEEDS (0.9.15): read, never a reason to refuse
+    // the manifest here. An older client still learns the approved Admin
+    // version; what it cannot do is INSTALL that Admin (run_pipeline), and
+    // the requirement is what makes it update itself first.
+    out.minimum_client.clear();
+    out.client_too_old = false;
     std::string minimum;
     if (json_scan::find_string_in(body, 0, body.size(), "minimumClientVersion",
                                   minimum)) {
         long long need[3] = {};
         if (parse_version_triple(minimum, need)) {
+            out.minimum_client = minimum;
             const long long have[3] = { VIRULE_CLIENT_VERSION_MAJOR,
                                         VIRULE_CLIENT_VERSION_MINOR,
                                         VIRULE_CLIENT_VERSION_PATCH };
             for (int i = 0; i < 3; ++i) {
                 if (have[i] > need[i]) break;
                 if (have[i] < need[i]) {
-                    why = "this client is older than the manifest's minimumClientVersion " + minimum;
-                    return false;
+                    out.client_too_old = true;
+                    break;
                 }
             }
         }
     }
     return true;
 }
+
+// The requirement as last read, and whether this client meets it.
+inline void note_client_requirement(const Manifest& m) {
+    bool ask = false;
+    {
+        std::lock_guard<std::mutex> lock(g_required_client_mutex);
+        g_required_client = m.minimum_client;
+        if (m.client_too_old && g_client_update_asked_for != m.minimum_client) {
+            g_client_update_asked_for = m.minimum_client;
+            ask = true;
+        }
+    }
+    if (ask) {
+        log::client("admin: the approved Admin " + m.version + " needs client " + m.minimum_client +
+                    "; this is " VIRULE_CLIENT_VERSION_STRING ", checking for the client's own update now");
+        if (g_on_user_operation) g_on_user_operation();
+    }
+}
+
+// The one decision for a manifest this client cannot serve: record the
+// request for the new client and ask for the self-update now, unless THIS
+// client already recorded it (its swap did not happen): then the update
+// fails visibly and stays offered. Returns the wire state.
+inline std::string client_update_first(const Manifest& manifest, bool shortcut, bool native_feedback,
+                                       bool launch_after, const std::function<void()>& on_failed) {
+    const PendingAdminUpdate prior = load_pending_admin_update();
+    if (prior.present && prior.recorded_by == VIRULE_CLIENT_VERSION_STRING &&
+        (long long)time(nullptr) - prior.requested_utc < kPendingAdminUpdateMaxAgeS) {
+        log::client("admin: the approved Admin " + manifest.version + " needs client " + manifest.minimum_client +
+                    " and this client's own update did not happen; the update fails and stays offered");
+        clear_pending_admin_update();
+        if (on_failed) on_failed();
+        return "failed";
+    }
+    if (!save_pending_admin_update(shortcut, native_feedback, launch_after)) {
+        log::client("admin: the pending Admin update could not be recorded");
+        if (on_failed) on_failed();
+        return "failed";
+    }
+    log::client("admin: the approved Admin " + manifest.version + " needs client " + manifest.minimum_client +
+                "; this client (" VIRULE_CLIENT_VERSION_STRING ") updates itself first and the new client runs the Admin update");
+    if (g_on_client_update_required) g_on_client_update_required();
+    return "client_update";
+}
+
 
 // ---- the silent Admin update check ----
 // AUTOMATIC CHECKING, USER-INITIATED INSTALLING (owner spec 2026-09-03).
@@ -1237,6 +1400,7 @@ inline void refresh_update_check(unsigned long long fresh_ms, bool scheduled = f
         log::client("admin: update check failed: " + why);
         return;
     }
+    note_client_requirement(manifest);
     std::lock_guard<std::mutex> lock(g_update_mutex);
     if (g_approved_version != manifest.version) {
         log::client("admin: update check: approved version " + manifest.version);
@@ -1393,12 +1557,20 @@ inline std::string update_status_json(bool launch_context) {
                   !admin_version.empty() &&
                   version_is_upgrade(approved, admin_version);
     if (update && launch_update_on_hold(approved, launch_context)) update = false;
+    std::string required;
+    {
+        std::lock_guard<std::mutex> lock(g_required_client_mutex);
+        required = g_required_client;
+    }
     std::string out = "{\"type\":\"admin_update_status\",\"installed\":";
     out += installed ? "true" : "false";
     out += ",\"admin_version\":\"" + json_scan::json_escape(admin_version) + "\"";
     out += ",\"approved_version\":\"" + json_scan::json_escape(approved) + "\"";
     out += ",\"update\":";
     out += update ? "true" : "false";
+    // Additive (0.9.15): the Client the approved Admin needs, and this one.
+    out += ",\"client_required\":\"" + json_scan::json_escape(required) + "\"";
+    out += ",\"client_version\":\"" VIRULE_CLIENT_VERSION_STRING "\"";
     out += "}";
     return out;
 }
@@ -1597,6 +1769,14 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
         log::client("admin: manifest rejected: " + why);
         broadcast_result("failed", "");
         return "failed";
+    }
+    note_client_requirement(manifest);
+    // THE MANIFEST GATE (0.9.15): an Admin this client cannot serve is not
+    // installed by this client (run() already decided this before closing
+    // any Admin; this is the backstop for a manifest that changed between).
+    if (manifest.client_too_old) {
+        return client_update_first(manifest, shortcut, g_native_feedback_requested.load(),
+                                   g_launch_after_requested.load(), [] { broadcast_result("failed", ""); });
     }
     log::client("admin: manifest version=" + manifest.version +
                 " size=" + std::to_string(manifest.size) +
@@ -1878,7 +2058,27 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
     const bool was_installed = admin_installed();
     log::client(std::string("admin: ") + (was_installed ? "update" : "install") +
                 " requested" + (shortcut ? " (desktop shortcut)" : ""));
+    g_native_feedback_requested.store(native_feedback);
     if (g_on_user_operation) g_on_user_operation(); // the client checks itself too
+
+    // THE CLIENT THE APPROVED ADMIN NEEDS, decided BEFORE any Admin is
+    // closed (0.9.15): an Admin this client cannot serve is never installed
+    // by it. The request is recorded, this client updates itself first, and
+    // the new client runs the Admin update from the record (the header's
+    // "THE ADMIN UPDATE RESUMES AFTER THE CLIENT'S OWN SWAP"). The Admin,
+    // if open, stays open until the new client closes it for the update.
+    {
+        Manifest m;
+        std::string why;
+        if (fetch_manifest(m, why)) {
+            note_client_requirement(m);
+            if (m.client_too_old) {
+                return client_update_first(m, shortcut, native_feedback, g_launch_after_requested.load(),
+                                           [] { broadcast_result("failed", ""); });
+            }
+        }
+        // A fetch that failed is stated by the pipeline below, as before.
+    }
 
     // THE CLIENT OWNS THE SHUTDOWN (owner spec 2026-09-03). A running
     // Admin is closed GRACEFULLY for the update: the initiating surface
@@ -2020,7 +2220,9 @@ inline void launch_after_update_handoff() {
         retire_card_into_admin_surface();
         return;
     }
+    g_launch_after_requested.store(true);
     const std::string state = run(false, /*native_feedback=*/true);
+    g_launch_after_requested.store(false);
     if (state == "updated") {
         // The Admin was not running, so run() left the launch to us (the
         // pipeline already cleared any failure hold on success). Watched +
@@ -2029,6 +2231,12 @@ inline void launch_after_update_handoff() {
         // card stays until that Admin surface is confirmed presented.
         launch_admin_with_recovery();
         retire_card_into_admin_surface();
+    } else if (state == "client_update") {
+        // This client updates itself first; the NEW client runs the Admin
+        // update from the record and launches the Admin (launch_after).
+        // This card goes with this process at the swap; the new client's
+        // own card follows within moments.
+        log::client("admin: launch handoff waits for the client's own update; the new client finishes it");
     } else if (state == "busy") {
         // Another operation owns the lifecycle; its own feedback covers it.
         result_card::close();
@@ -2042,6 +2250,55 @@ inline void launch_after_update_handoff() {
         launch_admin_with_recovery();
         retire_card_into_admin_surface();
     }
+}
+
+// THE NEW CLIENT RUNS THE ADMIN UPDATE THE OLD ONE COULD NOT (0.9.15; see
+// the header's "THE ADMIN UPDATE RESUMES AFTER THE CLIENT'S OWN SWAP").
+// Called once at startup, after the self-update reconciliation and with
+// the bridge up. A stale record, or one this very client version wrote
+// (its swap never happened), is discarded: never a loop.
+inline void resume_pending_update() {
+    const PendingAdminUpdate p = load_pending_admin_update();
+    if (!p.present) return;
+    if ((long long)time(nullptr) - p.requested_utc >= kPendingAdminUpdateMaxAgeS) {
+        log::client("admin: a stale pending Admin update record was discarded");
+        clear_pending_admin_update();
+        return;
+    }
+    if (p.recorded_by == VIRULE_CLIENT_VERSION_STRING) {
+        if (p.requested_utc >= g_started_utc - 1) {
+            // Written by THIS process moments ago (an Admin update asked for
+            // right after startup): it waits for the swap, as recorded.
+            return;
+        }
+        log::client("admin: the pending Admin update was recorded by this very client version; "
+                    "the client's own update did not happen, so it is not resumed");
+        clear_pending_admin_update();
+        bridge::push_lifecycle_status();
+        return;
+    }
+    if (bridge::g_uninstalling.load() || lifecycle::uninstall_intent_active()) {
+        clear_pending_admin_update();
+        return;
+    }
+    log::client("admin: resuming the Admin update recorded by client " + p.recorded_by);
+    clear_pending_admin_update();
+    if (p.launch_after) {
+        // The update-on-launch handoff: the user's launch ends with a
+        // visible Admin, exactly as launch_after_update_handoff promises.
+        result_card::show_working("Updating\xE2\x80\xA6", "");
+        g_launch_after_requested.store(true);
+        const std::string state = run(p.shortcut, /*native_feedback=*/true);
+        g_launch_after_requested.store(false);
+        if (state == "updated" || state == "failed" || state == "admin_running") {
+            launch_admin_with_recovery();
+            retire_card_into_admin_surface();
+        } else if (state == "busy" || state == "client_update") {
+            result_card::close();
+        }
+        return;
+    }
+    (void)run(p.shortcut, p.native_feedback);
 }
 
 } // namespace vclient::admin_install

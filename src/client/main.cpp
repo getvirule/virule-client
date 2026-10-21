@@ -96,6 +96,9 @@ namespace {
 enum class RunState { Starting, Serving, Draining, Uninstalling };
 std::atomic<RunState> g_state{ RunState::Starting };
 std::atomic<bool> g_exit_requested{ false };
+// An Admin update is waiting on this client's own swap (admin_install.hpp
+// g_on_client_update_required): the swap monitor drops its cadence.
+std::atomic<bool> g_swap_asap{ false };
 // Signaled with g_exit_requested by Setup's shutdown, so the serve loop
 // starts draining AT ONCE instead of at its next one-second wake: Setup
 // replaces this exe on a fixed two-second wait after the reply
@@ -173,10 +176,15 @@ bool resume_delivery_headless(const virule::core::evaluation_distribution::Job& 
     if (!std::filesystem::is_regular_file(std::filesystem::path(exe), ec) || ec) return false;
     std::wstring cmd = L"\"" + exe + L"\" --data-root=\"" + vclient::account::widen(job.admin_data_root) +
                        L"\" --resume-delivery=" + vclient::account::widen(job.id);
+    // THE CEF RUNTIME DIRECTORY IS THE WORKING DIRECTORY (2026-10-21): the
+    // host's libcef.dll import resolves from it (virule.exe starts the host
+    // the same way); started from anywhere else the host never gets to its
+    // own main and the stage stays stalled.
+    const std::wstring cwd = (std::filesystem::path(vclient::account::widen(job.admin_data_root)) / L".resources" / L"bin" / L"x64").wstring();
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, cwd.c_str(), &si, &pi)) return false;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;
@@ -194,6 +202,9 @@ void start_transfers() {
     cfg->root = vclient::paths::virule_data_root();
     cfg->service = &g_transfer_service;
     cfg->stop_event = g_transfer_stop;
+    // The bridge's transfer_control "verify" (0.9.15) reaches the service
+    // through the same configuration.
+    tr::control_config() = cfg;
     cfg->paused = [] {
         return vclient::bridge::g_uninstalling.load() ||
                vclient::lifecycle::uninstall_intent_active();
@@ -790,6 +801,22 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // or not the Admin is running; the startup pass is the recovery.
     start_transfers();
 
+    // AN ADMIN UPDATE THE PREVIOUS CLIENT COULD NOT RUN (0.9.15): the
+    // record it left is honored once, now that this (newer) client serves
+    // (admin_install.hpp resume_pending_update). Its own thread: the Admin
+    // is closed gracefully, the native card shows, the pipeline runs.
+    if (vclient::self_update::g_enabled.load()) {
+        if (HANDLE h = CreateThread(nullptr, 0,
+                [](LPVOID) -> DWORD {
+                    Sleep(1500); // the bridge is serving; let the first status asks land
+                    vclient::admin_install::resume_pending_update();
+                    return 0;
+                },
+                nullptr, 0, nullptr)) {
+            CloseHandle(h);
+        }
+    }
+
     // THE LIFECYCLE STATUS WATCHER (P1 status push, 2026-09-04): while any
     // virule.app page is connected, re-read the lifecycle core (the admin
     // block + the uninstalling flag) once a second and push a status frame
@@ -817,6 +844,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     }
 
     unsigned long long last_swap_attempt_tick = 0;
+    unsigned long long swap_asap_since = 0;
     for (;;) {
         if (g_exit_event) WaitForSingleObject(g_exit_event, 1000);
         else Sleep(1000);
@@ -828,6 +856,18 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         // applying it. The drain flag closes the tiny race between the
         // safety check and the exit: nothing new starts in a process that
         // is about to hand its binary to the replacement helper.
+        // AN ADMIN UPDATE IS WAITING ON THIS SWAP (0.9.15): the cadence
+        // gives way to every second for up to two minutes, so the new
+        // client takes over moments after the operation released the safe
+        // point.
+        if (g_swap_asap.load()) {
+            const unsigned long long now = GetTickCount64();
+            if (swap_asap_since == 0) swap_asap_since = now;
+            if (now - swap_asap_since > 120000) { g_swap_asap.store(false); swap_asap_since = 0; }
+            else last_swap_attempt_tick = 0;
+        } else {
+            swap_asap_since = 0;
+        }
         if (vclient::self_update::g_swap_ready.load() &&
             vclient::bridge::g_listen_state.load() == 1) {
             const unsigned long long now = GetTickCount64();
@@ -993,6 +1033,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 nullptr, 0, nullptr)) {
             CloseHandle(t);
         }
+    };
+    // THE ADMIN UPDATE RESUMES AFTER THE CLIENT'S OWN SWAP (0.9.15;
+    // admin_install.hpp): the approved Admin needs a newer client, the
+    // request is recorded, and this client stages its update NOW
+    // (synchronously, on the operation's own thread; a check already in
+    // flight from g_on_user_operation is the same staging) and swaps at
+    // the first safe moment instead of its 15-second cadence.
+    vclient::admin_install::g_on_client_update_required = [] {
+        vclient::self_update::refresh_check(0);
+        g_swap_asap.store(true); // the serve loop ticks every second
     };
     // The managed-Admin pipeline's own two dev seams (same posture:
     // --dev-unsigned relaxes only Authenticode gates, the manifest

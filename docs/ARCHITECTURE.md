@@ -140,7 +140,7 @@ in both components).
 | local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
 | local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
 | local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` (at most four `/[A-Za-z0-9_-]+` segments) made here under this installation's DPoP authorization; the body is the message's LAST field, raw JSON. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
-| local | `{"type":"transfer_control","assignment_id":"<32 hex>","action":"pause"\|"resume"\|"retry"}` | GAME DISTRIBUTION (v0.9.14): pause, resume or re-queue the evaluator's install job for that assignment (see "Game distribution"); answers `{"type":"transfer_control","ok":bool}`; a malformed id or action answers `error` |
+| local | `{"type":"transfer_control","assignment_id":"<32 hex>","action":"pause"\|"resume"\|"retry"\|"verify"}` | GAME DISTRIBUTION (v0.9.14): pause, resume or re-queue the evaluator's install job for that assignment; `verify` (0.9.15) makes an INSTALLED assignment's launch chain current before the Admin launches its wrapper (see "Game distribution"); answers `{"type":"transfer_control","ok":bool}` (`verify` adds `"message"`); a malformed id or action answers `error` |
 | local | `{"type":"transfer_wake"}` | signal the transfer driver to run a pass now (the Admin host wrote or changed a job record); answers `{"type":"transfer_wake","ok":true}` |
 | local | `{"type":"transfer_status"}` | answers `{"type":"transfer_status","jobs":[...],"truncated":bool}`: every job record under `%LOCALAPPDATA%\VIRULE\transfers` as it stands (bounded); a read only |
 
@@ -1381,6 +1381,49 @@ moves. The staged client still swaps only at the safe takeover point after
 the Admin operation, so the Admin update's timing and feedback are
 unchanged. One check runs at a time (`g_check_in_flight`).
 
+ADMIN AND CLIENT UPDATES CONVERGE (0.9.15; defect correction 2026-10-21:
+staging alpha.59 needed Client 0.9.14 and nothing made an older Client
+update before the Admin did, so the two ran as an incompatible pair until
+the Client's six-hour timer). The approved Admin manifest names the Client
+it needs (`minimumClientVersion`, published from the Admin's one
+definition `v2_mvp/include/virule/core/client_requirement.hpp`). When this
+client is OLDER than that:
+
+- `fetch_manifest` still READS the manifest (the approved Admin version is
+  known and Settings offers the update as usual) and records the
+  requirement (`Manifest.minimum_client`, `client_too_old`;
+  `admin_update_status` carries `client_required` and `client_version`,
+  additive). The first time a requirement this client fails is seen, its
+  own self-update check runs at once (`note_client_requirement` through
+  `g_on_user_operation`), so the staged client swaps at the next safe
+  point, seconds on an idle machine. No six-hour wait, no Windows restart.
+- an Admin install or update the person asks for meanwhile (Settings
+  Update, virule.app, update-on-launch) NEVER installs an Admin this
+  client cannot serve. `run()` decides it BEFORE any Admin is closed: the
+  request is RECORDED (`client\pending_admin_update.json`: the shortcut
+  choice, the native-feedback choice, whether the Admin is to be launched
+  afterwards, when, and which client version recorded it), the self-update
+  is staged now and the swap asked for at the first safe moment
+  (`g_on_client_update_required` → `self_update::refresh_check(0)`, the
+  serve loop's cadence dropped to every second for two minutes), and the
+  operation answers `client_update`. The Admin, if open, stays open.
+  `status` reports `updating:true` while the record stands, so the
+  Admin's Settings overlay keeps waiting through the swap.
+- the NEW client, at startup after its own reconciliation
+  (`resume_pending_update`), runs the Admin update from the record: the
+  Admin is closed gracefully, the native "Updating…" card shows, the
+  verified pipeline runs, the Admin relaunches (`launch_after` for the
+  update-on-launch handoff). A record is honored once and only while fresh
+  (30 minutes); a client that finds ITS OWN version in the record (the
+  swap failed or rolled back) discards it and the update fails visibly and
+  stays offered: never a loop. The Admin host's own gate (an older Client
+  refuses Build for Evaluation's delivery and an evaluator's Install, and
+  asks the Client to update) is `v2_mvp/docs/ADMIN_ARCHITECTURE.md`.
+- an older Client (before 0.9.15) does not know any of this: it refuses
+  the manifest outright, its forced self-update check (above) stages the
+  new client, and the swap at the next safe point brings this behavior.
+  Proof: `tools/client_requirement_test.mjs`.
+
 Once accepted, the operation finishes even if every page closes
 (`g_busy` also holds off the client self-update swap), and a FRESH install
 launches the installed Admin automatically at the end. The desktop
@@ -1444,7 +1487,12 @@ the Client's, one at a time:
   process is gone and no Admin is running (`Local\VIRULE.AdminHost.Singleton`
   absent), the driver starts the host headless
   (`ViruleAdminHost.exe --data-root=<dir> --resume-delivery=<job id>`,
-  from the paths the job records), at most every five minutes per job.
+  from the paths the job records, with `<dir>\.resources\bin\x64` as the
+  working directory: the host's CEF import resolves from it, exactly as
+  virule.exe starts it; corrected 2026-10-21), at most every five minutes
+  per job. A CLOSING Admin starts the same host for the stage it owns
+  itself (v2_mvp ADMIN_ARCHITECTURE.md "Closing the Admin while a build
+  runs"), so a stage rarely has to wait for this driver.
 
 GUARANTEES (`tests	ransfers`, `tools	ransfer_test.mjs`): the record is
 written atomically after every step; a part the service holds is never
@@ -1462,10 +1510,26 @@ refreshed on 401), never the relay. Part uploads carry the raw bytes
 (`http::request`); ranged downloads stream to the file (`http::request_to_file`).
 
 LOCAL MESSAGES (control connections only): `transfer_control`
-(`{"assignment_id","action":"pause"|"resume"|"retry"}`: a pause is recorded
-on the job and honored at the next range, a resume clears it, a retry
-re-queues a failed install; answers `{"type":"transfer_control","ok":true}`),
+(`{"assignment_id","action":"pause"|"resume"|"retry"|"verify"}`: a pause is
+recorded on the job and honored at the next range, a resume clears it, a
+retry re-queues a failed install; answers `{"type":"transfer_control","ok":true}`),
 `transfer_wake` (signal the driver), `transfer_status` (every job, bounded).
+
+THE LAUNCH CHAIN IS MADE CURRENT BEFORE A LAUNCH (0.9.15; defect correction
+2026-10-21). `verify` runs the install's own chain step again for an
+INSTALLED assignment (`ensure_launch_chain`, the core `write_launch_chain`
+wraps): the ticket is asked and written again, and the evaluator credential
+is issued again when the machine key it is bound to is not this computer's
+current one (the Admin re-issues `dev_machine.cred` on its first run, and
+the credential must be bound to the key the wrapper will derive from that
+file). The machine key is READ at every call, never remembered. It is
+synchronous (the service is asked, the Admin host waits), never touches the
+job record, and answers `ok:false` with a plain message when nothing can be
+done (`This game isn't installed yet.`, `This computer has no VIRULE
+identity.`, the service's refusal). The Admin host calls it from
+`LaunchEvaluationGame` when the wrapper's own selection of the chain would
+refuse, then selects again before launching. Proof: `tests/transfers`
+(`test_launch_chain`).
 
 ## Evaluation evidence delivery (2026-10-14)
 

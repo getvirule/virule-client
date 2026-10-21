@@ -188,6 +188,16 @@ inline std::filesystem::path self_update_state_file() {
     return r.empty() ? r : r / L"self_update.json";
 }
 
+// AN ADMIN UPDATE WAITING FOR THIS CLIENT'S OWN UPDATE (0.9.15; client
+// admin_install.hpp "the Admin update resumes after the Client's swap"):
+// the Admin update the person asked for could not run on this client
+// (the approved Admin needs a newer client), so the client updates itself
+// first and the NEW client runs the Admin update from this record.
+inline std::filesystem::path pending_admin_update_file() {
+    const auto r = client_state_dir();
+    return r.empty() ? r : r / L"pending_admin_update.json";
+}
+
 // The managed VIRULE Admin installation. ONLY this location counts as "Admin
 // installed": a development tree or a manually extracted copy elsewhere is
 // never reported or launched by the client.

@@ -216,13 +216,44 @@ inline bool is_paused(const std::string& assignment_id) {
     return controls().paused.count(assignment_id) > 0;
 }
 
+struct DriverConfig;
+// The driver's configuration, for the one control that needs the service
+// ("verify", below); set by main.cpp when the driver starts. Null = no
+// service here (the unit harness), and verify answers ok:false.
+inline const DriverConfig*& control_config() { static const DriverConfig* p = nullptr; return p; }
+namespace detail {
+inline bool refresh_launch_chain(const DriverConfig& cfg, const std::string& assignment_id, std::string& why);
+}
+
 // The bridge's transfer_control: answers the reply JSON.
+//   pause | resume | retry   the evaluator's install job (the driver applies it)
+//   verify                   (0.9.15) make the launch chain of an INSTALLED
+//                            assignment current before the Admin launches
+//                            its wrapper: the ticket asked again, the
+//                            evaluator credential re-issued when the
+//                            machine key it is bound to is not this
+//                            computer's any more. Synchronous (the service
+//                            is asked); never touches the job record.
 inline std::string control(const std::string& payload, const fs::path& root) {
     std::string assignment, action;
     (void)js::find_string_in(payload, 0, payload.size(), "assignment_id", assignment);
     (void)js::find_string_in(payload, 0, payload.size(), "action", action);
-    if (!ev::is_hex32(assignment) || (action != "pause" && action != "resume" && action != "retry")) {
+    if (!ev::is_hex32(assignment) ||
+        (action != "pause" && action != "resume" && action != "retry" && action != "verify")) {
         return "{\"type\":\"error\"}";
+    }
+    if (action == "verify") {
+        std::string why;
+        bool ok = false;
+        if (const DriverConfig* cfg = control_config()) {
+            ed::Job j;
+            if (!ed::install_for_assignment(root, assignment, j) || j.state != "installed") why = "This game isn't installed yet.";
+            else ok = detail::refresh_launch_chain(*cfg, assignment, why);
+        } else {
+            why = "No service here.";
+        }
+        return std::string("{\"type\":\"transfer_control\",\"ok\":") + (ok ? "true" : "false") +
+               ",\"message\":" + ev::json::quote(why) + "}";
     }
     {
         std::lock_guard<std::mutex> lock(controls().m);
@@ -563,54 +594,92 @@ inline fs::path credential_path(const fs::path& root) { return root / L"security
 // (v2_mvp docs/EVALUATION_VIRULE.md section 2): asked of the service, written
 // as given (the signatures are the service's), with the install location
 // and the launch file added for the Admin (not covered by the signature).
-inline bool write_launch_chain(const DriverConfig& cfg, ed::Job& j) {
-    const Reply t = cfg.service->call("GET", "/v1/assignments/" + j.assignment_id + "/ticket", "", "", {});
-    if (t.status != 200) { defer(cfg, j, t.status == 0 ? "Couldn't reach our servers right now." : body_message(t.body)); return false; }
+//
+// THE CORE touches no job record: it is what the install writes once and
+// what "verify" (control, 0.9.15) runs again before a launch. `retryable`
+// says whether a failure is the service being unreachable or answering
+// badly (the install defers and tries again) or this computer's (no
+// identity: the install fails).
+struct ChainOutcome { bool ok = false; bool retryable = true; std::string why; };
+
+inline ChainOutcome ensure_launch_chain(const DriverConfig& cfg, const std::string& assignment_id,
+                                        const std::string& install_dir, const std::string& launch_exe,
+                                        const std::string& revision_id) {
+    ChainOutcome r;
+    const Reply t = cfg.service->call("GET", "/v1/assignments/" + assignment_id + "/ticket", "", "", {});
+    if (t.status != 200) { r.why = t.status == 0 ? "Couldn't reach our servers right now." : body_message(t.body); return r; }
     std::string_view ticket_raw;
-    if (!ev::json::member(t.body, "ticket", ticket_raw)) { defer(cfg, j, "The service answered without a ticket."); return false; }
+    if (!ev::json::member(t.body, "ticket", ticket_raw)) { r.why = "The service answered without a ticket."; return r; }
     std::string ticket(ticket_raw);
     std::string aid, evid, guid, acc, sig;
-    if (!ev::json::get_string(ticket, "assignment_id", aid) || aid != j.assignment_id ||
+    if (!ev::json::get_string(ticket, "assignment_id", aid) || aid != assignment_id ||
         !ev::json::get_string(ticket, "evaluator_id", evid) || !ev::json::get_string(ticket, "game_uuid", guid) ||
         !ev::json::get_string(ticket, "accepted_utc", acc) || !ev::json::get_string(ticket, "signature", sig)) {
-        defer(cfg, j, "The service answered with a malformed ticket.");
-        return false;
+        r.why = "The service answered with a malformed ticket.";
+        return r;
     }
     const std::string ticket_doc = "{\"version\":1,\"assignment_id\":" + ev::json::quote(aid) + ",\"evaluator_id\":" + ev::json::quote(evid) +
         ",\"game_uuid\":" + ev::json::quote(guid) + ",\"accepted_utc\":" + ev::json::quote(acc) + ",\"signature\":" + ev::json::quote(sig) +
-        ",\"install_path\":" + ev::json::quote(j.install_dir) + ",\"launch_exe\":" + ev::json::quote(j.launch_exe) +
-        ",\"revision_id\":" + ev::json::quote(j.revision_id) + "}\n";
+        ",\"install_path\":" + ev::json::quote(install_dir) + ",\"launch_exe\":" + ev::json::quote(launch_exe) +
+        ",\"revision_id\":" + ev::json::quote(revision_id) + "}\n";
     std::error_code ec;
     fs::create_directories(ticket_path(cfg.root, aid).parent_path(), ec);
-    if (!ev::write_file_atomic(ticket_path(cfg.root, aid), ticket_doc)) { defer(cfg, j, "The ticket could not be written."); return false; }
+    if (!ev::write_file_atomic(ticket_path(cfg.root, aid), ticket_doc)) { r.why = "The ticket could not be written."; return r; }
 
+    // THE MACHINE KEY IS READ NOW, never remembered: the Admin re-issues
+    // this computer's identity (dev_machine.cred) on its first run, and the
+    // credential must be bound to the key the wrapper will derive from
+    // that file at launch.
     const std::string machine = cfg.service->machine_key();
-    if (machine.empty()) { fail(cfg, j, "This computer has no VIRULE identity."); return false; }
+    if (machine.empty()) { r.retryable = false; r.why = "This computer has no VIRULE identity."; return r; }
     // The credential held here, when it is this evaluator's for this machine, stays.
     {
         const std::string held = ev::read_document(credential_path(cfg.root));
         std::string hev, hkey;
         if (!held.empty() && ev::json::get_string(held, "evaluator_id", hev) && hev == evid &&
             ev::json::get_string(held, "machine_key", hkey) && hkey == machine) {
-            return true;
+            r.ok = true;
+            return r;
         }
     }
     const Reply c = cfg.service->call("POST", "/v1/assignments/credential", "{\"machine_key\":\"" + machine + "\"}", "application/json", {});
-    if (c.status != 200 && c.status != 201) { defer(cfg, j, c.status == 0 ? "Couldn't reach our servers right now." : body_message(c.body)); return false; }
+    if (c.status != 200 && c.status != 201) { r.why = c.status == 0 ? "Couldn't reach our servers right now." : body_message(c.body); return r; }
     std::string_view cred_raw;
-    if (!ev::json::member(c.body, "credential", cred_raw)) { defer(cfg, j, "The service answered without a credential."); return false; }
+    if (!ev::json::member(c.body, "credential", cred_raw)) { r.why = "The service answered without a credential."; return r; }
     std::string cred(cred_raw);
     std::string cev, ckey, bound, csig;
     if (!ev::json::get_string(cred, "evaluator_id", cev) || cev != evid || !ev::json::get_string(cred, "machine_key", ckey) ||
         ckey != machine || !ev::json::get_string(cred, "bound_utc", bound) || !ev::json::get_string(cred, "signature", csig)) {
-        defer(cfg, j, "The service answered with a malformed credential.");
-        return false;
+        r.why = "The service answered with a malformed credential.";
+        return r;
     }
     const std::string cred_doc = "{\"version\":1,\"evaluator_id\":" + ev::json::quote(cev) + ",\"machine_key\":" + ev::json::quote(ckey) +
         ",\"bound_utc\":" + ev::json::quote(bound) + ",\"signature\":" + ev::json::quote(csig) + "}\n";
     fs::create_directories(credential_path(cfg.root).parent_path(), ec);
-    if (!ev::write_file_atomic(credential_path(cfg.root), cred_doc)) { defer(cfg, j, "The credential could not be written."); return false; }
-    return true;
+    if (!ev::write_file_atomic(credential_path(cfg.root), cred_doc)) { r.why = "The credential could not be written."; return r; }
+    r.ok = true;
+    return r;
+}
+
+// The install's step: a failure defers (the service) or fails (this
+// computer) the job.
+inline bool write_launch_chain(const DriverConfig& cfg, ed::Job& j) {
+    const ChainOutcome r = ensure_launch_chain(cfg, j.assignment_id, j.install_dir, j.launch_exe, j.revision_id);
+    if (r.ok) return true;
+    if (r.retryable) defer(cfg, j, r.why); else fail(cfg, j, r.why);
+    return false;
+}
+
+// "verify" (control): an INSTALLED assignment's chain made current; the
+// job record is only read.
+inline bool refresh_launch_chain(const DriverConfig& cfg, const std::string& assignment_id, std::string& why) {
+    ed::Job j;
+    if (!ed::install_for_assignment(cfg.root, assignment_id, j) || j.state != "installed") { why = "This game isn't installed yet."; return false; }
+    const ChainOutcome r = ensure_launch_chain(cfg, assignment_id, j.install_dir, j.launch_exe, j.revision_id);
+    why = r.why;
+    if (r.ok) log(cfg, j.id + " launch chain verified for " + assignment_id);
+    else log(cfg, j.id + " launch chain could not be made current: " + r.why);
+    return r.ok;
 }
 
 inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
