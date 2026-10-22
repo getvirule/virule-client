@@ -374,11 +374,19 @@ inline bool https_get_to_file(const wchar_t* host, const wchar_t* path,
 // written, `status_out` 0 exactly when no HTTP response was received.
 // `keep_going` false ABORTS the read (a pause, a stop); the caller keeps
 // the file and resumes from its length. Nothing here logs.
+//
+// THE WHOLE OBJECT (2026-10-22): `whole_length` > 0 says the caller asked
+// for the WHOLE object from byte 0 (a received evidence file,
+// client/evaluation_inbox.hpp) and also takes a 200 answer, but only when
+// its Content-Length is exactly `whole_length`: a route that ignores Range
+// then answers the same bytes. 0 (the default, the game package's chunked
+// download) keeps requiring 206, so a 200 is never appended mid-file.
 inline bool request_to_file(const wchar_t* host, unsigned short port, bool secure,
                             const std::wstring& path, const std::wstring& headers,
                             unsigned long long max_bytes, FILE* out,
                             unsigned long long& bytes_out, unsigned long& status_out,
-                            const std::function<bool()>& keep_going) {
+                            const std::function<bool()>& keep_going,
+                            unsigned long long whole_length = 0) {
     status_out = 0;
     bytes_out = 0;
     HINTERNET hsession = WinHttpOpen(L"ViruleClient/1.0",
@@ -406,6 +414,16 @@ inline bool request_to_file(const wchar_t* host, unsigned short port, bool secur
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX)) {
                     status_out = status;
                     ok = (status == 206);
+                    if (!ok && status == 200 && whole_length > 0) {
+                        // Content-Length as a 64-bit number; absent (chunked) = refused.
+                        unsigned long long length = 0;
+                        DWORD lsz = sizeof(length);
+                        if (WinHttpQueryHeaders(hrequest,
+                                WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &length, &lsz, WINHTTP_NO_HEADER_INDEX)) {
+                            ok = (length == whole_length);
+                        }
+                    }
                 }
                 if (ok) {
                     std::string chunk;

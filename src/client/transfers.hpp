@@ -207,6 +207,16 @@ struct Service {
     virtual bool get_range_to_file(const std::string& path, std::uint64_t from, std::uint64_t to, FILE* out,
                                    std::uint64_t& bytes_out, unsigned long& status_out,
                                    const std::function<bool()>& keep_going) = 0;
+    // THE WHOLE OBJECT from byte 0 (2026-10-22; a received evidence file,
+    // client/evaluation_inbox.hpp): like a ranged GET of [0, bytes-1], but a
+    // 200 whose Content-Length is exactly `bytes` is taken too
+    // (http_client.hpp request_to_file `whole_length`). The default forwards
+    // to the ranged GET (206 only); the game package's download never uses it.
+    virtual bool get_whole_to_file(const std::string& path, std::uint64_t bytes, FILE* out,
+                                   std::uint64_t& bytes_out, unsigned long& status_out) {
+        if (bytes == 0) { bytes_out = 0; status_out = 0; return false; }
+        return get_range_to_file(path, 0, bytes - 1, out, bytes_out, status_out, [] { return true; });
+    }
     // This installation's machine identity (the evaluator credential binds to it).
     virtual std::string machine_key() = 0;
 };

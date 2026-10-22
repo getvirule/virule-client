@@ -266,8 +266,8 @@ try {
   mode.kind = "hang";
   const quiet = await seed(1);
   await signal();
-  const qState = await waitFor(() => { const s = deliveryState(quiet); return s && s.attempts >= 1 ? s : null; }, 20000);
-  check("no answer keeps it pending", qState && qState.last_error === "no answer from the test endpoint" && inOutbox(quiet), qState);
+  const qState = await waitFor(() => { const s = deliveryState(quiet); return s && s.attempts >= 1 && s.state === "waiting" ? s : null; }, 20000);
+  check("no answer keeps it pending (reason offline)", qState && qState.last_error === "no answer from the test endpoint" && qState.reason === "offline" && inOutbox(quiet), qState);
   mode.kind = "normal";
   releaseHeld();
   check("delivered after the silence", await waitFor(() => delivered(quiet), 20000));

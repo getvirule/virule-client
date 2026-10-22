@@ -14,8 +14,13 @@
 //
 // GUARANTEES (each one has a test in tests/evidence):
 //   - oldest package first (outbox directory creation time, then id);
-//   - delivery state is written atomically after every attempt
-//     {attempts, failures, next_attempt_utc, last_error, damaged, acked};
+//   - delivery state is written atomically at the start of every attempt,
+//     after EVERY acknowledged file, and after the attempt
+//     {attempts, failures, next_attempt_utc, last_error, damaged, acked,
+//      state, reason, updated_utc} (the last three 2026-10-22);
+//   - evidence goes only under its evaluator's account: signed out or with
+//     another account signed in it WAITS, no attempt and no failure
+//     (2026-10-22, "whose evidence it is" below);
 //   - the receipt is written atomically BEFORE the payload is removed
 //     (evaluation_evidence::acknowledge), and the payload goes only after a
 //     COMPLETE acknowledgment that covers every file;
@@ -110,6 +115,19 @@ inline fs::path delivery_path(const ee::Root& r, const std::string& id) {
     return delivery_dir(r) / fs::path(id + ".json");
 }
 
+// THE DELIVERY'S OWN STATE AND WHY IT WAITS (2026-10-22), beside the
+// ladder fields: `state` is "sending" while an attempt runs, else
+// "waiting"; `reason` says what it waits on: "" (its turn on the ladder),
+// "signed_out", "other_account" (the package's evaluator is not the
+// signed-in account), "offline" (the last attempt reached no service) or
+// "refused" (the service answered a refusal that is not a transient;
+// last_error keeps its sentence). `updated_utc` is the unix second of the
+// last write: at the attempt's start and after EVERY acknowledged file.
+inline constexpr const char* kReasonSignedOut = "signed_out";
+inline constexpr const char* kReasonOtherAccount = "other_account";
+inline constexpr const char* kReasonOffline = "offline";
+inline constexpr const char* kReasonRefused = "refused";
+
 struct State {
     std::string package_id, assignment_id;
     std::int64_t attempts = 0;          // every delivery attempt, ever
@@ -118,6 +136,9 @@ struct State {
     std::string last_error;
     bool damaged = false;
     std::vector<std::string> acked;     // files the service acknowledged, sorted
+    std::string state = "waiting";      // "sending" | "waiting"
+    std::string reason;                 // see above
+    std::int64_t updated_utc = 0;       // the last write
 };
 
 inline std::string state_json(const State& s) {
@@ -128,7 +149,10 @@ inline std::string state_json(const State& s) {
         ",\"failures\":" + std::to_string(s.failures) +
         ",\"next_attempt_utc\":" + std::to_string(s.next_attempt_utc) +
         ",\"last_error\":" + quote(s.last_error) +
-        ",\"damaged\":" + (s.damaged ? "true" : "false") + ",\"acked\":[";
+        ",\"damaged\":" + (s.damaged ? "true" : "false") +
+        ",\"state\":" + quote(s.state) +
+        ",\"reason\":" + quote(s.reason) +
+        ",\"updated_utc\":" + std::to_string(s.updated_utc) + ",\"acked\":[";
     for (size_t i = 0; i < s.acked.size(); ++i) {
         if (i) out += ",";
         out += quote(s.acked[i]);
@@ -146,6 +170,10 @@ inline bool parse_state(std::string_view text, State& s) {
     s.next_attempt_utc = j::opt_int(text, "next_attempt_utc");
     s.last_error = j::opt_string(text, "last_error");
     (void)j::get_bool(text, "damaged", s.damaged);
+    s.state = j::opt_string(text, "state");
+    if (s.state != "sending") s.state = "waiting";
+    s.reason = j::opt_string(text, "reason");
+    s.updated_utc = j::opt_int(text, "updated_utc");
     std::string_view raw;
     if (j::member(text, "acked", raw)) {
         std::vector<std::string_view> list;
@@ -198,6 +226,11 @@ struct Offer {
     std::string package_id, assignment_id;
     std::vector<OfferFile> files;          // every file of the package
     std::vector<std::string> already_acked; // never sent again
+    // PER-FILE PROGRESS (2026-10-22): a transport calls this with the
+    // service's acknowledged set after EVERY answer it got during the
+    // attempt (names may repeat), so each acknowledged file is persisted
+    // and counted at once, not only when the attempt ends.
+    std::function<void(const std::vector<std::string>& acked)> on_acked;
 };
 
 struct Answer {
@@ -208,7 +241,21 @@ struct Answer {
     std::string receipt_id;
     std::string error;
     std::string progress;            // the service's progress of the assignment (raw JSON), when it said
+    unsigned long status = 0;        // the HTTP status that ended a Failed attempt (0 = no answer)
+    bool refused = false;            // that answer was a refusal, not a transient (2026-10-22)
+    bool signed_out = false;         // Unavailable because nobody is signed in
+    bool no_answer = false;          // the attempt reached no service (offline)
 };
+
+// A refusal, not a transient: a 4xx other than 401 (the authorization is
+// renewed), 408 and 429 (try later), and a 409 `integrity` (storage: send
+// again). Everything else (no answer, 5xx) is transient.
+inline bool refusal_status(unsigned long status, const std::string& code) {
+    if (status < 400 || status >= 500) return false;
+    if (status == 401 || status == 408 || status == 429) return false;
+    if (status == 409 && code == "integrity") return false;
+    return true;
+}
 
 // One answer of the service to a request (an early completion, a report).
 struct ServiceReply {
@@ -341,6 +388,7 @@ public:
         Answer last;
         if (!post(L"/packages/" + widen(offer.package_id), body, last)) return finish(last);
         acked.insert(last.acked.begin(), last.acked.end());
+        if (offer.on_acked) offer.on_acked(last.acked);
         if (last.complete) return finish(last);
 
         for (const auto& f : offer.files) {
@@ -369,6 +417,7 @@ public:
                     return finish(last);
                 }
                 acked.insert(last.acked.begin(), last.acked.end());
+                if (offer.on_acked) offer.on_acked(last.acked);
                 offset += n;
                 if (is_last) break;
             }
@@ -396,11 +445,14 @@ private:
         if (!got || status == 0) {
             out.kind = Answer::Kind::Failed;
             out.error = "no answer from the test endpoint";
+            out.no_answer = true;
             return false;
         }
         if (status != 200) {
             out.kind = Answer::Kind::Failed;
             out.error = "test endpoint answered " + std::to_string(status);
+            out.status = status;
+            out.refused = refusal_status(status, std::string());
             return false;
         }
         if (!parse_answer(text, out)) {
@@ -476,6 +528,7 @@ public:
         if (!call_ || !ready()) {
             result.kind = Answer::Kind::Unavailable;
             result.error = "signed out";
+            result.signed_out = true;
             return result;
         }
         std::set<std::string> acked(offer.already_acked.begin(), offer.already_acked.end());
@@ -499,12 +552,16 @@ public:
                 last = Answer{};
                 if ((r.status == 200 || r.status == 201) && parse_answer(r.body, last)) {
                     acked.insert(last.acked.begin(), last.acked.end());
+                    if (offer.on_acked) offer.on_acked(last.acked);   // persisted file by file
                     return true;
                 }
                 if (r.status == 409 && service_code(r) == "integrity" && attempt == 0) continue;
                 last = Answer{};
                 last.kind = Answer::Kind::Failed;
                 last.error = service_error(r);
+                last.status = r.status;
+                last.no_answer = r.status == 0;
+                last.refused = refusal_status(r.status, service_code(r));
                 return false;
             }
             return false;
@@ -568,6 +625,44 @@ inline std::unique_ptr<Transport> select_transport(const std::wstring& test_endp
     }
     if (service) return std::make_unique<ServiceTransport>(std::move(service), std::move(signed_in));
     return std::make_unique<ProductionTransport>();
+}
+
+// ---- whose evidence it is (2026-10-22)
+//
+// A package (and a request) is delivered only under the account of its
+// evaluator: package.json `evaluator_id` IS the evaluator's account id
+// (EVALUATION_VIRULE.md section 2). Signed out, or with another account
+// signed in (a shared computer), it WAITS: no attempt, no failure, no
+// ladder step; a sign-in wakes the driver (main.cpp) and it goes at once.
+// The Client holds no account id of its own (/v1/account/me names none),
+// so the decision is the injected OwnerFn (client/evidence_owner.hpp in
+// production); without one every package is treated as the signed-in
+// account's (the loopback test transport, the tests).
+enum class Owner {
+    Mine,          // the signed-in account is the evaluator
+    SignedOut,     // nobody is signed in
+    OtherAccount,  // another account is signed in (or it lacks the evaluator capability)
+    Unknown,       // not decidable now (no answer): the attempt goes, the service decides
+};
+using OwnerFn = std::function<Owner(const std::string& assignment_id, const std::string& evaluator_id)>;
+
+// Every file the service acknowledged in this process (the uninstall's
+// wait reads progress from it as well as from the delivery state).
+inline std::atomic<std::uint64_t>& acked_file_counter() { static std::atomic<std::uint64_t> n{ 0 }; return n; }
+
+// A FORCED PASS ASKED FOR: the next wake runs a pass that ignores
+// next_attempt (a sign-in, the uninstall's wait), as the startup pass does.
+inline std::atomic<bool>& forced_pass_flag() { static std::atomic<bool> f{ false }; return f; }
+inline void request_forced_pass() { forced_pass_flag().store(true); }
+
+// The evaluator a request belongs to: its own `evaluator_id` when it names
+// one, else the assignment ticket's (evaluator\assignments\<id>\ticket.json
+// beside the evidence root). "" = not known here.
+inline std::string request_evaluator(const ee::Root& r, const std::string& assignment_id, std::string_view text) {
+    std::string id = ee::json::opt_string(text, "evaluator_id");
+    if (!id.empty() || r.dir.empty()) return id;
+    const fs::path ticket = r.dir.parent_path() / L"evaluator" / L"assignments" / fs::path(assignment_id) / L"ticket.json";
+    return ee::json::opt_string(ee::read_document(ticket), "evaluator_id");
 }
 
 // ---- the engine
@@ -641,6 +736,7 @@ struct PassResult {
     int delivered = 0;        // receipts written this pass
     int cleaned = 0;          // payloads removed under an existing receipt
     int pending = 0;          // still waiting
+    int waiting_account = 0;  // of those, waiting on its evaluator's account (2026-10-22)
     int damaged = 0;
     int skipped_not_due = 0;
     int transport_calls = 0;
@@ -653,12 +749,23 @@ struct LogOnce {
     bool first(const std::string& key) { return seen.insert(key).second; }
 };
 
+// What a pass may be given beside the transport (2026-10-22): whose
+// evidence it is, and the clock of `updated_utc` (default: time()).
+struct PassHooks {
+    OwnerFn owner;
+    std::function<std::int64_t()> clock;
+};
+
 // ONE PASS over the outbox. `force` ignores next_attempt (the startup
 // recovery pass). `now` is UTC seconds (injected for the tests).
 inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t now,
-                           bool force, const Log& log, LogOnce* once = nullptr) {
+                           bool force, const Log& log, LogOnce* once = nullptr,
+                           const PassHooks* hooks = nullptr) {
     PassResult res;
     if (r.dir.empty()) return res;
+    const auto clock = [&]() -> std::int64_t {
+        return hooks && hooks->clock ? hooks->clock() : (std::int64_t)std::time(nullptr);
+    };
     const auto say = [&](const std::string& key, const std::string& text) {
         if (!log) return;
         if (once && !once->first(key)) return;
@@ -696,6 +803,9 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
             const bool newly = !st.damaged || st.last_error != damage;
             st.damaged = true;
             st.last_error = damage;
+            st.state = "waiting";
+            st.reason.clear();
+            st.updated_utc = clock();
             ++st.failures;
             st.next_attempt_utc = now + backoff_seconds(st.failures);
             (void)save_state(r, st);
@@ -706,26 +816,76 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
         }
         st.damaged = false;
 
+        // WHOSE EVIDENCE (2026-10-22): signed out, or another account signed
+        // in, the package WAITS: no attempt, no failure, no ladder step, due
+        // again the moment a sign-in wakes the driver.
+        Owner owner = transport.ready() ? Owner::Mine : Owner::SignedOut;
+        if (owner == Owner::Mine && hooks && hooks->owner) owner = hooks->owner(pkg.assignment_id, pkg.evaluator_id);
+        if (owner == Owner::SignedOut || owner == Owner::OtherAccount) {
+            const char* why = owner == Owner::SignedOut ? kReasonSignedOut : kReasonOtherAccount;
+            if (st.state != "waiting" || st.reason != why || st.next_attempt_utc != 0 || !st.last_error.empty()) {
+                st.state = "waiting";
+                st.reason = why;
+                st.last_error.clear();
+                st.next_attempt_utc = 0;
+                st.updated_utc = clock();
+                (void)save_state(r, st);
+                note_change();
+            }
+            ++res.pending;
+            ++res.waiting_account;
+            say(std::string("wait:") + id + why, "evidence: " + id + " waits (" + why + "); nothing sent");
+            continue;
+        }
+
         // Acked names that are not files of this package mean nothing.
         std::vector<std::string> known;
         for (const auto& f : files) known.push_back(f.file);
         std::vector<std::string> acked_before;
         for (const auto& a : st.acked) if (contains(known, a)) acked_before.push_back(a);
 
+        // THE ATTEMPT IS RECORDED AS IT STARTS, and every file the service
+        // acknowledges during it is persisted at once (acked, updated_utc,
+        // the change counter), so a kill mid-attempt loses nothing and the
+        // Admin sees the files go one by one.
+        std::set<std::string> merged(acked_before.begin(), acked_before.end());
+        ++st.attempts;
+        st.state = "sending";
+        st.reason.clear();
+        st.updated_utc = clock();
+        (void)save_state(r, st);
+
         Offer offer;
         offer.package_id = id;
         offer.assignment_id = pkg.assignment_id;
         offer.files = files;
         offer.already_acked = acked_before;
+        offer.on_acked = [&](const std::vector<std::string>& names) {
+            bool grew = false;
+            for (const auto& a : names) {
+                if (contains(known, a) && merged.insert(a).second) {
+                    grew = true;
+                    acked_file_counter().fetch_add(1);
+                }
+            }
+            if (!grew) return;
+            st.acked.assign(merged.begin(), merged.end());
+            st.updated_utc = clock();
+            (void)save_state(r, st);
+            note_change();
+        };
 
-        ++st.attempts;
         ++res.transport_calls;
         const Answer ans = transport.deliver(offer);
 
-        std::set<std::string> merged(acked_before.begin(), acked_before.end());
-        for (const auto& a : ans.acked) if (contains(known, a)) merged.insert(a);
+        for (const auto& a : ans.acked) {
+            if (contains(known, a) && merged.insert(a).second) acked_file_counter().fetch_add(1);
+        }
         const bool progress = merged.size() > acked_before.size();
         st.acked.assign(merged.begin(), merged.end());
+        st.state = "waiting";
+        st.reason.clear();
+        st.updated_utc = clock();
 
         const bool all_acked = merged.size() == known.size();
         if (ans.kind == Answer::Kind::Answered && ans.complete && all_acked && !ans.receipt_id.empty()) {
@@ -747,6 +907,15 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
                 continue;
             }
             st.last_error = "the receipt could not be written";
+        } else if (ans.kind == Answer::Kind::Unavailable && ans.signed_out) {
+            // Signed out while the pass ran: a wait, never a failure.
+            st.reason = kReasonSignedOut;
+            st.last_error.clear();
+            st.next_attempt_utc = 0;
+            (void)save_state(r, st);
+            ++res.pending;
+            ++res.waiting_account;
+            continue;
         } else if (ans.kind == Answer::Kind::Unavailable) {
             st.last_error = ans.error.empty() ? "transport unavailable" : ans.error;
             say("unavailable:" + id, "evidence: " + id + " pending (" + st.last_error + ")");
@@ -758,6 +927,7 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
                          std::to_string(merged.size()) + " of " + std::to_string(known.size()) + " files)");
         } else {
             st.last_error = ans.error.empty() ? "delivery failed" : ans.error;
+            st.reason = ans.refused ? kReasonRefused : ans.no_answer ? kReasonOffline : "";
             say("failed:" + id + st.last_error, "evidence: " + id + " delivery failed (" + st.last_error + ")");
         }
         st.failures = progress ? 1 : st.failures + 1;
@@ -813,6 +983,7 @@ inline RequestState load_request_state(const ee::Root& r, const std::string& ass
 // What the pass did with the requests (tests and logs).
 struct RequestResult {
     int acknowledged = 0, refused = 0, pending = 0;
+    int waiting_account = 0;         // of the pending, waiting on its evaluator's account (2026-10-22)
     std::int64_t next_due_utc = 0;
 };
 
@@ -821,7 +992,7 @@ using AcknowledgedFn = std::function<void(const std::string& kind, const std::st
 // One pass over the requests folder. `on_ack` hears every acknowledgment
 // (main.cpp: a report acknowledged starts the game's removal).
 inline RequestResult run_requests(const ee::Root& r, Transport& transport, std::int64_t now, bool force,
-                                  const Log& log, const AcknowledgedFn& on_ack = {}) {
+                                  const Log& log, const AcknowledgedFn& on_ack = {}, const OwnerFn& owner = {}) {
     RequestResult res;
     if (r.dir.empty()) return res;
     struct Item { std::string assignment, kind; fs::path path; };
@@ -872,7 +1043,13 @@ inline RequestResult run_requests(const ee::Root& r, Transport& transport, std::
             if (res.next_due_utc == 0 || st.next_attempt_utc < res.next_due_utc) res.next_due_utc = st.next_attempt_utc;
             continue;
         }
-        if (!transport.ready()) { ++res.pending; continue; }   // signed out: waits for an account, no ladder
+        if (!transport.ready()) { ++res.pending; ++res.waiting_account; continue; }   // signed out: waits for an account, no ladder
+        // Another account signed in (2026-10-22): the request waits too, no
+        // attempt and no ladder step, until its evaluator signs in.
+        if (owner) {
+            const Owner o = owner(it.assignment, request_evaluator(r, it.assignment, text));
+            if (o == Owner::SignedOut || o == Owner::OtherAccount) { ++res.pending; ++res.waiting_account; continue; }
+        }
         const std::string body = ee::request_body(text);
         const std::string path = "/v1/assignments/" + it.assignment + (early ? "/early-completion" : "/report");
         ServiceReply reply;
@@ -1049,7 +1226,12 @@ struct DriverConfig {
     Log log;
     std::function<std::int64_t()> now;        // UTC seconds; default time()
     AcknowledgedFn on_ack;                    // a request acknowledged (main.cpp)
+    OwnerFn owner;                            // whose evidence it is (2026-10-22); empty = the signed-in account's
 };
+
+// Evidence waiting on its evaluator's account is looked at again this often
+// even without a wake (the sign-in wake is the normal path).
+inline constexpr DWORD kAccountWaitPollMs = 5 * 60 * 1000;
 
 // The evidence thread's whole life. Returns when stop_event is set.
 inline void run_driver(const DriverConfig& cfg) {
@@ -1060,15 +1242,22 @@ inline void run_driver(const DriverConfig& cfg) {
     HANDLE wake = create_wake_event(cfg.wake_name.c_str());
     if (!wake && cfg.log) cfg.log("evidence: wake event unavailable; polling every minute");
     LogOnce once;
+    PassHooks hooks;
+    hooks.owner = cfg.owner;
     bool force = true; // the startup pass: recovery after a crash or a restart
     for (;;) {
         if (cfg.paused && cfg.paused()) {
-            if (WaitForSingleObject(cfg.stop_event, kPausedPollMs) == WAIT_OBJECT_0) break;
+            // Paused (an uninstall), yet a wake is still heard: the
+            // uninstall's own wait for undelivered evidence lifts the pause
+            // and wakes this thread (main.cpp).
+            HANDLE ph[2] = { cfg.stop_event, wake };
+            if (WaitForMultipleObjects(wake ? 2 : 1, ph, FALSE, kPausedPollMs) == WAIT_OBJECT_0) break;
             continue;
         }
+        if (forced_pass_flag().exchange(false)) force = true;   // a sign-in, the uninstall's wait
         const std::int64_t t = now();
-        const PassResult r = run_pass(cfg.root, *cfg.transport, t, force, cfg.log, &once);
-        const RequestResult q = run_requests(cfg.root, *cfg.transport, t, force, cfg.log, cfg.on_ack);
+        const PassResult r = run_pass(cfg.root, *cfg.transport, t, force, cfg.log, &once, &hooks);
+        const RequestResult q = run_requests(cfg.root, *cfg.transport, t, force, cfg.log, cfg.on_ack, cfg.owner);
         force = false;
         DWORD wait_ms = INFINITE;
         std::int64_t due = r.next_due_utc;
@@ -1077,9 +1266,11 @@ inline void run_driver(const DriverConfig& cfg) {
             const std::int64_t s = std::clamp<std::int64_t>(due - t, 1, kBackoffCap);
             wait_ms = (DWORD)(s * 1000);
         }
-        // A request waiting for an account is looked at again each minute
-        // (a sign-in wakes nothing here).
+        // A request waiting for an account is looked at again each minute,
+        // and anything waiting on its evaluator's account every few minutes
+        // (a sign-in also wakes this thread at once).
         if (q.pending > 0 && !cfg.transport->ready()) wait_ms = (std::min)(wait_ms, (DWORD)kPollWithoutWakeMs);
+        if (r.waiting_account > 0 || q.waiting_account > 0) wait_ms = (std::min)(wait_ms, kAccountWaitPollMs);
         if (!wake) wait_ms = std::min<DWORD>(wait_ms, kPollWithoutWakeMs);
         HANDLE hs[2] = { cfg.stop_event, wake };
         const DWORD w = WaitForMultipleObjects(wake ? 2 : 1, hs, FALSE, wait_ms);
@@ -1087,6 +1278,104 @@ inline void run_driver(const DriverConfig& cfg) {
         if (w == WAIT_FAILED) Sleep(1000);
     }
     if (wake) CloseHandle(wake);
+}
+
+// ---- the uninstall's wait for undelivered evidence (2026-10-22)
+//
+// OWNER RULING 2026-10-22: an uninstall (both modes) first lets the Client
+// finish uploading the signed-in evaluator's undelivered evidence; when it
+// cannot (no file acknowledged for kUninstallStallMs, PENDING OWNER
+// DECISION on the value), the evidence stays local and delivery resumes
+// after a reinstall and a sign-in. This is the wait; main.cpp lifts the
+// delivery pause around it and keeps the "Removing VIRULE..." surface it
+// already shows (no new copy).
+inline constexpr std::uint64_t kUninstallStallMs = 60000;
+
+enum class DrainEnd {
+    NothingOwned,  // no package of the signed-in account was waiting: no wait at all
+    Delivered,     // every such package was delivered
+    Stalled,       // no file acknowledged for the stall window: the rest stays local
+};
+
+inline const char* drain_end_name(DrainEnd e) {
+    return e == DrainEnd::NothingOwned ? "nothing_owned" : e == DrainEnd::Delivered ? "delivered" : "stalled";
+}
+
+struct DrainConfig {
+    ee::Root root;
+    OwnerFn owner;                                  // empty = every package counts
+    std::function<std::uint64_t()> tick_ms;         // default GetTickCount64
+    std::function<void(DWORD)> sleep_ms;            // default Sleep
+    std::function<void()> wake;                     // a forced pass now (main.cpp: the wake event)
+    std::uint64_t stall_ms = kUninstallStallMs;
+    DWORD poll_ms = 1000;
+    std::uint64_t rewake_ms = 10000;                // a forced pass again while nothing moves
+    Log log;
+};
+
+// The outbox packages this wait is for: no receipt, not damaged, and
+// (with an owner) the signed-in account's own or not decidable (Unknown:
+// the service decides, so it is waited for). Another account's, or a
+// signed-out computer's, are never waited for. `acked_total` sums their
+// acknowledged files (progress).
+inline std::vector<std::string> owned_pending(const DrainConfig& c, std::uint64_t& acked_total) {
+    acked_total = 0;
+    std::vector<std::string> out;
+    for (const auto& id : outbox_ids(c.root)) {
+        if (ee::exists_quiet(ee::receipt_path(c.root, id))) continue;
+        const State st = load_state(c.root, id);
+        if (st.damaged) continue;
+        ee::Package pkg;
+        if (!ee::read_outbox_package(c.root, id, pkg)) continue;
+        if (c.owner) {
+            const Owner o = c.owner(pkg.assignment_id, pkg.evaluator_id);
+            if (o == Owner::SignedOut || o == Owner::OtherAccount) continue;
+        }
+        acked_total += st.acked.size();
+        out.push_back(id);
+    }
+    return out;
+}
+
+// Wait while the owned outbox empties; ends when it is empty or nothing
+// was acknowledged for `stall_ms` (never a fixed total: a steady upload
+// keeps it going).
+inline DrainEnd drain_owned_outbox(const DrainConfig& c) {
+    const auto tick = [&]() -> std::uint64_t { return c.tick_ms ? c.tick_ms() : GetTickCount64(); };
+    const auto pause = [&](DWORD ms) { if (c.sleep_ms) c.sleep_ms(ms); else Sleep(ms); };
+    std::uint64_t acked = 0;
+    std::vector<std::string> pending = owned_pending(c, acked);
+    if (pending.empty()) return DrainEnd::NothingOwned;
+    if (c.log) c.log("evidence: uninstall waits for " + std::to_string(pending.size()) + " undelivered package(s)");
+    if (c.wake) c.wake();
+    std::uint64_t counter = acked_file_counter().load();
+    std::uint64_t last_progress = tick();
+    std::uint64_t last_wake = last_progress;
+    for (;;) {
+        pause(c.poll_ms);
+        std::uint64_t acked_now = 0;
+        const std::vector<std::string> now_pending = owned_pending(c, acked_now);
+        if (now_pending.empty()) return DrainEnd::Delivered;
+        const std::uint64_t counter_now = acked_file_counter().load();
+        const std::uint64_t t = tick();
+        if (now_pending.size() < pending.size() || acked_now > acked || counter_now != counter) {
+            last_progress = t;
+            last_wake = t;
+        }
+        pending = now_pending;
+        acked = acked_now;
+        counter = counter_now;
+        if (t - last_progress >= c.stall_ms) {
+            if (c.log) c.log("evidence: uninstall wait ended, nothing acknowledged for " +
+                             std::to_string(c.stall_ms / 1000) + " s; " + std::to_string(pending.size()) +
+                             " package(s) stay local");
+            return DrainEnd::Stalled;
+        }
+        if (t - last_wake >= c.rewake_ms) {
+            last_wake = t;
+            if (c.wake) c.wake();
+        }
+    }
 }
 
 } // namespace vclient::evidence

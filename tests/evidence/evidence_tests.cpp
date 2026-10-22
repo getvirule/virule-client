@@ -737,6 +737,277 @@ static void test_requests() {
     CHECK(q.acknowledged == 1 && ee::exists_quiet(ee::report_receipt_path(r2, kOtherAssignment)));
 }
 
+// ---- 2026-10-22: the evaluator workflow completion ----
+
+static void test_other_account_waits() {
+    SECTION("another account signed in or signed out: the package waits, no attempt, no failure; then goes");
+    const ee::Root r = fresh_root("other-account");
+    const std::string id = make_package(r, kAssignment, 2);
+    Fake t;
+    t.script = [](const ev::Offer& o, int) { return complete(o, "r-mine"); };
+    ev::Owner who = ev::Owner::OtherAccount;
+    ev::PassHooks hooks;
+    hooks.owner = [&](const std::string& a, const std::string& e) {
+        CHECK(a == kAssignment && e == "evaluator");
+        return who;
+    };
+    for (int i = 0; i < 5; ++i) {
+        const auto res = ev::run_pass(r, t, T0 + i * 4000, i == 0, nullptr, nullptr, &hooks);
+        CHECK(res.pending == 1 && res.waiting_account == 1 && res.next_due_utc == 0);
+    }
+    CHECK(t.calls == 0);
+    ev::State st = ev::load_state(r, id);
+    CHECK(st.failures == 0 && st.attempts == 0 && st.next_attempt_utc == 0);
+    CHECK(st.state == "waiting" && st.reason == "other_account" && st.updated_utc > 0);
+    who = ev::Owner::SignedOut;
+    (void)ev::run_pass(r, t, T0 + 30000, false, nullptr, nullptr, &hooks);
+    st = ev::load_state(r, id);
+    CHECK(t.calls == 0 && st.failures == 0 && st.reason == "signed_out");
+    // Its evaluator signs in: delivered on the next pass (no ladder to wait out).
+    who = ev::Owner::Mine;
+    const auto res = ev::run_pass(r, t, T0 + 30001, false, nullptr, nullptr, &hooks);
+    CHECK(res.delivered == 1 && t.calls == 1);
+    // Unknown (no answer from the ownership read): the attempt goes.
+    const std::string id2 = make_package(r, kAssignment, 1);
+    who = ev::Owner::Unknown;
+    const auto res2 = ev::run_pass(r, t, T0 + 30002, false, nullptr, nullptr, &hooks);
+    CHECK(res2.delivered == 1 && t.calls == 2 && ee::exists_quiet(ee::receipt_path(r, id2)));
+}
+
+static void test_per_file_progress() {
+    SECTION("per-file progress: acked persisted after each file, state sending during the attempt, refused reason");
+    const ee::Root r = fresh_root("per-file");
+    const std::string id = make_package(r, kAssignment, 3);
+    std::vector<std::string> seen_states;
+    std::vector<size_t> seen_acked;
+    const auto before = ev::change_counter().load();
+    Fake t;
+    t.sim = false;
+    t.script = [&](const ev::Offer& o, int) {
+        std::vector<std::string> acked;
+        for (size_t i = 0; i < 3; ++i) {   // package.json, then two captures, then a refusal
+            acked.push_back(o.files[i].file);
+            o.on_acked(acked);
+            const ev::State on_disk = ev::load_state(r, o.package_id);
+            seen_states.push_back(on_disk.state);
+            seen_acked.push_back(on_disk.acked.size());
+        }
+        ev::Answer a;
+        a.kind = ev::Answer::Kind::Failed;
+        a.error = "Not authorized.";
+        a.status = 403;
+        a.refused = true;
+        return a;
+    };
+    auto res = ev::run_pass(r, t, T0, false, nullptr);
+    CHECK(res.pending == 1);
+    CHECK(seen_acked.size() == 3 && seen_acked[0] == 1 && seen_acked[1] == 2 && seen_acked[2] == 3);
+    CHECK(seen_states.size() == 3 && seen_states[0] == "sending" && seen_states[2] == "sending");
+    CHECK(ev::change_counter().load() >= before + 3);
+    ev::State st = ev::load_state(r, id);
+    CHECK(st.state == "waiting" && st.reason == "refused" && st.last_error == "Not authorized.");
+    CHECK(st.acked.size() == 3 && st.attempts == 1);
+    CHECK(st.failures == 1);   // progress restarts the ladder; refused never gives up either
+    // Only the last capture goes next time.
+    t.sent.clear();
+    t.script = [](const ev::Offer& o, int) { return complete(o, "r-2"); };
+    res = ev::run_pass(r, t, T0 + 100, true, nullptr);
+    CHECK(res.delivered == 1 && t.sent.size() == 1 && t.sent[0].size() == 1 && t.sent[0][0] == "000003.jpg");
+    // The delivery state keeps every existing field.
+    const ee::Root r2 = fresh_root("fields");
+    const std::string id2 = make_package(r2, kAssignment, 1);
+    Fake down;
+    down.script = [](const ev::Offer&, int) { ev::Answer a = failed(); a.no_answer = true; return a; };
+    (void)ev::run_pass(r2, down, T0, false, nullptr);
+    const std::string doc = read_all(ev::delivery_path(r2, id2));
+    for (const char* k : { "\"package_id\"", "\"assignment_id\"", "\"attempts\"", "\"failures\"", "\"next_attempt_utc\"",
+                           "\"last_error\"", "\"damaged\"", "\"acked\"", "\"state\":\"waiting\"", "\"reason\":\"offline\"",
+                           "\"updated_utc\"" }) {
+        CHECK(doc.find(k) != std::string::npos);
+    }
+}
+
+static void test_requests_wait_for_account() {
+    SECTION("requests wait for their evaluator's account: no attempt, no ladder");
+    const ee::Root r = fresh_root("requests-account");
+    const std::string s1 = random_hex32();
+    CHECK(ee::write_file_atomic(ee::report_request_path(r, kAssignment), report_doc(kAssignment, s1)));
+    // The evaluator id comes from the assignment ticket beside the evidence root.
+    const fs::path ticket = r.dir.parent_path() / "evaluator" / "assignments" / kAssignment / "ticket.json";
+    fs::create_directories(ticket.parent_path());
+    CHECK(ee::write_file_atomic(ticket, "{\"evaluator_id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}\n"));
+    RequestFake t;
+    t.answers = { { 201, "{\"report\":{\"submitted_utc\":\"2026-10-22T00:00:00Z\"}}" } };
+    std::string asked_evaluator;
+    ev::Owner who = ev::Owner::OtherAccount;
+    const ev::OwnerFn owner = [&](const std::string&, const std::string& e) { asked_evaluator = e; return who; };
+    auto q = ev::run_requests(r, t, T0, true, nullptr, {}, owner);
+    CHECK(q.pending == 1 && q.waiting_account == 1 && t.paths.empty());
+    CHECK(asked_evaluator == std::string(32, 'e'));
+    CHECK(!ee::exists_quiet(ee::request_delivery_path(r, kAssignment, "report")));   // no ladder state at all
+    who = ev::Owner::Mine;
+    q = ev::run_requests(r, t, T0 + 1, false, nullptr, {}, owner);
+    CHECK(q.acknowledged == 1 && t.paths.size() == 1);
+}
+
+static void test_driver_wakes_on_sign_in() {
+    SECTION("driver: waiting evidence goes the moment its evaluator signs in (wake + forced pass)");
+    const ee::Root r = fresh_root("sign-in-wake");
+    const std::string id = make_package(r, kAssignment, 1);
+    Fake t;
+    t.script = [](const ev::Offer& o, int) { return complete(o, "r-wake"); };
+    std::atomic<int> who{ (int)ev::Owner::OtherAccount };
+    ev::DriverConfig cfg;
+    cfg.root = r;
+    cfg.transport = &t;
+    cfg.wake_name = L"Local\\VIRULE.Evidence.Test.SignIn." + std::to_wstring(GetCurrentProcessId());
+    cfg.stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    cfg.owner = [&](const std::string&, const std::string&) { return (ev::Owner)who.load(); };
+    std::thread th([&] { ev::run_driver(cfg); });
+    Sleep(500);
+    CHECK(t.calls == 0 && ev::load_state(r, id).reason == "other_account");
+    // The sign-in hook (main.cpp): forced pass + the wake event.
+    who = (int)ev::Owner::Mine;
+    ev::request_forced_pass();
+    HANDLE w = OpenEventW(EVENT_MODIFY_STATE, FALSE, cfg.wake_name.c_str());
+    CHECK(w != nullptr);
+    if (w) { SetEvent(w); CloseHandle(w); }
+    bool done = false;
+    for (int i = 0; i < 40 && !done; ++i) { Sleep(100); done = ee::exists_quiet(ee::receipt_path(r, id)); }
+    CHECK(done && t.calls == 1);
+    SetEvent(cfg.stop_event);
+    th.join();
+    CloseHandle(cfg.stop_event);
+}
+
+static void test_uninstall_drain() {
+    SECTION("uninstall wait: nothing owned = no wait; ends delivered; ends on a stall; another account's never waited for");
+    std::uint64_t tick = 0;
+    ev::DrainConfig d;
+    d.tick_ms = [&] { return tick; };
+    d.sleep_ms = [&](DWORD ms) { tick += ms; };
+    int wakes = 0;
+    d.wake = [&] { ++wakes; };
+    // Nothing in the outbox: no wait at all.
+    d.root = fresh_root("drain-empty");
+    CHECK(ev::drain_owned_outbox(d) == ev::DrainEnd::NothingOwned && wakes == 0);
+    // Another account's package only: never waited for.
+    d.root = fresh_root("drain-other");
+    (void)make_package(d.root, kAssignment, 1);
+    d.owner = [](const std::string&, const std::string&) { return ev::Owner::OtherAccount; };
+    CHECK(ev::drain_owned_outbox(d) == ev::DrainEnd::NothingOwned && wakes == 0);
+    d.owner = [](const std::string&, const std::string&) { return ev::Owner::Mine; };
+    // A stall: nothing acknowledged for 60 s ends it, the package stays.
+    tick = 0;
+    const std::string stuck = ev::outbox_ids(d.root).front();
+    CHECK(ev::drain_owned_outbox(d) == ev::DrainEnd::Stalled);
+    CHECK(tick >= ev::kUninstallStallMs && tick < ev::kUninstallStallMs + 5000);
+    CHECK(wakes >= 5);   // a forced pass at the start and again while nothing moves
+    CHECK(ee::exists_quiet(ee::outbox_dir(d.root, stuck)));
+    // Progress keeps it going past 60 s; it ends when the outbox is empty.
+    tick = 0;
+    int polls = 0;
+    d.sleep_ms = [&](DWORD ms) {
+        tick += ms;
+        ++polls;
+        if (polls % 30 == 0 && polls < 150) {   // one more file every 30 s
+            ev::State st = ev::load_state(d.root, stuck);
+            st.package_id = stuck;
+            st.acked.push_back("f" + std::to_string(polls));
+            ev::save_state(d.root, st);
+        }
+        if (polls == 150) {   // the receipt: delivered
+            ee::Receipt rc;
+            rc.package_id = stuck;
+            rc.assignment_id = kAssignment;
+            rc.receipt_id = "r";
+            rc.acknowledged_utc = "2026-10-22T00:00:00Z";
+            ee::acknowledge(d.root, rc);
+        }
+    };
+    CHECK(ev::drain_owned_outbox(d) == ev::DrainEnd::Delivered);
+    CHECK(tick >= 150000);   // well past the 60 s window, because files kept arriving
+}
+
+#include "shared/evidence_keep.hpp"
+
+static void touch(const fs::path& p, const std::string& text = "x") {
+    std::error_code ec;
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream(p, std::ios::binary) << text;
+}
+
+static void test_delete_data_keep_set() {
+    SECTION("Delete Data keeps undelivered evaluation evidence and drafts, removes everything else");
+    namespace ek = vclient::evidence_keep;
+    // Nothing unfinished: the whole root goes, as before.
+    {
+        const ee::Root r = fresh_root("keep-none");
+        const fs::path root = r.dir.parent_path();
+        touch(root / "virule.db");
+        touch(root / "security" / "evaluator.cred");
+        CHECK(ek::keep_set(root).empty());
+        CHECK(ek::remove_root_keeping(root, ek::keep_set(root)));
+        CHECK(!fs::exists(root));
+    }
+    const ee::Root r = fresh_root("keep-some");
+    const fs::path root = r.dir.parent_path();
+    const std::string pkg = make_package(r, kAssignment, 2);          // undelivered, assignment A
+    ev::State st;
+    st.package_id = pkg;
+    ev::save_state(r, st);
+    // A receipt of A's earlier package (kept), and of another assignment's (removed).
+    const std::string old_pkg = random_hex32(), other_pkg = random_hex32();
+    ee::Receipt rc;
+    rc.package_id = old_pkg; rc.assignment_id = kAssignment; rc.receipt_id = "x"; rc.acknowledged_utc = "2026-10-22T00:00:00Z";
+    ee::write_receipt(r, rc);
+    rc.package_id = other_pkg; rc.assignment_id = kOtherAssignment;
+    ee::write_receipt(r, rc);
+    touch(ee::progress_path(r, kAssignment), "{\"sessions\":1}");
+    touch(ee::progress_path(r, kOtherAssignment), "{\"sessions\":1}");
+    const fs::path a_dir = root / "evaluator" / "assignments" / kAssignment;
+    touch(a_dir / "ledger.json");
+    touch(a_dir / "ticket.json");                                     // re-issued: removed
+    touch(a_dir / "captures" / "s" / "000001.jpg");
+    // Assignment C: only a report draft (kept); D: an empty draft (removed).
+    const std::string c_id(32, 'c'), d_id(32, 'd');
+    touch(root / "evaluator" / "assignments" / c_id / "report_draft.json", "{\"overall\":7}");
+    touch(root / "evaluator" / "assignments" / c_id / "ticket.json");
+    touch(root / "evaluator" / "assignments" / d_id / "report_draft.json", "");
+    touch(root / "evaluator" / "assignments" / d_id / "ledger.json");
+    // Assignment E: a pending early completion request.
+    const std::string e_id(32, 'e');
+    touch(ee::early_request_path(r, e_id), "{}");
+    // Everything else.
+    touch(root / "virule.db");
+    touch(root / "workspace" / "a.txt");
+    touch(root / "security" / "evaluator.cred");
+    touch(root / "transfers" / "job.json");
+    const auto keep = ek::keep_set(root);
+    CHECK(!keep.empty());
+    CHECK(ek::remove_root_keeping(root, keep));
+    CHECK(fs::exists(ee::outbox_dir(r, pkg) / "package.json"));
+    CHECK(fs::exists(ev::delivery_path(r, pkg)));
+    CHECK(fs::exists(ee::receipt_path(r, old_pkg)));
+    CHECK(!fs::exists(ee::receipt_path(r, other_pkg)));
+    CHECK(fs::exists(ee::progress_path(r, kAssignment)));
+    CHECK(!fs::exists(ee::progress_path(r, kOtherAssignment)));
+    CHECK(fs::exists(a_dir / "ledger.json") && fs::exists(a_dir / "captures" / "s" / "000001.jpg"));
+    CHECK(!fs::exists(a_dir / "ticket.json"));
+    CHECK(fs::exists(root / "evaluator" / "assignments" / c_id / "report_draft.json"));
+    CHECK(!fs::exists(root / "evaluator" / "assignments" / c_id / "ticket.json"));
+    CHECK(!fs::exists(root / "evaluator" / "assignments" / d_id));
+    CHECK(fs::exists(ee::early_request_path(r, e_id)));
+    CHECK(!fs::exists(root / "virule.db") && !fs::exists(root / "workspace") && !fs::exists(root / "security") &&
+          !fs::exists(root / "transfers"));
+    // After the reinstall and the evaluator's sign-in, the kept package is delivered.
+    Fake t;
+    t.script = [](const ev::Offer& o, int) { return complete(o, "r-after"); };
+    ev::PassHooks hooks;
+    hooks.owner = [](const std::string&, const std::string&) { return ev::Owner::Mine; };
+    CHECK(ev::run_pass(r, t, T0, true, nullptr, nullptr, &hooks).delivered == 1);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "seed") == 0) return run_seed(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "signal") == 0) return run_signal(argc, argv);
@@ -755,6 +1026,12 @@ int main(int argc, char** argv) {
     test_wake_and_driver();
     test_service_transport();
     test_requests();
+    test_other_account_waits();
+    test_per_file_progress();
+    test_requests_wait_for_account();
+    test_driver_wakes_on_sign_in();
+    test_uninstall_drain();
+    test_delete_data_keep_set();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

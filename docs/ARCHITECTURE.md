@@ -129,7 +129,9 @@ in both components).
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe; since 0.9.12 an event wakes the serve loop so draining starts at once, not at its next 1 s poll, narrowing the race with Setup's fixed 2 s wait before it replaces the exe) |
 | local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below |
 | local | `{"type":"update_health"}` | answers `{"type":"update_health","blocked":bool}` from the persisted update-connectivity record (see "Update connectivity health"); a read only, it never makes a request (v0.8.6) |
-| local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch |
+| local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch. THE FALLBACK (owner ruling 2026-10-22, for evaluation games built before `assignment_open`, whose "Quit and Open VIRULE" sends `admin_launch`): the update claim is asked first, showing nothing (`admin_install::approved_update_available`, the same claim `admin_update_check` answers, launch context); with NO approved update the Admin is opened or focused as `admin_open` does, with no card (an update in flight is joined; a running Admin is focused at once and, if it was a handing-off virule.exe that exits within 10 s, launched); with a real approved update the behavior is exactly the update-on-launch handoff above |
+| local | `{"type":"assignment_open","assignment_id":"<32 hex>"}` | THE EVALUATION WRAPPER'S Write Evaluation (owner ruling 2026-10-22, `client/assignment_open.hpp`): records an in-memory OPEN INTENT (latest wins; expires after 10 minutes; survives an Admin update relaunch because the Client process stays), bumps the change counter, then opens or focuses the Admin through the `admin_open` path (an update in flight is joined; a running Admin is focused; else it is launched); never the "Updating…" card (virule.exe itself may still run a real approved update-on-launch). Answers `{"type":"assignment_open_started"}`, or `error` (malformed id, Admin not installed or not started); refused while uninstalling and during the self-update drain |
+| local | `{"type":"assignment_open_take"}` | the Admin host taking the open intent (2026-10-22): answers `{"type":"assignment_open_intent","assignment_id":"<32 hex or empty>"}` and clears it |
 | local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
@@ -1063,8 +1065,11 @@ whole `security\` credential store (dev_machine.cred AND qa_tester*.cred)
 all stay, and the shared `VIRULE\` folder goes only if left empty. The
 explicit DELETE LOCAL DATA mode (the `delete_data` flag behind the site
 modal's toggle / the native dialog's checkbox, each with its "cannot be
-undone" warning) additionally removes the entire `%LOCALAPPDATA%\VIRULE\`
-user-data root. Both surfaces say "Uninstall VIRULE" (never "Remove").
+undone" warning) additionally removes the `%LOCALAPPDATA%\VIRULE\`
+user-data root, EXCEPT undelivered evaluation evidence and report drafts
+(owner ruling 2026-10-22; the kept set, PENDING OWNER DECISION, is in
+"Evaluation evidence delivery", "Uninstall and undelivered evidence"); with
+nothing to keep the entire root goes, as before. Both surfaces say "Uninstall VIRULE" (never "Remove").
 The running exe hands removal to a `%TEMP%` copy
 (`--finish-uninstall <pid> [--delete-data]`) so no broken executable is
 left behind. Development trees (the VIRULE repository, its
@@ -1098,7 +1103,11 @@ lifecycle operations (status carries `"uninstalling":true`;
 update is CANCELLED back to known-good (stage-boundary checks plus an
 abortable download; uninstall wins, never drained) -> update residue
 reconciled -> the Admin closed GRACEFULLY (a refusal aborts with NOTHING
-destroyed, failure push, latch kept) -> the client exits -> the VISIBLE
+destroyed, failure push, latch kept) -> the signed-in evaluator's
+undelivered evidence is delivered while files keep being acknowledged
+(owner ruling 2026-10-22; ends on an empty outbox or a 60 s stall, PENDING
+OWNER DECISION; "Uninstall and undelivered evidence") -> the installation
+signs out -> the client exits -> the VISIBLE
 `%TEMP%` helper (branded "Removing VIRULE…" card; log in
 `%TEMP%\virule-uninstall.log`) waits for every install-dir process,
 removes FILES (bounded retries per tree), then REGISTRATIONS LAST
@@ -1640,26 +1649,31 @@ byte-identical from v2_mvp (never redefined here). Engine and driver:
 `src/client/main.cpp`.
 
 OWNERSHIP, under `%LOCALAPPDATA%\VIRULE\evidence\` (a sibling of `client\`,
-so a default uninstall keeps it; Uninstall & Delete Data removes it with the
-rest of the data root):
+so a default uninstall keeps it; Uninstall & Delete Data removes it EXCEPT
+undelivered evaluation evidence and report drafts, owner ruling 2026-10-22,
+see "Uninstall and undelivered evidence" below):
 
 | Path | Owner |
 |---|---|
 | `.incoming\<id>\` | the wrapper's session, until its one rename; the Client never touches it |
 | `outbox\<id>\` (`package.json` + frames) | the Client, from the rename on |
-| `delivery\<id>.json` | Client-written delivery state `{attempts, failures, next_attempt_utc, last_error, damaged, acked}`, atomic |
+| `delivery\<id>.json` | Client-written delivery state `{package_id, assignment_id, attempts, failures, next_attempt_utc, last_error, damaged, state, reason, updated_utc, acked}`, atomic; `state`, `reason` and `updated_utc` since 2026-10-22 (below) |
 | `receipts\<id>.json` | Client-written receipt; the Admin reads it to unlock writing |
 | `progress\<assignment>.json` | Client-written: the service's progress for the assignment as its last answer stated it (0.9.17) |
 | `requests\<assignment>.early.json` / `.report.json` | the wrapper's early completion / the Admin host's report, until answered (0.9.17) |
 | `receipts\<assignment>.early.json` / `.report.json` | Client-written: the service's answer to the request (0.9.17) |
-| `received\<evaluation>\` | the DEVELOPER's Client: `evaluation.json` and each fetched package (`<package>\`, `.done` once whole), until the Admin imports it (0.9.17) |
+| `received\<evaluation>\` | the DEVELOPER's Client: `evaluation.json` and each fetched package (`<package>\`, `.done` once whole: `{package_id, sha256, session_index}`, `session_index` since 2026-10-22), until the Admin imports it (0.9.17) |
 
 THE DRIVER is a dedicated thread started in `serve()` on every client. It
 runs one FORCED pass at startup (the recovery after a crash, a kill or a
 Windows restart, with or without a wake), then blocks on the wake event
 `Local\VIRULE.Evidence.Wake`, the earliest `next_attempt_utc`, or its stop
 event (set when `serve()` ends). Idle with nothing pending is an infinite
-wait. An uninstall (`g_uninstalling` or the intent latch) pauses it. The
+wait. An uninstall (`g_uninstalling` or the intent latch) pauses it, except
+while the uninstall itself waits for undelivered evidence (2026-10-22); a
+paused driver still hears its wake event. A FORCED PASS (next_attempt
+ignored) runs at startup and on a wake after `request_forced_pass()` (a
+sign-in, the uninstall's wait). The
 Client creates the event auto-reset, initially clear (the parameters the
 wrapper's `open_wake_event` uses), with an explicit descriptor: full access
 for this user's SID and SYSTEM, medium mandatory label, so a same-user
@@ -1737,3 +1751,131 @@ renamed; `.done` once whole). A failure waits on the same ladder. The Admin
 imports a DELIVERED evaluation's packages into its workspace and frees the
 Client's copy. Signed out it does nothing; nothing private is in any
 public manifest.
+
+A RECEIVED FILE IS FETCHED WHOLE FROM BYTE 0 (2026-10-22): the inbox asks
+for `[0, bytes-1]` and takes a 206, or a 200 whose `Content-Length` is
+exactly the listed size (`http_client.hpp` `request_to_file`
+`whole_length`; `transfers::Service::get_whole_to_file`). The QA-laptop
+inbox fetched nothing because the developer file route answered 200 and the
+read took only 206. The game package's chunked download keeps requiring
+206: a 200 is never appended mid-file. The `.done` marker carries the
+service's number of the session from the listing (`session_index`, read
+as `session_index` or `index`, 0 when the listing names none), so the
+Admin orders renumbered sessions as the service does; a marker written
+before it gains the field once, nothing fetched again. The listing's
+`session_index` is the service's (`VIRULE_BACKEND/docs/API_CONTRACT_V1.md`,
+`GET /v1/evaluations/evidence`).
+
+### Whose evidence it is (2026-10-22, `src/client/evidence_owner.hpp`)
+
+THE QA-LAPTOP ROOT CAUSE: with a developer account signed in on a shared
+computer, the evaluator's packages were sent under that account, refused
+("Not authorized.") and climbed the ladder to 30 minutes. A package (and a
+request: early completion, report) is now delivered ONLY under its
+evaluator's account. Signed out, or with another account signed in, it
+WAITS: no attempt, no failure, no ladder step (`reason` `signed_out` /
+`other_account`, `next_attempt_utc` 0). Every sign-in and sign-out
+(`account.hpp` `g_on_account_changed`, fired outside the account lock)
+forgets what the previous sign-in learned, asks a forced pass and signals
+`Local\VIRULE.Evidence.Wake`, so waiting evidence goes the moment its
+evaluator signs in; waiting evidence is also looked at again every five
+minutes.
+
+THE CLIENT HOLDS NO ACCOUNT ID: `/v1/account/me` names email, display
+name, capabilities and the opaque `account_hint`, never the id, while a
+package's `evaluator_id` IS the evaluator's account id. The decision, in
+order: nobody signed in -> signed out; the signed-in account's id known
+here (the `evaluator_id` of the service-signed `ticket.json` of one of this
+account's own install jobs, `account_email` = the signed-in email, or
+learned below) -> equal is the account's, else another account's; else
+ONE read of the assignment's ticket under this account (`GET
+/v1/assignments/<id>/ticket`, which answers only the caller's own
+assignment and writes nothing): 200 the account's (and its id is learned),
+409 the account's (not active: the service decides), 404 another
+account's (remembered for the sign-in), 403 another account's (the
+account lacks the evaluator capability; asked again later), 401, 5xx or
+no answer: not decidable, the attempt goes and the service decides.
+`security\evaluator.cred` is never used for this (one file per computer,
+it survives another account's sign-out). The gate applies to the service
+transport only; the loopback test transport is not account-bound. A
+request's evaluator is its own `evaluator_id`, else its assignment
+ticket's.
+
+### The delivery state, file by file (2026-10-22)
+
+`delivery\<id>.json` keeps every earlier field and adds `state`
+(`"sending"` while an attempt runs, else `"waiting"`), `reason` (`""` its
+turn on the ladder, `signed_out`, `other_account`, `offline` the last
+attempt reached no service, `refused` the service answered a refusal that
+is not a transient: a 4xx other than 401, 408, 429 and a 409 `integrity`;
+`last_error` keeps its sentence; the ladder still never gives up) and
+`updated_utc` (unix seconds of the last write). The attempt is written as
+it starts, and `acked` is written after EACH acknowledged file, with
+`updated_utc` and a change-counter bump, so a kill mid-attempt loses
+nothing and the Admin sees files go one by one (`Offer::on_acked`, called
+by both transports after every answer).
+
+### Uninstall and undelivered evidence (2026-10-22)
+
+OWNER RULING 2026-10-22: Delete Data removes everything EXCEPT undelivered
+evaluation evidence and report drafts; if the Client is uploading them the
+uninstall waits; if it cannot (a stall) the evidence stays local and
+delivery resumes after a reinstall and a sign-in.
+
+THE WAIT (both modes, `main.cpp` `wait_for_undelivered_evidence`, step 4a
+of the ordered teardown): after the update was cancelled and the Admin
+closed (no update can finish meanwhile and the outbox is stable) and
+before the installation signs out, when the outbox holds a package of the
+signed-in account (or one not decidable now), the delivery pause is
+lifted for exactly the wait, a forced pass is woken (again every 10 s
+while nothing moves), and the uninstall waits until no such package is
+left or NO FILE WAS ACKNOWLEDGED FOR 60 s (PENDING OWNER DECISION on the
+value; `evidence_queue.hpp` `kUninstallStallMs`). A steady upload keeps
+it going: the bound is the stall, not a total. Another account's or a
+damaged package is never waited for. No new copy: the "Removing VIRULE…"
+card and the site's Removing state stay as they are; pages hold Removing
+while the client serves (`uninstalling:true`; the site's 15 s absence
+window starts only when the client is gone). The Apps & Features
+`--uninstall` path with no serving client cannot wait (no delivery runs
+there); its evidence is kept by the rule below.
+
+THE KEPT SET (PENDING OWNER DECISION; `src/shared/evidence_keep.hpp`):
+for every evaluator assignment with unfinished business (an outbox or
+`.incoming` package of it, a pending request in `evidence\requests`, a
+non-empty `evaluator\assignments\<id>\report_draft.json`, or an
+`open_session.json`), Delete Data keeps `evidence\outbox\<pkg>`,
+`evidence\.incoming\<pkg>`, `evidence\delivery\<pkg>.json`,
+`evidence\requests\<assignment>.*`, `evidence\progress\<assignment>.json`,
+`evidence\receipts\<pkg>.json` of that assignment's packages, and
+`evaluator\assignments\<id>\{ledger.json, open_session*.json,
+report_draft.json, captures\}` (what the wrapper's recovery and the
+session numbering need). The ticket and `security\` credentials are NOT
+kept (the service issues them again). Everything else goes as before;
+with nothing kept, the whole data root goes as before, and the helper's
+verification reads "everything but the kept set is gone". NOT in the
+listed set, flagged for the owner: the request receipts
+(`receipts\<assignment>.early.json` / `.report.json`) and the request
+delivery state, so after a reinstall the wrapper may offer the early
+completion again (the service answers `exists`, which settles it).
+
+## Session recovery (2026-10-22, `src/client/evaluation_recovery.hpp`)
+
+OWNER RULING 2026-10-22: the Client runs the wrapper's own recovery in a
+windowless recovery-only mode; the Client never builds evidence itself.
+For each INSTALLED evaluator assignment, at Client start (after the
+launcher's first scan) and whenever the launcher sees the game's last
+process exit (`launcher::Config::on_stopped`), the Client starts `"<install
+dir>\<launch exe>" --virule-evaluation-recover` hidden (CREATE_NO_WINDOW,
+the game folder as working directory), waits up to 120 s, logs the exit
+code (0 done or nothing to do, nonzero failed) and signals the evidence
+wake, when ALL hold: recovery is needed (`open_session.json` exists, or
+`ledger.json` lists a session id with no outbox package, no `.incoming`
+package, no receipt, and not among the progress document's `received[]`);
+no process of the game runs (the launcher's busy check after a fresh
+process scan); the INSTALLED wrapper's bytes contain the ASCII marker
+`VIRULE_EVALUATION_RECOVER_CLI_V1` (older wrappers are NEVER started this
+way: they would open their game); and the assignment was not tried in the
+last five minutes. The recovery process lives in the game folder, so the
+launcher adopts it and the game reads running while it runs (Play is
+refused, an update waits); its exit is a last-process exit again, which
+the rule and the five-minute limit keep from looping.

@@ -83,6 +83,11 @@ struct Config {
     std::function<bool(const std::string&)> refresh_progress;
     std::function<void(const std::string&)> log;
     HANDLE stop_event = nullptr;
+    // THE GAME'S LAST PROCESS EXITED (2026-10-22): an assignment left the
+    // running set (wrapper, game and panels all gone). main.cpp: the session
+    // recovery check (client/evaluation_recovery.hpp). Called on the monitor
+    // thread; must not block.
+    std::function<void(const std::string& assignment_id)> on_stopped;
 };
 
 namespace detail {
@@ -135,6 +140,16 @@ public:
     bool busy(const std::string& assignment_id) {
         if (!ev::is_hex32(assignment_id)) return false;
         std::lock_guard<std::mutex> lock(m_);
+        return busy_locked(assignment_id);
+    }
+
+    // The same, after a fresh scan of the process list (2026-10-22): the
+    // session recovery asks it before starting anything from a game
+    // folder, so a game started some other way and not adopted yet counts.
+    bool busy_scanned(const std::string& assignment_id) {
+        if (!ev::is_hex32(assignment_id)) return false;
+        std::lock_guard<std::mutex> lock(m_);
+        adopt_locked();
         return busy_locked(assignment_id);
     }
 
@@ -239,14 +254,14 @@ public:
                 }
             }
             const std::vector<std::string> now_running = running_set();
-            if (now_running != last) { last = now_running; changed(); }
+            if (now_running != last) { stopped(last, now_running); last = now_running; changed(); }
             const DWORD w = handles.empty() ? WAIT_TIMEOUT
                 : WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, kDiscoverMs);
             if (cfg_.stop_event && w == WAIT_OBJECT_0) return;
             if (w == WAIT_FAILED) Sleep(1000);
             reap();
             const std::vector<std::string> after = running_set();
-            if (after != last) { last = after; changed(); }
+            if (after != last) { stopped(last, after); last = after; changed(); }
         }
     }
 
@@ -359,6 +374,13 @@ private:
     }
 
     void changed() { if (cfg_.on_change) cfg_.on_change(); }
+    // Every assignment that was running and no longer is.
+    void stopped(const std::vector<std::string>& before, const std::vector<std::string>& after) {
+        if (!cfg_.on_stopped) return;
+        for (const auto& id : before) {
+            if (std::find(after.begin(), after.end(), id) == after.end()) cfg_.on_stopped(id);
+        }
+    }
     void say(const std::string& t) { if (cfg_.log) cfg_.log(t); }
 
     Config cfg_;

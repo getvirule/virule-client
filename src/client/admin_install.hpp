@@ -1537,26 +1537,40 @@ inline std::string update_health_json() {
 // only those callers observe the long launch-retry hold window; everyone
 // else (Settings, older Admins sending no context) sees only the short
 // claim-suppression window.
-inline std::string update_status_json(bool launch_context) {
-    const bool installed = admin_installed();
-    std::string admin_version;
+// THE UPDATE CLAIM, alone (2026-10-22: admin_launch's no-update fallback
+// asks it before showing anything). "update" is a CLAIM and requires a real
+// comparison: both the installed version and the approved version must be
+// known, and the approved version must be a genuine UPGRADE (SemVer
+// ordering; never an automatic downgrade). Unknown installed version = no
+// claim in either direction. A version whose launch-time transaction just
+// failed is NOT claimed while the hold lasts (the loop breaker above).
+// Refreshes the cached manifest check when stale (bounded).
+inline bool update_claim(bool launch_context, bool& installed, std::string& admin_version, std::string& approved) {
+    installed = admin_installed();
+    admin_version.clear();
     if (installed) admin_version = authoritative_admin_version();
     if (installed) refresh_update_check(kUpdateCheckFreshMs);
-    std::string approved;
     {
         std::lock_guard<std::mutex> lock(g_update_mutex);
         approved = g_approved_version;
     }
-    // "update" is a CLAIM and requires a real comparison: both the
-    // installed version and the approved version must be known, and the
-    // approved version must be a genuine UPGRADE (SemVer ordering; never
-    // an automatic downgrade). Unknown installed version = no claim in
-    // either direction. A version whose launch-time transaction just
-    // failed is NOT claimed while the hold lasts (the loop breaker above).
     bool update = installed && !approved.empty() &&
                   !admin_version.empty() &&
                   version_is_upgrade(approved, admin_version);
     if (update && launch_update_on_hold(approved, launch_context)) update = false;
+    return update;
+}
+
+inline bool approved_update_available(bool launch_context) {
+    bool installed = false;
+    std::string admin_version, approved;
+    return update_claim(launch_context, installed, admin_version, approved);
+}
+
+inline std::string update_status_json(bool launch_context) {
+    bool installed = false;
+    std::string admin_version, approved;
+    const bool update = update_claim(launch_context, installed, admin_version, approved);
     std::string required;
     {
         std::lock_guard<std::mutex> lock(g_required_client_mutex);
@@ -2249,6 +2263,42 @@ inline void launch_after_update_handoff() {
         log::client("admin: launch-time update did not complete; launching current Admin");
         launch_admin_with_recovery();
         retire_card_into_admin_surface();
+    }
+}
+
+// admin_launch WITH NO APPROVED UPDATE (OWNER RULING 2026-10-22, for
+// evaluation games built before this release, whose "Quit and Open VIRULE"
+// sends admin_launch): the Admin opens or comes to the front as admin_open
+// does, with NO card. One update transaction still wins (an operation in
+// flight is joined). A virule.exe that handed its launch over may still be
+// exiting as this runs: the running Admin is focused at once, and if it is
+// gone within the next ten seconds (it was that exiting process) the Admin
+// is launched, so the request always ends with a visible Admin.
+inline void open_admin_without_update() {
+    if (!admin_installed()) return;
+    if (bridge::g_uninstalling.load()) {
+        log::client("admin: launch request refused (uninstall in progress)");
+        return;
+    }
+    if (g_busy.load()) {
+        log::client("admin: launch request during an active update; joining it");
+        return;
+    }
+    if (!admin_running()) {
+        (void)open_installed_admin();
+        return;
+    }
+    focus_running_admin();
+    log::client("admin: launch request without an update; focused the running Admin");
+    for (int i = 0; i < 40; ++i) {
+        Sleep(250);
+        if (g_busy.load() || bridge::g_uninstalling.load()) return;
+        if (!admin_running()) {
+            log::client("admin: the focused Admin was exiting; launching it");
+            g_last_admin_launch_tick.store(0);
+            (void)open_installed_admin();
+            return;
+        }
     }
 }
 

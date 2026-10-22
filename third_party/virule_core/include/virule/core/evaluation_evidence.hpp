@@ -13,6 +13,8 @@
 //   .incoming\<package_id>\   being written by the wrapper (the session owns it)
 //   outbox\<package_id>\      handed off: package.json + <seq>.jpg (the Client owns it)
 //   receipts\<package_id>.json  the service acknowledged it
+//   delivery\<package_id>.json  the Client's delivery state of it ("package
+//                             delivery" below, 2026-10-22)
 //   requests\, progress\      the early completion, the report and the
 //                             service's progress (2026-10-21; "requests" below)
 //
@@ -1244,6 +1246,140 @@ inline DeliveryState assignment_delivery_state(const Root& root, const std::stri
         std::sort(v->begin(), v->end());
     }
     return s;
+}
+
+// ===================================================== writing unlock ====
+// THE ONE UNLOCK PREDICATE (2026-10-22). Writing opens when the order is
+// eligible by its whole progress (or the service recorded an early
+// completion) AND every finished session's evidence package is
+// acknowledged (docs/specs/UIUX.md:1557) AND the service is not still
+// receiving a session. A session counts as ACKNOWLEDGED when this computer
+// holds its receipt OR the service's progress lists it as received (by id,
+// only when the progress document carries a `received` list: a count is
+// never matched against ids). A simulated receipt counts only when the
+// caller says so (a staging build). `delivery.acknowledged` elsewhere keeps
+// meaning real receipt files only; this is the unlock's own reading.
+//
+// Pure: no file is read here. The Admin host's assignment status and the
+// wrapper's post-session live line both call it, so they cannot drift.
+
+inline bool service_received(const ServiceProgress& svc, const std::string& id) {
+    if (!svc.known || !svc.listed) return false;
+    for (const auto& f : svc.received) {
+        if (f.session_id == id) return true;
+    }
+    return false;
+}
+
+// Acknowledged for the unlock: a local receipt, or listed as received.
+inline bool session_acknowledged(const std::string& id, const DeliveryState& local, const ServiceProgress& svc,
+                                 bool simulated_counts) {
+    return local.has_receipt(id, simulated_counts) || service_received(svc, id);
+}
+
+struct Unlock {
+    bool unlocked = false;
+    bool any_session = false;         // a session exists here or at the service
+    bool all_acknowledged = false;    // any_session AND nothing below
+    bool service_receiving = false;   // the service is still receiving a session
+    std::vector<std::string> unacknowledged;   // finalized here, not acknowledged (sorted, unique)
+};
+
+// `finalized`: every session this computer finalized (its ledger, plus any
+// package the evidence root holds for the assignment).
+inline Unlock writing_unlock(bool eligible_or_early, const std::vector<std::string>& finalized,
+                             const DeliveryState& local, const ServiceProgress& svc, bool simulated_counts) {
+    Unlock u;
+    std::vector<std::string> ids = finalized;
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    for (const auto& id : ids) {
+        if (!session_acknowledged(id, local, svc, simulated_counts)) u.unacknowledged.push_back(id);
+    }
+    // The service's history alone is a session too (a reinstall that
+    // recorded nothing yet is never locked out of it): its listed ids, or,
+    // from a service older than the list, its own count.
+    const bool service_has = svc.known && (svc.listed ? !svc.received.empty() : svc.totals.sessions > 0);
+    u.any_session = !ids.empty() || service_has;
+    u.all_acknowledged = u.any_session && u.unacknowledged.empty();
+    u.service_receiving = svc.known && svc.receiving > 0;
+    u.unlocked = eligible_or_early && u.all_acknowledged && !u.service_receiving;
+    return u;
+}
+
+// ====================================================== package delivery ====
+// THE CLIENT'S DELIVERY STATE OF ONE PACKAGE (2026-10-22), written by the
+// VIRULE Client beside its retry bookkeeping and read by the Admin host to
+// say whether a session is on its way:
+//   delivery\<package_id>.json  {attempts, failures, last_error,
+//     acked: ["package.json", "<seq>.jpg", ...]   (saved after each file),
+//     state: "sending" | "waiting",
+//     reason: "" | "signed_out" | "other_account" | "offline" | "refused",
+//     updated_utc: <unix seconds, the Client's heartbeat while sending>}
+// Read leniently: an older Client's file has no state, reason or heartbeat.
+inline std::filesystem::path package_delivery_path(const Root& r, const std::string& package_id) {
+    return r.dir / L"delivery" / std::filesystem::path(package_id + ".json");
+}
+
+struct PackageDelivery {
+    bool present = false;
+    std::int64_t attempts = 0, failures = 0, updated_unix = 0;
+    std::string state, reason, last_error;
+    std::vector<std::string> acked;
+};
+
+inline PackageDelivery parse_package_delivery(std::string_view text) {
+    PackageDelivery d;
+    if (text.empty() || text.front() != '{') return d;
+    d.present = true;
+    d.attempts = json::opt_int(text, "attempts");
+    d.failures = json::opt_int(text, "failures");
+    d.updated_unix = json::opt_int(text, "updated_utc");
+    d.state = json::opt_string(text, "state");
+    d.reason = json::opt_string(text, "reason");
+    d.last_error = json::opt_string(text, "last_error");
+    std::string_view raw;
+    std::vector<std::string_view> list;
+    if (json::member(text, "acked", raw) && json::items(raw, list)) {
+        for (const auto& it : list) {
+            std::string f;
+            if (!it.empty() && it.front() == '"') {
+                if (json::as_string(it, f) && !f.empty()) d.acked.push_back(f);
+            } else if (json::get_string(it, "file", f) && !f.empty()) {
+                d.acked.push_back(f);
+            }
+        }
+    }
+    return d;
+}
+
+inline constexpr std::int64_t kSendingHeartbeatSeconds = 30;
+
+// Whether a pending package is MOVING now, and if not, why. No delivery
+// file yet: just handed off, the Client has not started (moving). `sending`
+// with a heartbeat within 30 s: moving. `sending` but stale: offline. An
+// older Client's file (no state): moving before its first attempt, then
+// waiting (offline unless it says otherwise). A current Client's held
+// package with no named reason is held with none ("").
+inline bool package_moving(const PackageDelivery& d, std::int64_t now_unix, std::string& reason) {
+    reason.clear();
+    if (!d.present) return true;
+    if (d.state == "sending") {
+        if (d.updated_unix > 0 && now_unix - d.updated_unix <= kSendingHeartbeatSeconds &&
+            d.updated_unix - now_unix <= kSendingHeartbeatSeconds) return true;
+        reason = "offline";
+        return false;
+    }
+    if (d.state.empty() && d.attempts == 0) return true;
+    // A held send states only a reason the Client named: anything else (a
+    // partial acknowledgment, a local write failure) is held with no reason
+    // of its own, never presented as a connection failure.
+    if (d.reason == "signed_out" || d.reason == "other_account" || d.reason == "offline" || d.reason == "refused") {
+        reason = d.reason;
+    } else if (d.state.empty()) {
+        reason = "offline";   // an older Client's file: its failures name no reason
+    }
+    return false;
 }
 
 } // namespace virule::core::evaluation_evidence

@@ -75,8 +75,10 @@ inline bool fetch_file(const Config& c, const std::string& path, std::int64_t by
     if (_wfopen_s(&out, part.wstring().c_str(), L"wb") != 0 || !out) { why = "a received file could not be written"; return false; }
     std::uint64_t got = 0;
     unsigned long status = 0;
+    // The whole file from byte 0: a 206, or a 200 of exactly `bytes`
+    // (2026-10-22: the route answered 200, and a 206-only read kept nothing).
     const bool okd = bytes > 0
-        ? c.service->get_range_to_file(path, 0, (std::uint64_t)bytes - 1, out, got, status, [&]() { return true; })
+        ? c.service->get_whole_to_file(path, (std::uint64_t)bytes, out, got, status)
         : true;
     const bool closed = fclose(out) == 0;
     if (!okd || !closed || (status != 200 && status != 206 && bytes > 0) || (std::int64_t)got != bytes) {
@@ -93,6 +95,14 @@ inline bool fetch_file(const Config& c, const std::string& path, std::int64_t by
     fs::rename(part, dst, ec);
     if (ec) { fs::remove(part, ec); why = "a received file could not be kept"; return false; }
     return true;
+}
+
+// The service's number of a listed session (2026-10-22): `session_index`,
+// else `index`, else 0 (a listing that names none).
+inline std::int64_t listed_session_index(std::string_view listed_package) {
+    std::int64_t n = 0;
+    if (!ee::json::get_int(listed_package, "session_index", n)) (void)ee::json::get_int(listed_package, "index", n);
+    return n < 0 ? 0 : n;
 }
 
 // Whether `p` holds exactly the listed file.
@@ -147,7 +157,20 @@ inline PassResult run_pass(const Config& c) {
             if (!ee::json::get_string(p, "package_id", pid) || !ee::is_hex32(pid)) continue;
             if (!ee::json::get_string(p, "sha256", psha) || !ee::is_sha256_hex(psha)) continue;
             (void)ee::json::get_int(p, "bytes", pbytes);
-            if (ee::exists_quiet(ee::received_marker_path(er, eid, pid))) continue;   // whole already
+            if (ee::exists_quiet(ee::received_marker_path(er, eid, pid))) {   // whole already
+                // A marker written before it carried the session's number
+                // gains it, once; nothing is fetched again.
+                const fs::path mp = ee::received_marker_path(er, eid, pid);
+                const std::string held = ee::read_document(mp);
+                std::string_view raw;
+                if (!held.empty() && !ee::json::member(held, "session_index", raw)) {
+                    const std::string upgraded = "{\"package_id\":" + ee::json::quote(pid) + ",\"sha256\":" +
+                        ee::json::quote(ee::json::opt_string(held, "sha256")) + ",\"session_index\":" +
+                        std::to_string(listed_session_index(p)) + "}\n";
+                    if (ee::write_file_atomic(mp, upgraded)) evidence::note_change();
+                }
+                continue;
+            }
             const fs::path pdir = ee::received_package_dir(er, eid, pid);
             fs::create_directories(pdir, ec);
             const std::string base = "/v1/evaluations/" + eid + "/evidence/" + pid + "/files/";
@@ -193,7 +216,12 @@ inline PassResult run_pass(const Config& c) {
             bool all = true;
             for (const auto& pf : ee::package_files(pkg)) if (!holds(pdir / fs::path(pf.file), pf.bytes, pf.sha256)) { all = false; break; }
             if (!all) continue;
-            const std::string marker = "{\"package_id\":" + ee::json::quote(pid) + ",\"sha256\":" + ee::json::quote(psha) + "}\n";
+            // The marker also carries the service's number of the session
+            // from the listing (2026-10-22, `session_index`; read as
+            // `session_index` or `index`, 0 when the listing names none), so
+            // the Admin orders renumbered sessions as the service does.
+            const std::string marker = "{\"package_id\":" + ee::json::quote(pid) + ",\"sha256\":" + ee::json::quote(psha) +
+                ",\"session_index\":" + std::to_string(listed_session_index(p)) + "}\n";
             if (ee::write_file_atomic(ee::received_marker_path(er, eid, pid), marker)) {
                 ++res.completed_packages;
                 evidence::note_change();

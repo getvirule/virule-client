@@ -2,15 +2,21 @@
 // (client/launcher.hpp), transfer driver (client/transfers.hpp) and evidence
 // delivery (shared/evidence_queue.hpp ServiceTransport), in one test
 // process, driven line by line on stdin by
-// VIRULE_BACKEND tools/launcher_lifecycle_staging_e2e.mjs.
+// VIRULE_BACKEND tools/launcher_lifecycle_staging_e2e.mjs and
+// tools/evaluator_workflow_staging_e2e.mjs (which also uses the evidence
+// thread, the owner decision, the session recovery and the developer inbox
+// below). It copies main.cpp's wiring of these modules; virule-client.exe
+// itself does not run.
 //
-// The ONE thing that is not the Client's is how the service is reached:
+// Inside this process the one stand-in is how the service is reached:
 // every call goes to a loopback proxy the driver runs, which signs it as the
-// evaluator's installation (DPoP, exactly what the Client's account calls
-// carry) and forwards it to LIVE STAGING. Everything else (the job record,
-// the ranged download, the verification, the extraction, the ticket and the
-// credential, the launch, the running set, the change counter, the evidence
-// package) is the Client's own code.
+// installation's account (DPoP, exactly what the Client's account calls
+// carry) and forwards it to LIVE STAGING. The job record's processing, the
+// ranged download, the verification, the extraction, the ticket and the
+// credential, the launch, the running set, the change counter and the
+// evidence package are the Client's own code. The drivers name their own
+// stand-ins (they write the install job as the Admin host does, and switch
+// the signed-in account through the `account` command).
 //
 //   launcher_harness.exe serve <virule root> <proxy port> <account email>
 //
@@ -21,8 +27,22 @@
 //   wake                                        a transfer pass now
 //   evidence                                    one evidence and requests pass
 //   progress <assignment>                       the service's progress, kept
+//   driver                                      start the Client's evidence THREAD (run_driver:
+//                                               startup pass, the wake event, the ladder), as
+//                                               main.cpp runs it; `evidence` passes stay usable
+//   account <email | ->                         sign the Client in as another account (or out):
+//                                               main.cpp's account-changed path (owner
+//                                               generation, forced pass, the evidence wake)
+//   recover <assignment>                        the session recovery's check, now (its verdict)
+//   inbox                                       one developer inbox pass (evaluation_inbox.hpp)
 //   quit
 // Unsolicited: `CHANGE <n>` whenever the change counter moves.
+//
+// WHOSE EVIDENCE (2026-10-22): every evidence pass (the `evidence` command
+// and the driver) decides the owner through the Client's own
+// client/evidence_owner.hpp Resolver, exactly as main.cpp wires it. The
+// launcher's "last process exit" runs the Client's session recovery
+// (client/evaluation_recovery.hpp), as main.cpp does.
 //
 // Refuses to run unless LOCALAPPDATA is redirected away from the real one
 // (the root must be inside it).
@@ -33,6 +53,9 @@
 #include <string>
 #include <thread>
 
+#include "client/evaluation_inbox.hpp"
+#include "client/evaluation_recovery.hpp"
+#include "client/evidence_owner.hpp"
 #include "client/launcher.hpp"
 #include "client/transfers.hpp"
 #include "shared/evidence_queue.hpp"
@@ -53,8 +76,11 @@ namespace ee = virule::core::evaluation_evidence;
 namespace fs = std::filesystem;
 
 static unsigned short g_port = 0;
-static std::string g_email;
+static std::mutex g_email_m;
+static std::string g_email;               // "" = signed out
 static std::mutex g_out;
+
+static std::string email_now() { std::lock_guard<std::mutex> l(g_email_m); return g_email; }
 
 static void emit(const std::string& line) {
     std::lock_guard<std::mutex> lock(g_out);
@@ -79,7 +105,7 @@ static tr::Reply proxy_call(const char* method, const std::string& path, const s
 }
 
 struct ProxyService final : tr::Service {
-    bool signed_in(std::string& email_out) override { email_out = g_email; return true; }
+    bool signed_in(std::string& email_out) override { email_out = email_now(); return !email_out.empty(); }
     tr::Reply call(const char* method, const std::string& path, const std::string& body,
                    const std::string& content_type, const std::vector<tr::Header>& headers) override {
         return proxy_call(method, path, body, content_type, headers);
@@ -92,6 +118,21 @@ struct ProxyService final : tr::Service {
         unsigned long long got = 0;
         const bool okd = vclient::http::request_to_file(L"127.0.0.1", g_port, false, L"/range", h, to - from + 1, out, got,
                                                         status_out, keep_going);
+        bytes_out = got;
+        return okd;
+    }
+    // The whole object from byte 0, as main.cpp's AccountTransferService
+    // asks it: a Range header, and a 200 of exactly `bytes` taken too.
+    bool get_whole_to_file(const std::string& path, std::uint64_t bytes, FILE* out,
+                           std::uint64_t& bytes_out, unsigned long& status_out) override {
+        bytes_out = 0;
+        status_out = 0;
+        if (bytes == 0) return false;
+        std::wstring h = L"X-Virule-Method: GET\r\nX-Virule-Path: " + widen(path) + L"\r\nRange: bytes=0-" +
+                         std::to_wstring(bytes - 1) + L"\r\n";
+        unsigned long long got = 0;
+        const bool okd = vclient::http::request_to_file(L"127.0.0.1", g_port, false, L"/range", h, bytes, out, got,
+                                                        status_out, {}, bytes);
         bytes_out = got;
         return okd;
     }
@@ -117,6 +158,7 @@ int wmain(int argc, wchar_t** argv) {
     {
         const std::wstring w = argv[4];
         g_email.assign(w.begin(), w.end());
+        if (g_email == "-") g_email.clear();
     }
     // The sandbox guard: LOCALAPPDATA is redirected and holds the root.
     {
@@ -137,13 +179,28 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     const auto on_change = [] { evq::note_change(); };
 
+    // THE SESSION RECOVERY (main.cpp start_recovery), the launcher's busy
+    // check bound once the launcher exists.
+    static la::Launcher* launcher_ptr = nullptr;
+    namespace rv = vclient::evaluation_recovery;
+    rv::Config rc;
+    rc.root = root;
+    rc.busy = [](const std::string& a) {
+        return launcher_ptr ? launcher_ptr->busy_scanned(a) : ee::session_running(a);
+    };
+    rc.on_done = [] { (void)ee::signal_wake(); };
+    rc.log = [](const std::string& t) { emit("LOG " + t); };
+    static rv::Recovery recovery(std::move(rc));
+
     la::Config lc;
     lc.root = root;
+    lc.on_stopped = [](const std::string& a) { (void)recovery.check(a); };
     lc.on_change = on_change;
     lc.refresh_progress = [root](const std::string& a) { return refresh_progress(root, a); };
     lc.log = [](const std::string& t) { emit("LOG " + t); };
     lc.stop_event = stop;
     static la::Launcher launcher(std::move(lc));
+    launcher_ptr = &launcher;
     std::thread([] { launcher.run(); }).detach();
 
     static tr::DriverConfig dc;
@@ -175,7 +232,12 @@ int wmain(int argc, wchar_t** argv) {
             const tr::Reply r = proxy_call(m, p, b, ct, hh);
             return evq::ServiceReply{ r.status, r.body };
         },
-        [] { return true; });
+        [] { return !email_now().empty(); });
+
+    // Whose evidence it is (main.cpp: the service transport's owner).
+    static vclient::evidence_owner::Resolver owner(root, &service);
+    static evq::DriverConfig ec;
+    bool driver_started = false;
 
     emit("READY");
     std::string line;
@@ -204,10 +266,52 @@ int wmain(int argc, wchar_t** argv) {
         } else if (cmd == "evidence") {
             const ee::Root er = ee::root_under(root);
             const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
-            const auto p = evq::run_pass(er, transport, now, true, [](const std::string& t) { emit("LOG " + t); });
-            const auto q = evq::run_requests(er, transport, now, true, [](const std::string& t) { emit("LOG " + t); });
+            evq::PassHooks hooks;
+            hooks.owner = owner.fn();
+            const auto p = evq::run_pass(er, transport, now, true, [](const std::string& t) { emit("LOG " + t); }, nullptr, &hooks);
+            const auto q = evq::run_requests(er, transport, now, true, [](const std::string& t) { emit("LOG " + t); }, {}, owner.fn());
             emit("REPLY {\"delivered\":" + std::to_string(p.delivered) + ",\"pending\":" + std::to_string(p.pending) +
                  ",\"requests_acknowledged\":" + std::to_string(q.acknowledged) + "}");
+        } else if (cmd == "driver") {
+            if (!driver_started) {
+                driver_started = true;
+                ec.root = ee::root_under(root);
+                ec.transport = &transport;
+                ec.stop_event = stop;
+                ec.log = [](const std::string& t) { emit("LOG " + t); };
+                ec.owner = owner.fn();
+                // A REPORT ACKNOWLEDGED: the game removes itself (main.cpp).
+                ec.on_ack = [root, wake](const std::string& kind, const std::string& assignment_id) {
+                    emit("LOG evidence: acknowledged " + kind + " of " + assignment_id);
+                    if (kind == "report" && tr::begin_removal(root, assignment_id)) {
+                        emit("LOG evidence: report acknowledged; the game of " + assignment_id + " removes itself");
+                        SetEvent(wake);
+                    }
+                };
+                std::thread([] { evq::run_driver(ec); }).detach();
+            }
+            emit("REPLY {\"ok\":true}");
+        } else if (cmd == "account") {
+            {
+                std::lock_guard<std::mutex> l(g_email_m);
+                g_email = a == "-" ? std::string() : a;
+            }
+            // main.cpp g_on_account_changed.
+            vclient::evidence_owner::note_account_changed();
+            evq::request_forced_pass();
+            (void)ee::signal_wake();
+            emit("REPLY {\"ok\":true}");
+        } else if (cmd == "recover") {
+            emit(std::string("REPLY {\"verdict\":\"") + rv::verdict_name(recovery.check_now(a)) + "\"}");
+        } else if (cmd == "inbox") {
+            vclient::evaluation_inbox::Config ic;
+            ic.root = root;
+            ic.service = &service;
+            ic.log = [](const std::string& t) { emit("LOG " + t); };
+            const auto r = vclient::evaluation_inbox::run_pass(ic);
+            emit(std::string("REPLY {\"ok\":") + (r.ok ? "true" : "false") + ",\"fetched_files\":" +
+                 std::to_string(r.fetched_files) + ",\"completed_packages\":" + std::to_string(r.completed_packages) +
+                 ",\"error\":" + ee::json::quote(r.error) + "}");
         } else if (cmd == "progress") {
             emit(std::string("REPLY {\"ok\":") + (refresh_progress(root, a) ? "true" : "false") + "}");
         } else {

@@ -30,10 +30,20 @@
 //
 // The helper modes are driven by tools\transfer_test.mjs.
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <random>
 #include <string>
@@ -45,6 +55,9 @@
 #include "shared/paths.hpp"
 #include "client/transfers.hpp"
 #include "client/game_art.hpp"
+#include "client/evidence_owner.hpp"
+#include "client/evaluation_recovery.hpp"
+#include "client/assignment_open.hpp"
 
 namespace fs = std::filesystem;
 namespace ed = virule::core::evaluation_distribution;
@@ -700,7 +713,307 @@ static void test_game_art() {
     CHECK(!fs::exists(tampered_pc / L"art", ec) || fs::is_empty(tampered_pc / L"art", ec));
 }
 
+// ---- 2026-10-22: the evaluator workflow completion ----
+
+// A one-shot loopback HTTP server: answers every connection with `answer`.
+struct OneShotServer {
+    SOCKET listener = INVALID_SOCKET;
+    unsigned short port = 0;
+    std::string answer;
+    HANDLE thread = nullptr;
+    bool start(const std::string& a) {
+        answer = a;
+        WSADATA w{};
+        WSAStartup(MAKEWORD(2, 2), &w);
+        listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(listener, (sockaddr*)&addr, sizeof(addr)) != 0 || listen(listener, 4) != 0) return false;
+        int len = sizeof(addr);
+        getsockname(listener, (sockaddr*)&addr, &len);
+        port = ntohs(addr.sin_port);
+        thread = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+            auto* self = (OneShotServer*)p;
+            for (;;) {
+                SOCKET c = accept(self->listener, nullptr, nullptr);
+                if (c == INVALID_SOCKET) return 0;
+                std::string req;
+                char buf[4096];
+                while (req.find("\r\n\r\n") == std::string::npos) {
+                    const int n = recv(c, buf, sizeof(buf), 0);
+                    if (n <= 0) break;
+                    req.append(buf, (size_t)n);
+                }
+                send(c, self->answer.data(), (int)self->answer.size(), 0);
+                shutdown(c, SD_BOTH);
+                closesocket(c);
+            }
+        }, this, 0, nullptr);
+        return thread != nullptr;
+    }
+    ~OneShotServer() {
+        if (listener != INVALID_SOCKET) closesocket(listener);
+        if (thread) { WaitForSingleObject(thread, 2000); CloseHandle(thread); }
+    }
+};
+
+static std::string fetch_with(const std::string& answer, unsigned long long whole_length, unsigned long& status,
+                              unsigned long long& got, bool& ok) {
+    OneShotServer srv;
+    if (!srv.start(answer)) { ok = false; return {}; }
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const fs::path out_path = fs::path(tmp) / (L"virule-whole-" + std::to_wstring(GetTickCount64()) + L".bin");
+    FILE* out = nullptr;
+    _wfopen_s(&out, out_path.wstring().c_str(), L"wb");
+    got = 0;
+    ok = vclient::http::request_to_file(L"127.0.0.1", srv.port, false, L"/f", L"Range: bytes=0-4\r\n", 5, out, got, status,
+                                        {}, whole_length);
+    fclose(out);
+    const std::string body = slurp(out_path);
+    std::error_code ec;
+    fs::remove(out_path, ec);
+    return body;
+}
+
+static void test_whole_object_fetch() {
+    SECTION("request_to_file: a 200 of the whole object is taken only when asked from byte 0 with that length");
+    const std::string ok200 = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    const std::string ok206 = "HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 0-4/5\r\nConnection: close\r\n\r\nhello";
+    const std::string long200 = "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nhello1234";
+    unsigned long status = 0;
+    unsigned long long got = 0;
+    bool ok = false;
+    // The ranged (game package) mode keeps requiring 206.
+    std::string body = fetch_with(ok200, 0, status, got, ok);
+    CHECK(status == 200 && !ok && got == 0 && body.empty());
+    body = fetch_with(ok206, 0, status, got, ok);
+    CHECK(status == 206 && ok && got == 5 && body == "hello");
+    // The whole-object mode takes a 200 of exactly the asked length...
+    body = fetch_with(ok200, 5, status, got, ok);
+    CHECK(status == 200 && ok && got == 5 && body == "hello");
+    // ...never a 200 of another length.
+    body = fetch_with(long200, 5, status, got, ok);
+    CHECK(status == 200 && !ok && got == 0 && body.empty());
+    // A 206 is still a 206 in it.
+    body = fetch_with(ok206, 5, status, got, ok);
+    CHECK(status == 206 && ok && body == "hello");
+}
+
+// THE OWNER RESOLVER (client/evidence_owner.hpp) over a scripted service.
+struct OwnerService final : tr::Service {
+    std::string email;
+    std::map<std::string, unsigned long> ticket_status;   // assignment -> status
+    std::string evaluator = std::string(32, 'e');
+    int ticket_calls = 0;
+    bool signed_in(std::string& out) override { out = email; return !email.empty(); }
+    tr::Reply call(const char* method, const std::string& path, const std::string&, const std::string&,
+                   const std::vector<tr::Header>&) override {
+        tr::Reply r;
+        if (std::string(method) == "GET" && path.find("/ticket") != std::string::npos) {
+            ++ticket_calls;
+            const std::string aid = path.substr(std::string("/v1/assignments/").size(), 32);
+            const auto it = ticket_status.find(aid);
+            r.status = it == ticket_status.end() ? 404 : it->second;
+            if (r.status == 200) r.body = "{\"ticket\":{\"assignment_id\":\"" + aid + "\",\"evaluator_id\":\"" + evaluator + "\"}}";
+            return r;
+        }
+        r.status = 404;
+        return r;
+    }
+    bool get_range_to_file(const std::string&, std::uint64_t, std::uint64_t, FILE*, std::uint64_t&, unsigned long& s,
+                           const std::function<bool()>&) override { s = 0; return false; }
+    std::string machine_key() override { return std::string(64, '1'); }
+};
+
+static void write_ticket(const fs::path& root, const std::string& assignment, const std::string& evaluator) {
+    const fs::path p = root / L"evaluator" / L"assignments" / fs::path(assignment) / L"ticket.json";
+    fs::create_directories(p.parent_path());
+    ev::write_file_atomic(p, "{\"version\":1,\"assignment_id\":\"" + assignment + "\",\"evaluator_id\":\"" + evaluator + "\"}\n");
+}
+
+static void test_evidence_owner() {
+    SECTION("whose evidence: local install jobs, then the ticket read; another account or signed out waits");
+    namespace eo = vclient::evidence_owner;
+    using vclient::evidence::Owner;
+    const fs::path root = temp_root("owner");
+    const std::string mine_a(32, 'a'), other_a(32, 'b'), unknown_a(32, 'c');
+    const std::string eva(32, 'e'), dev(32, 'd');
+    OwnerService svc;
+    eo::Resolver res(root, &svc);
+    // Signed out.
+    CHECK(res.owner(mine_a, eva) == Owner::SignedOut);
+    // The developer signed in on the shared computer: no install job of its
+    // own, the ticket read answers 404 for the evaluator's assignment.
+    svc.email = "dev@example.com";
+    eo::note_account_changed();
+    CHECK(res.owner(mine_a, eva) == Owner::OtherAccount);
+    const int calls = svc.ticket_calls;
+    CHECK(res.owner(mine_a, eva) == Owner::OtherAccount && svc.ticket_calls == calls);   // remembered
+    // 403 (the account lacks the evaluator capability): other, asked again.
+    svc.ticket_status[other_a] = 403;
+    CHECK(res.owner(other_a, eva) == Owner::OtherAccount);
+    CHECK(res.owner(other_a, eva) == Owner::OtherAccount && svc.ticket_calls == calls + 2);
+    // No answer: unknown (the attempt goes, the service decides).
+    svc.ticket_status[unknown_a] = 0;
+    CHECK(res.owner(unknown_a, eva) == Owner::Unknown);
+    // The evaluator signs in: her install job and its ticket name her id
+    // locally, no network.
+    ed::Job j;
+    j.id = ed::random_hex32();
+    j.kind = "install";
+    j.state = "installed";
+    j.assignment_id = mine_a;
+    j.account_email = "eva@example.com";
+    j.created_utc = "2026-10-22T10:00:00Z";
+    ed::write_job(root, j);
+    write_ticket(root, mine_a, eva);
+    svc.email = "eva@example.com";
+    eo::note_account_changed();
+    const int before = svc.ticket_calls;
+    CHECK(res.owner(mine_a, eva) == Owner::Mine && svc.ticket_calls == before);
+    CHECK(res.owner(other_a, dev) == Owner::OtherAccount && svc.ticket_calls == before);   // another evaluator's package
+    // A reinstalled computer (no job, no ticket): the ticket read answers 200 and teaches the id.
+    const fs::path root2 = temp_root("owner2");
+    eo::Resolver res2(root2, &svc);
+    svc.ticket_status[mine_a] = 200;
+    CHECK(res2.owner(mine_a, eva) == Owner::Mine);
+    const int after = svc.ticket_calls;
+    CHECK(res2.owner(other_a, dev) == Owner::OtherAccount && svc.ticket_calls == after);   // the learned id decides
+    // 409 (the caller's own assignment, not active): the service decides.
+    const fs::path root3 = temp_root("owner3");
+    eo::Resolver res3(root3, &svc);
+    svc.ticket_status[unknown_a] = 409;
+    CHECK(res3.owner(unknown_a, "") == Owner::Mine);
+}
+
+// THE SESSION RECOVERY RULES (client/evaluation_recovery.hpp).
+static void install_game(const fs::path& root, const std::string& assignment, const fs::path& exe_source, fs::path& dir_out) {
+    dir_out = root / L"games" / fs::path(assignment);
+    fs::create_directories(dir_out);
+    if (!exe_source.empty()) fs::copy_file(exe_source, dir_out / L"Game.exe", fs::copy_options::overwrite_existing);
+    else { std::ofstream f(dir_out / L"Game.exe", std::ios::binary); f << "MZ an old wrapper without the mode"; }
+    ed::Job j;
+    j.id = ed::random_hex32();
+    j.kind = "install";
+    j.state = "installed";
+    j.assignment_id = assignment;
+    j.account_email = "eva@example.com";
+    j.install_dir = utf8(dir_out);
+    j.launch_exe = "Game.exe";
+    j.created_utc = "2026-10-22T10:00:00Z";
+    ed::write_job(root, j);
+}
+
+static void write_ledger(const fs::path& root, const std::string& assignment, const std::vector<std::string>& sessions) {
+    const fs::path p = root / L"evaluator" / L"assignments" / fs::path(assignment) / L"ledger.json";
+    fs::create_directories(p.parent_path());
+    std::string s = "{\"version\":1,\"assignment_id\":\"" + assignment + "\",\"sessions\":[";
+    for (size_t i = 0; i < sessions.size(); ++i) {
+        if (i) s += ",";
+        s += "{\"session_id\":\"" + sessions[i] + "\",\"index\":" + std::to_string(i + 1) + ",\"session_ms\":1000,\"idle_ms\":0}";
+    }
+    ev::write_file_atomic(p, s + "]}\n");
+}
+
+static void test_recovery_rules() {
+    SECTION("session recovery: needed, marker, running, received, rate limit; the real recovery-only start");
+    namespace rv = vclient::evaluation_recovery;
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const fs::path me(self);
+    CHECK(rv::binary_has_marker(me));   // this test exe carries the marker literal
+    const fs::path root = temp_root("recovery");
+    const std::string a_new(32, '1'), a_old(32, '2'), a_recv(32, '3');
+    const std::string s1(32, 'a'), s2(32, 'b');
+    fs::path d_new, d_old, d_recv;
+    install_game(root, a_new, me, d_new);
+    install_game(root, a_old, fs::path(), d_old);
+    install_game(root, a_recv, me, d_recv);
+    CHECK(!rv::binary_has_marker(d_old / L"Game.exe"));
+    bool running = false;
+    std::vector<std::string> started;
+    std::int64_t clock = 1790000000;
+    rv::Config cfg;
+    cfg.root = root;
+    cfg.busy = [&](const std::string&) { return running; };
+    cfg.run = [&](const fs::path& exe, const fs::path&, DWORD) { started.push_back(utf8(exe)); return 0L; };
+    cfg.now = [&] { return clock; };
+    cfg.synchronous = true;
+    rv::Recovery r(cfg);
+    // Nothing to recover: no ledger, no checkpoint.
+    CHECK(r.check(a_new) == rv::Verdict::NotNeeded && started.empty());
+    // A ledger session with no package anywhere: recovery needed.
+    write_ledger(root, a_new, { s1 });
+    std::string why;
+    CHECK(rv::needs_recovery(root, a_new, why));
+    // The game running: never.
+    running = true;
+    CHECK(r.check(a_new) == rv::Verdict::Running && started.empty());
+    running = false;
+    // An old wrapper (no marker): never, whatever is needed.
+    write_ledger(root, a_old, { s2 });
+    ev::write_file_atomic(root / L"evaluator" / L"assignments" / fs::path(a_old) / L"open_session.json", "{}\n");
+    CHECK(r.check(a_old) == rv::Verdict::NoMarker && started.empty());
+    // A session the service received (progress received[]): never.
+    write_ledger(root, a_recv, { s2 });
+    const ev::Root er = ev::root_under(root);
+    fs::create_directories(ev::progress_dir(er));
+    ev::write_file_atomic(ev::progress_path(er, a_recv),
+                          "{\"sessions\":1,\"session_ms\":1000,\"idle_ms\":0,\"received\":[{\"session_id\":\"" + s2 + "\",\"session_ms\":1000,\"idle_ms\":0,\"index\":1}]}\n");
+    CHECK(!rv::needs_recovery(root, a_recv, why));
+    CHECK(r.check(a_recv) == rv::Verdict::NotNeeded && started.empty());
+    // A receipt also settles a session.
+    const std::string s3(32, 'c');
+    write_ledger(root, a_recv, { s3 });
+    fs::create_directories(ev::receipts_dir(er));
+    ev::write_file_atomic(ev::receipt_path(er, s3), "{}\n");
+    CHECK(!rv::needs_recovery(root, a_recv, why));
+    // Needed, idle, a wrapper with the mode: started once, then not again for five minutes.
+    CHECK(r.check(a_new) == rv::Verdict::Start && started.size() == 1);
+    CHECK(r.check(a_new) == rv::Verdict::TooSoon && started.size() == 1);
+    clock += 301;
+    CHECK(r.check(a_new) == rv::Verdict::Start && started.size() == 2);
+    // An open checkpoint alone is a reason.
+    write_ledger(root, a_new, {});
+    ev::write_file_atomic(root / L"evaluator" / L"assignments" / fs::path(a_new) / L"open_session.json", "{}\n");
+    CHECK(rv::needs_recovery(root, a_new, why));
+    // THE REAL START: the installed copy of this exe in its recovery-only
+    // mode, hidden, the game folder as working directory; exit 0.
+    const long code = rv::run_hidden(d_new / L"Game.exe", d_new, 30000);
+    CHECK(code == 0);
+    CHECK(fs::exists(d_new / L"recovered.txt"));   // written by the recovery mode in its working directory
+}
+
+// THE OPEN INTENT and the admin_launch route (client/assignment_open.hpp).
+static void test_assignment_open() {
+    SECTION("assignment_open: the intent (latest wins, taken once, ten minutes); admin_launch without an update opens");
+    namespace ao = vclient::assignment_open;
+    ao::Intent i;
+    CHECK(i.take(1000).empty());
+    i.set(std::string(32, 'a'), 1000);
+    i.set(std::string(32, 'b'), 2000);                        // the latest wins
+    CHECK(i.take(3000) == std::string(32, 'b'));
+    CHECK(i.take(3001).empty());                              // taken once
+    i.set(std::string(32, 'c'), 5000);
+    CHECK(i.take(5000 + ao::kIntentLifeMs).size() == 32);     // still inside ten minutes
+    i.set(std::string(32, 'c'), 5000);
+    CHECK(i.take(5001 + ao::kIntentLifeMs).empty());          // expired
+    CHECK(ao::take_json("") == "{\"type\":\"assignment_open_intent\",\"assignment_id\":\"\"}");
+    CHECK(ao::admin_launch_route(false) == ao::LaunchRoute::OpenAdmin);
+    CHECK(ao::admin_launch_route(true) == ao::LaunchRoute::UpdateHandoff);
+    CHECK(ao::is_hex32(std::string(32, 'f')) && !ao::is_hex32("XYZ"));
+}
+
 int main(int argc, char** argv) {
+    // The recovery-only mode as an installed wrapper with the marker runs
+    // it (test_recovery_rules starts a copy of this exe as Game.exe).
+    if (argc > 1 && std::strcmp(argv[1], "--virule-evaluation-recover") == 0) {
+        std::ofstream("recovered.txt") << "ok";
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "package") == 0) return run_package(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "install") == 0) return run_install(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "signal") == 0) return run_signal(argc, argv);
@@ -714,6 +1027,10 @@ int main(int argc, char** argv) {
     test_launch_chain();
     test_update_and_removal();
     test_game_art();
+    test_whole_object_fetch();
+    test_evidence_owner();
+    test_recovery_rules();
+    test_assignment_open();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

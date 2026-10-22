@@ -58,7 +58,16 @@
 //                    {"type":"admin_install"}          (Admin Settings Update;
 //                                                       records no capability)
 //                    {"type":"capability_enable","capability":...}  (as from a page)
-//                    {"type":"admin_launch"}           (managed launch handoff)
+//                    {"type":"admin_launch"}           (managed launch handoff; with NO
+//                                                      approved update (2026-10-22) it
+//                                                      opens/focuses the Admin, no card)
+//                    {"type":"assignment_open","assignment_id":"<32 hex>"}
+//                                                      (2026-10-22: the evaluation wrapper's
+//                                                      Quit and Open VIRULE: records the
+//                                                      open intent, then opens/focuses the
+//                                                      Admin like admin_open)
+//                    {"type":"assignment_open_take"}   (2026-10-22: the Admin host takes the
+//                                                      intent, once)
 //                    {"type":"admin_update_check"}     (Admin Settings query)
 //                    {"type":"update_health"}          (Admin notice query)
 //                    {"type":"evidence_status","assignment_id":"<32 hex>"}
@@ -107,6 +116,8 @@
 //                    {"type":"qa_result","token":...,"state":...}
 //                    {"type":"admin_result","state":...,"version":...}
 //                    {"type":"uninstall_started"} / {"type":"error"}
+//                    {"type":"assignment_open_started"}
+//                    {"type":"assignment_open_intent","assignment_id":"<id or empty>"}
 //
 // admin_install / admin_open are page messages behind the same origin
 // policy. They are CLOSED operations, not a filesystem or process surface:
@@ -197,6 +208,13 @@ struct Callbacks {
     // A page asked to open the managed Admin installation. Synchronous;
     // false = not installed / could not launch.
     std::function<bool()> on_admin_open;
+    // THE EVALUATION WRAPPER'S "Quit and Open VIRULE" (2026-10-22, LOCAL
+    // ONLY): record the open intent for the assignment, then open or focus
+    // the Admin through the admin_open path. False = could not open.
+    std::function<bool(const std::string& assignment_id)> on_assignment_open;
+    // The Admin host taking the open intent: the assignment id, or "" (the
+    // intent is cleared either way).
+    std::function<std::string()> assignment_open_take;
     // The Admin status block embedded in every status answer
     // ({"installed","version","running"}), or empty = "null".
     std::function<std::string()> admin_status_json;
@@ -687,7 +705,7 @@ inline void handle_client(SOCKET client) {
             }
         } else if (g_uninstalling.load() &&
                    (type == "admin_install" || type == "admin_launch" ||
-                    type == "admin_open" || type == "capability_enable" ||
+                    type == "admin_open" || type == "assignment_open" || type == "capability_enable" ||
                     type == "qa_accept" ||
                     type == "qa_verify_url" || type == "setup_takeover")) {
             // ORDERED TEARDOWN: once an explicit uninstall has begun, no
@@ -696,7 +714,7 @@ inline void handle_client(SOCKET client) {
             if (!reply(0x1, "{\"type\":\"error\"}")) return;
         } else if (g_self_update_draining.load() &&
                    (type == "admin_install" || type == "admin_launch" ||
-                    type == "admin_open" || type == "capability_enable" ||
+                    type == "admin_open" || type == "assignment_open" || type == "capability_enable" ||
                     type == "qa_accept" ||
                     type == "qa_verify_url" || type == "setup_takeover" ||
                     type == "uninstall" || type == "uninstall_local")) {
@@ -756,14 +774,38 @@ inline void handle_client(SOCKET client) {
             // A managed virule.exe launch handing itself over because an
             // approved update exists (update-on-launch): the client shows
             // the native "Updating…" card, updates, and launches only the
-            // new Admin. Local trust model: a local process could run the
-            // update itself; nothing here is authorization.
+            // new Admin. With NO approved update (an evaluation game built
+            // before assignment_open, owner ruling 2026-10-22) it opens or
+            // focuses the Admin with no card (main.cpp). Local trust model:
+            // a local process could run the update itself; nothing here is
+            // authorization.
             if (g_callbacks.on_admin_launch) {
                 g_callbacks.on_admin_launch();
                 if (!reply(0x1, "{\"type\":\"admin_launch_started\"}")) return;
             } else {
                 if (!reply(0x1, "{\"type\":\"error\"}")) return;
             }
+        } else if (type == "assignment_open" && !is_page) {
+            // The evaluation wrapper asking to open VIRULE on its assignment
+            // (2026-10-22). Local trust model: a local process could start
+            // the Admin itself; the intent only says which assignment to show.
+            std::string assignment_id;
+            (void)js::find_string_in(payload, 0, payload.size(), "assignment_id", assignment_id);
+            bool id_ok = assignment_id.size() == 32;
+            for (const char c : assignment_id) {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) id_ok = false;
+            }
+            const bool opened = id_ok && g_callbacks.on_assignment_open &&
+                                g_callbacks.on_assignment_open(assignment_id);
+            if (!reply(0x1, opened ? "{\"type\":\"assignment_open_started\"}"
+                                   : "{\"type\":\"error\"}")) {
+                return;
+            }
+        } else if (type == "assignment_open_take" && !is_page) {
+            // The Admin host, once it is up: which assignment to show.
+            const std::string answer = g_callbacks.assignment_open_take
+                ? g_callbacks.assignment_open_take() : std::string();
+            if (!reply(0x1, answer.empty() ? "{\"type\":\"error\"}" : answer)) return;
         } else if (type == "admin_update_check" && !is_page) {
             // The Admin Settings row's availability question, and the
             // managed virule.exe's update-on-launch question. Local-only:

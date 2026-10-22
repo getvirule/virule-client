@@ -69,6 +69,9 @@
 #include "shared/environment.hpp"
 #include "shared/evidence_queue.hpp"
 #include "client/evaluation_inbox.hpp"
+#include "client/evidence_owner.hpp"
+#include "client/evaluation_recovery.hpp"
+#include "client/assignment_open.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
@@ -113,6 +116,13 @@ HANDLE g_exit_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 // in a staging build or a redirected sandbox (shared/evidence_queue.hpp).
 std::wstring g_evidence_test_endpoint;
 HANDLE g_evidence_stop = nullptr;
+// WHOSE EVIDENCE IT IS (2026-10-22, client/evidence_owner.hpp): set only
+// for the real service transport (the loopback test transport is not
+// account-bound). The uninstall's evidence wait uses the same decision.
+vclient::evidence_owner::Resolver* g_evidence_owner = nullptr;
+// The uninstall's wait for undelivered evidence lifts the delivery pause
+// (an uninstall otherwise pauses it) for exactly its own duration.
+std::atomic<bool> g_evidence_draining{ false };
 
 // GAME DISTRIBUTION (client/transfers.hpp; docs/ARCHITECTURE.md "Game
 // distribution"): the transfer thread. One forced pass at startup (the
@@ -170,6 +180,28 @@ struct AccountTransferService final : vclient::transfers::Service {
             unsigned long long got = 0;
             const bool okd = vclient::http::request_to_file(e.host.c_str(), e.port, e.secure, acct::widen(path), h,
                                                             to - from + 1, out, got, status_out, keep_going);
+            bytes_out = got;
+            if (status_out != 401) return okd;
+        }
+        return false;
+    }
+    // A received evidence file, whole from byte 0: a 200 of exactly that
+    // length is taken as well as a 206 (2026-10-22, http_client.hpp).
+    bool get_whole_to_file(const std::string& path, std::uint64_t bytes, FILE* out,
+                           std::uint64_t& bytes_out, unsigned long& status_out) override {
+        namespace acct = vclient::account;
+        const acct::Endpoint e = acct::api_endpoint();
+        bytes_out = 0;
+        status_out = 0;
+        if (bytes == 0) return false;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            std::wstring h;
+            if (!acct::transfer_headers("GET", path, h, attempt == 1)) { status_out = 0; return false; }
+            h += L"Range: bytes=0-" + std::to_wstring(bytes - 1) + L"\r\n";
+            // A 401 wrote nothing (the body is read only on 206 / a whole 200).
+            unsigned long long got = 0;
+            const bool okd = vclient::http::request_to_file(e.host.c_str(), e.port, e.secure, acct::widen(path), h,
+                                                            bytes, out, got, status_out, {}, bytes);
             bytes_out = got;
             if (status_out != 401) return okd;
         }
@@ -241,6 +273,35 @@ void keep_workspace_progress(const std::string& payload, const std::string& answ
 HANDLE g_launcher_stop = nullptr;
 vclient::launcher::Launcher* g_launcher = nullptr;
 
+// SESSION RECOVERY (client/evaluation_recovery.hpp; OWNER RULING 2026-10-22:
+// the wrapper's own recovery, windowless). Checked at Client start and at
+// every game's last process exit.
+vclient::evaluation_recovery::Recovery* g_recovery = nullptr;
+
+void start_recovery() {
+    namespace rv = vclient::evaluation_recovery;
+    rv::Config cfg;
+    cfg.root = vclient::paths::virule_data_root();
+    cfg.busy = [](const std::string& assignment_id) {
+        return g_launcher ? g_launcher->busy_scanned(assignment_id)
+                          : virule::core::evaluation_evidence::session_running(assignment_id);
+    };
+    // A recovered package is handed off by the wrapper (which signals the
+    // wake itself); the wake here covers a wrapper that did not.
+    cfg.on_done = [] { (void)virule::core::evaluation_evidence::signal_wake(); };
+    cfg.log = [](const std::string& t) { vclient::log::client(t); };
+    g_recovery = new rv::Recovery(std::move(cfg));   // lives as long as the process
+    // The startup look, after the launcher's first scan of what is running.
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID) -> DWORD {
+            Sleep(vclient::launcher::kDiscoverMs + 1000);
+            g_recovery->check_all();
+            return 0;
+        },
+        nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
 void start_launcher() {
     namespace la = vclient::launcher;
     g_launcher_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -250,6 +311,11 @@ void start_launcher() {
     cfg.refresh_progress = refresh_assignment_progress;
     cfg.log = [](const std::string& t) { vclient::log::client(t); };
     cfg.stop_event = g_launcher_stop;
+    // The game's last process exited: a finished session left without a
+    // package is recovered (client/evaluation_recovery.hpp).
+    cfg.on_stopped = [](const std::string& assignment_id) {
+        if (g_recovery) (void)g_recovery->check(assignment_id);
+    };
     g_launcher = new la::Launcher(std::move(cfg));   // lives as long as the process
     HANDLE h = CreateThread(nullptr, 0,
         [](LPVOID) -> DWORD {
@@ -357,6 +423,12 @@ void start_evidence_delivery() {
                                           vclient::paths::environment_redirected(),
                                           [](const std::string& t) { vclient::log::client(t); },
                                           service, [] { return vclient::account::signed_in(); });
+    // Evidence goes only under its evaluator's account (2026-10-22): signed
+    // out or another account signed in, it waits without a failure.
+    if (std::string(arg->transport->name()) == "service") {
+        g_evidence_owner = new vclient::evidence_owner::Resolver(vclient::paths::virule_data_root(), &g_transfer_service);
+        arg->cfg.owner = g_evidence_owner->fn();
+    }
     // A REPORT ACKNOWLEDGED: the game removes itself (client/transfers.hpp
     // begin_removal), never while it runs.
     arg->cfg.on_ack = [](const std::string& kind, const std::string& assignment_id) {
@@ -369,9 +441,12 @@ void start_evidence_delivery() {
     arg->cfg.root = ev::ee::root_under(vclient::paths::virule_data_root());
     arg->cfg.transport = arg->transport.get();
     arg->cfg.stop_event = g_evidence_stop;
+    // An uninstall pauses it, except while the uninstall itself waits for
+    // the evaluator's undelivered evidence (owner ruling 2026-10-22).
     arg->cfg.paused = [] {
-        return vclient::bridge::g_uninstalling.load() ||
-               vclient::lifecycle::uninstall_intent_active();
+        return (vclient::bridge::g_uninstalling.load() ||
+                vclient::lifecycle::uninstall_intent_active()) &&
+               !g_evidence_draining.load();
     };
     arg->cfg.log = [](const std::string& t) { vclient::log::client(t); };
     HANDLE h = CreateThread(nullptr, 0,
@@ -453,6 +528,27 @@ bool self_update_safe_point() {
     return true;
 }
 
+// THE UNINSTALL WAITS FOR THE EVALUATOR'S UNDELIVERED EVIDENCE (OWNER RULING
+// 2026-10-22): with a package of the signed-in account in the outbox, the
+// delivery pause is lifted, a forced pass is woken, and the uninstall waits
+// while files are acknowledged; it goes on once the outbox holds none of
+// this account's packages or nothing was acknowledged for 60 s (PENDING
+// OWNER DECISION). The rest stays local and is delivered after a reinstall
+// and a sign-in. The "Removing VIRULE..." surface stays as it is (no new
+// copy); pages hold Removing while this process serves.
+void wait_for_undelivered_evidence() {
+    namespace ev = vclient::evidence;
+    ev::DrainConfig d;
+    d.root = ev::ee::root_under(vclient::paths::virule_data_root());
+    if (g_evidence_owner) d.owner = g_evidence_owner->fn();
+    d.wake = [] { ev::request_forced_pass(); (void)ev::ee::signal_wake(); };
+    d.log = [](const std::string& t) { vclient::log::client(t); };
+    g_evidence_draining.store(true);
+    const ev::DrainEnd end = ev::drain_owned_outbox(d);
+    g_evidence_draining.store(false);
+    vclient::log::client(std::string("uninstall: evidence wait ended (") + ev::drain_end_name(end) + ")");
+}
+
 // THE ORDERED UNINSTALL (owner corrective spec 2026-09-04). Explicit user
 // uninstall outranks every automatic recovery behavior, and the order is
 // the contract:
@@ -465,6 +561,9 @@ bool self_update_safe_point() {
 //      Admin-directory process is gone (never partially uninstall under a
 //      live Admin; a refusal aborts with visible feedback and changes
 //      nothing);
+//   4a. (owner ruling 2026-10-22) wait while the signed-in evaluator's
+//      undelivered evidence is delivered: ends on an empty outbox or a
+//      60 s stall (PENDING OWNER DECISION), the rest stays local;
 //   5. hand the removal to the visible %TEMP% helper, which removes
 //      files, removes registrations LAST, verifies, clears the intent
 //      latch LAST and shows the terminal outcome;
@@ -535,6 +634,12 @@ void run_uninstall_sequence(bool delete_data) {
         }
         vclient::log::client("uninstall: the Admin closed");
     }
+
+    // 4a. THE EVALUATOR'S UNDELIVERED EVIDENCE (owner ruling 2026-10-22):
+    // after the update was cancelled and the Admin closed (so the outbox is
+    // stable and no update can finish meanwhile), and while the account is
+    // still signed in, delivery runs until the outbox is empty or stalls.
+    wait_for_undelivered_evidence();
 
     // 4b. Sign this installation out of its VIRULE account at the service
     // (bounded; offline is fine): the session file goes with the client
@@ -811,13 +916,41 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         // Update-on-launch: a managed virule.exe handed its user-initiated
         // launch over because an approved update exists. Native "Updating…"
         // feedback, verified update, then ONLY the new Admin launches.
+        // THE FALLBACK (OWNER RULING 2026-10-22; evaluation games built
+        // before assignment_open send admin_launch): with NO approved update,
+        // asked before anything is shown, the Admin opens or comes to the
+        // front with no card.
         HANDLE h = CreateThread(nullptr, 0,
             [](LPVOID) -> DWORD {
-                vclient::admin_install::launch_after_update_handoff();
+                namespace ao = vclient::assignment_open;
+                const bool update = vclient::admin_install::approved_update_available(/*launch_context=*/true);
+                if (ao::admin_launch_route(update) == ao::LaunchRoute::UpdateHandoff) {
+                    vclient::admin_install::launch_after_update_handoff();
+                } else {
+                    vclient::log::client("admin: admin_launch without an approved update; opening the Admin");
+                    vclient::admin_install::open_admin_without_update();
+                }
                 return 0;
             },
             nullptr, 0, nullptr);
         if (h) CloseHandle(h);
+    };
+    // THE EVALUATION WRAPPER'S "Quit and Open VIRULE" (2026-10-22): the open
+    // intent first (the change counter tells the Admin), then the ordinary
+    // admin_open path (an update in flight is joined; a running Admin is
+    // focused; else it is launched). Never the update card.
+    callbacks.on_assignment_open = [](const std::string& assignment_id) {
+        vclient::assignment_open::intent().set(assignment_id, GetTickCount64());
+        vclient::evidence::note_change();
+        vclient::log::client("admin: open requested on assignment " + assignment_id);
+        if (vclient::admin_install::g_busy.load()) {
+            vclient::log::client("admin: open requested during an active update; joining it");
+            return true;
+        }
+        return vclient::admin_install::open_installed_admin();
+    };
+    callbacks.assignment_open_take = []() {
+        return vclient::assignment_open::take_json(vclient::assignment_open::intent().take(GetTickCount64()));
     };
     callbacks.on_admin_open = []() {
         // ONE update transaction: an open that arrives while the
@@ -851,6 +984,13 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // (shared/account_roles.hpp); signed out, the next sign-in delivers it.
     vclient::roles::g_on_developer_intent = []() { vclient::account::confirm_async(); };
     vclient::roles::g_signed_in = []() { return vclient::account::signed_in(); };
+    // THE ACCOUNT CHANGED (2026-10-22): whose evidence it is is decided
+    // again, and an evaluator's waiting evidence goes at once.
+    vclient::account::g_on_account_changed = []() {
+        vclient::evidence_owner::note_account_changed();
+        vclient::evidence::request_forced_pass();
+        (void)virule::core::evaluation_evidence::signal_wake();
+    };
     callbacks.on_shutdown = []() {
         vclient::log::client("shutdown requested (local)");
         g_exit_requested.store(true);
@@ -995,6 +1135,10 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // install are carried by this process (client/transfers.hpp), whether
     // or not the Admin is running; the startup pass is the recovery.
     start_transfers();
+
+    // Session recovery: a finished session left without a package
+    // (client/evaluation_recovery.hpp), at startup and at every game exit.
+    start_recovery();
 
     // The developer's evaluation evidence, fetched in the background
     // (client/evaluation_inbox.hpp); the startup pass is its recovery.

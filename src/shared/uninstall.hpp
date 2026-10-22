@@ -47,7 +47,10 @@
 //
 // UNINSTALL & DELETE DATA (delete_data = true; the explicit destructive
 // option behind the "Delete local data" toggle and its "cannot be undone"
-// warning) removes everything above PLUS the whole VIRULE user-data root.
+// warning) removes everything above PLUS the VIRULE user-data root, EXCEPT
+// undelivered evaluation evidence and report drafts (OWNER RULING
+// 2026-10-22; the kept set, PENDING OWNER DECISION, is
+// shared/evidence_keep.hpp): with none, the whole root goes as before.
 // That root is VIRULE-owned by definition (paths.hpp); nothing outside it
 // is touched. The Admin is closed FIRST in both modes, so virule.db is
 // never deleted under a live Admin.
@@ -79,6 +82,7 @@
 #include <string>
 
 #include "shared/client_state.hpp"
+#include "shared/evidence_keep.hpp"
 #include "shared/logging.hpp"
 #include "shared/login_start.hpp"
 #include "shared/paths.hpp"
@@ -332,6 +336,8 @@ inline bool remove_files(bool delete_data) {
     // Provenance first, while state.json still exists to consult.
     const state::State s = state::load();
     std::error_code ec;
+    bool data_kept = false;      // Delete Data kept undelivered evidence (2026-10-22)
+    bool data_kept_ok = true;    //   and everything else under the root is gone
 
     // VIRULE-owned shortcuts. A shortcut is VIRULE-owned when this client
     // recorded creating it (state.json provenance) OR when its stored
@@ -369,7 +375,13 @@ inline bool remove_files(bool delete_data) {
         // touched, so unrelated files and development trees stay. The
         // Admin was closed before this runs (the order contract), so the
         // database is never deleted under a live Admin.
-        (void)remove_tree_with_retries(paths::virule_data_root());
+        // UNDELIVERED EVALUATION EVIDENCE STAYS (owner ruling 2026-10-22):
+        // the kept set is read now, from the tree itself.
+        const auto keep = evidence_keep::keep_set(paths::virule_data_root());
+        if (!keep.empty()) temp_log("delete data: keeping " + std::to_string(keep.size()) +
+                                    " undelivered evaluation record(s)");
+        data_kept_ok = evidence_keep::remove_root_keeping(paths::virule_data_root(), keep);
+        data_kept = !keep.empty();
     } else {
         // Default: PRESERVE user data. Every credential (dev_machine.cred
         // AND qa_tester*.cred), virule.db, workspace\, logs\ and
@@ -390,7 +402,9 @@ inline bool remove_files(bool delete_data) {
     bool data_gone = true;
     if (delete_data) {
         ec.clear();
-        data_gone = !std::filesystem::exists(paths::virule_data_root(), ec);
+        // With evidence kept, "gone" is everything but the kept set.
+        data_gone = data_kept ? data_kept_ok
+                              : !std::filesystem::exists(paths::virule_data_root(), ec);
     }
     return program_gone && state_gone && data_gone;
 }

@@ -321,6 +321,13 @@ inline void ensure_loaded_locked(State& s) {
  *  next sign-in, whoever makes it, starts a new key and a new authorization
  *  (shared/account_store.hpp). Local game files and every other local
  *  record are untouched. */
+/** THE ACCOUNT ON THIS INSTALLATION CHANGED (2026-10-22): a sign-in
+ *  completed, or this installation was signed out. main.cpp wires it to the
+ *  evidence delivery (whose evidence it is changes with the account, and an
+ *  evaluator's waiting evidence goes the moment they sign in). It must stay
+ *  lock-free: it can run under this module's state lock. */
+inline std::function<void()> g_on_account_changed;
+
 inline void sign_out_locally(State& s, const char* reason) {
     s.signed_in = false;
     s.session = store::Session{};
@@ -333,6 +340,7 @@ inline void sign_out_locally(State& s, const char* reason) {
     // An undelivered Install Dev Tools made while signed in belonged to
     // this account: it never reaches the next one (account_roles.hpp).
     roles::drop_bound_intent();
+    if (g_on_account_changed) g_on_account_changed();
 }
 
 /** Apply a token response: persist the rotated refresh token FIRST. */
@@ -830,14 +838,18 @@ inline void run_flow(unsigned long long id) {
     // before its roles are read (account_roles.hpp).
     deliver_enrollment_locked(key, at);
     const Reply me = call(L"GET", "GET", "/v1/account/me", "", key, at);
-    std::lock_guard<std::mutex> lock(st().m);
-    if (me.status == 200) (void)apply_me(st(), me.body);
-    else st().offline = true;
-    // Signed in either way: the authorization exists and is persisted; an
-    // unanswered /me is re-confirmed on the next status read (stale snapshot).
-    st().signed_in = true;
-    st().phase = Phase::idle;
-    log::client("account: signed in");
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        if (me.status == 200) (void)apply_me(st(), me.body);
+        else st().offline = true;
+        // Signed in either way: the authorization exists and is persisted; an
+        // unanswered /me is re-confirmed on the next status read (stale snapshot).
+        st().signed_in = true;
+        st().phase = Phase::idle;
+        log::client("account: signed in");
+    }
+    // Outside the state lock: evidence waiting on this account goes now.
+    if (g_on_account_changed) g_on_account_changed();
 }
 
 // ------------------------------------------------------ bridge surface --
