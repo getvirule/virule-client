@@ -62,6 +62,7 @@
 #include "client/service_watch.hpp"
 #include "client/takeover.hpp"
 #include "client/transfers.hpp"
+#include "client/launcher.hpp"
 #include "client/game_art.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
@@ -178,6 +179,87 @@ struct AccountTransferService final : vclient::transfers::Service {
 };
 AccountTransferService g_transfer_service;
 
+// THE ASSIGNMENT'S PROGRESS FROM THE SERVICE (2026-10-22): GET
+// /v1/assignments/<id>/progress, kept through the one forward-only write
+// (evaluation_evidence.hpp store_progress). Bounded: a launch asks it first
+// and never waits on it for long. False = not reached or refused.
+bool refresh_assignment_progress(const std::string& assignment_id) {
+    namespace acct = vclient::account;
+    namespace ee = virule::core::evaluation_evidence;
+    if (!ee::is_hex32(assignment_id) || !acct::signed_in()) return false;
+    const std::string path = "/v1/assignments/" + assignment_id + "/progress";
+    const acct::Endpoint e = acct::api_endpoint();
+    unsigned long status = 0;
+    std::string body;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::wstring h;
+        if (!acct::transfer_headers("GET", path, h, attempt == 1)) return false;
+        vclient::http::Timeouts t;
+        t.resolve_ms = 3000;
+        t.connect_ms = 3000;
+        t.send_ms = 3000;
+        t.receive_ms = 4000;
+        (void)vclient::http::request(L"GET", e.host.c_str(), e.port, e.secure, acct::widen(path), h, "", 256 * 1024, status, body, t);
+        if (status != 401) break;
+    }
+    if (status != 200) return false;
+    std::string_view progress;
+    if (!ee::json::member(body, "progress", progress) || progress.empty() || progress.front() != '{') return false;
+    if (ee::store_progress(ee::root_under(vclient::paths::virule_data_root()), assignment_id, progress)) {
+        vclient::evidence::note_change();
+    }
+    return true;
+}
+
+// THE EVALUATOR'S WORKSPACE READ, RELAYED (2026-10-22): the Admin's own
+// GET /v1/assignments passes through this Client (account_api); every
+// order's progress in its answer is kept (forward only, store_progress), so
+// the progress document is as current as what the Admin just read and the
+// host's whole-progress union never lags the service. No call of its own.
+void keep_workspace_progress(const std::string& payload, const std::string& answer) {
+    namespace ee = virule::core::evaluation_evidence;
+    if (payload.find("\"GET\"") == std::string::npos || payload.find("\"/v1/assignments\"") == std::string::npos) return;
+    if (answer.find("\"status\":200") == std::string::npos) return;
+    std::string_view body, orders;
+    std::vector<std::string_view> items;
+    if (!ee::json::member(answer, "body", body) || !ee::json::member(body, "orders", orders) || !ee::json::items(orders, items)) return;
+    const ee::Root r = ee::root_under(vclient::paths::virule_data_root());
+    bool wrote = false;
+    for (const auto& o : items) {
+        std::string id;
+        std::string_view progress;
+        if (!ee::json::get_string(o, "id", id) || !ee::is_hex32(id)) continue;
+        if (!ee::json::member(o, "progress", progress) || progress.empty() || progress.front() != '{') continue;
+        wrote = ee::store_progress(r, id, progress) || wrote;
+    }
+    if (wrote) vclient::evidence::note_change();
+}
+
+// THE LAUNCHER (client/launcher.hpp): the one local authority over a
+// game's launch and whether it is running. Its monitor thread waits on the
+// processes it tracks and notes every change for the Admin.
+HANDLE g_launcher_stop = nullptr;
+vclient::launcher::Launcher* g_launcher = nullptr;
+
+void start_launcher() {
+    namespace la = vclient::launcher;
+    g_launcher_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    la::Config cfg;
+    cfg.root = vclient::paths::virule_data_root();
+    cfg.on_change = [] { vclient::evidence::note_change(); };
+    cfg.refresh_progress = refresh_assignment_progress;
+    cfg.log = [](const std::string& t) { vclient::log::client(t); };
+    cfg.stop_event = g_launcher_stop;
+    g_launcher = new la::Launcher(std::move(cfg));   // lives as long as the process
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID) -> DWORD {
+            g_launcher->run();
+            return 0;
+        },
+        nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
 // A Build for Evaluation whose build or packaging stage lost its owner (the
 // Admin closed): start the Admin host headless to finish it, never while an
 // Admin is running (its singleton says so).
@@ -225,6 +307,16 @@ void start_transfers() {
     };
     cfg->log = [](const std::string& t) { vclient::log::client(t); };
     cfg->resume_headless = resume_delivery_headless;
+    // The launcher decides whether a game is up (never replaced or removed
+    // while it is); every job state change reaches the Admin's counter; a
+    // placed revision (and every installed one, once) reads the service's
+    // progress for the assignment.
+    cfg->busy = [](const std::string& assignment_id) {
+        return g_launcher ? g_launcher->busy(assignment_id)
+                          : virule::core::evaluation_evidence::session_running(assignment_id);
+    };
+    cfg->on_change = [] { vclient::evidence::note_change(); };
+    cfg->after_install = [](const std::string& assignment_id) { (void)refresh_assignment_progress(assignment_id); };
     HANDLE h = CreateThread(nullptr, 0,
         [](LPVOID p) -> DWORD {
             auto* c = (tr::DriverConfig*)p;
@@ -625,6 +717,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         if (type == "account_open_settings") return acct::open_settings();
         if (type == "account_api") {
             const std::string answer = acct::api_call(payload);
+            keep_workspace_progress(payload, answer);
             // The developer's own Evaluations read answered something new
             // (an acceptance, a delivery): one inbox pass rides it.
             if (payload.find("\"GET\"") != std::string::npos && payload.find("\"/v1/evaluations\"") != std::string::npos &&
@@ -642,7 +735,16 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
         if (type == "transfer_control") {
             const std::string answer = tr::control(payload, root);
             if (g_transfer_wake) SetEvent(g_transfer_wake);
+            vclient::evidence::note_change();
             return answer;
+        }
+        // THE LAUNCHER (2026-10-22): the one launch of an installed game,
+        // and what is running (client/launcher.hpp).
+        if (type == "game_launch") {
+            return g_launcher ? g_launcher->launch(payload) : std::string("{\"type\":\"error\"}");
+        }
+        if (type == "launcher_state") {
+            return g_launcher ? g_launcher->state_json() : std::string("{\"type\":\"error\"}");
         }
         if (type == "transfer_wake") {
             if (g_transfer_wake) SetEvent(g_transfer_wake);
@@ -883,6 +985,11 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // wrapper or the Admin is running (survives both closing, a client
     // restart and a Windows restart: the startup pass is the recovery).
     start_evidence_delivery();
+
+    // The launcher first (the transfer driver asks it before it touches a
+    // game folder): it finds any game already running (a Client restart)
+    // before anything else looks.
+    start_launcher();
 
     // Game distribution: Build for Evaluation's upload and the evaluator's
     // install are carried by this process (client/transfers.hpp), whether

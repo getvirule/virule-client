@@ -931,6 +931,154 @@ inline std::filesystem::path progress_path(const Root& r, const std::string& ass
     return progress_dir(r) / std::filesystem::path(assignment_id + ".json");
 }
 
+// ---- THE ASSIGNMENT'S RECONCILED PROGRESS (2026-10-22) ----------------------
+// Acknowledged gameplay belongs to the evaluator's ASSIGNMENT, not to one
+// Windows installation. The service owns what it RECEIVED (the progress
+// document the VIRULE Client keeps from every service answer: its sums and,
+// per received session, `received:[{session_id, session_ms, idle_ms}]`);
+// this computer's ledger owns what it RECORDED, received or still on its
+// way. The assignment's progress is their UNION BY SESSION ID: every
+// received session once, with the service's own figures, plus every
+// session recorded here that the service has not received. A session the
+// service received is never counted twice (a package id IS its session
+// id), and a session lost with an erased installation before it was
+// received is never invented.
+
+// One recorded session, as either side states it.
+struct SessionFigure {
+    std::string session_id;
+    std::int64_t session_ms = 0, idle_ms = 0;
+    std::int64_t index = 0;   // the session's number (the service's list carries it)
+};
+
+// The service's progress as the progress document holds it. `known` is
+// false without a document (nothing received here yet, or an older
+// service); `listed` is false when the document carries no `received`
+// list (a service older than 2026-10-22), which leaves only its sums.
+struct ServiceProgress {
+    bool known = false;
+    bool listed = false;
+    Totals totals;
+    std::int64_t receiving = 0;
+    bool eligible = false;
+    bool writing_unlocked = false;
+    bool early = false;
+    std::vector<SessionFigure> received;
+};
+
+inline std::int64_t nonneg(std::int64_t v) { return v < 0 ? 0 : v; }
+
+inline ServiceProgress parse_service_progress(std::string_view doc) {
+    ServiceProgress p;
+    if (doc.empty() || doc.front() != '{') return p;
+    std::int64_t s = 0, i = 0, n = 0;
+    if (!json::get_int(doc, "sessions", n)) return p;
+    (void)json::get_int(doc, "session_ms", s);
+    (void)json::get_int(doc, "idle_ms", i);
+    p.known = true;
+    p.totals.session_ms = nonneg(s);
+    p.totals.idle_ms = (std::min)(nonneg(i), p.totals.session_ms);
+    p.totals.effective_ms = p.totals.session_ms - p.totals.idle_ms;
+    p.totals.sessions = nonneg(n);
+    (void)json::get_int(doc, "receiving", p.receiving);
+    bool b = false;
+    p.eligible = json::get_bool(doc, "eligible", b) && b;
+    b = false;
+    p.writing_unlocked = json::get_bool(doc, "writing_unlocked", b) && b;
+    std::string_view early;
+    p.early = json::member(doc, "early_completion", early) && !early.empty() && early.front() == '{';
+    std::string_view raw;
+    std::vector<std::string_view> items;
+    if (json::member(doc, "received", raw) && json::items(raw, items)) {
+        p.listed = true;
+        for (const auto& it : items) {
+            SessionFigure f;
+            if (!json::get_string(it, "session_id", f.session_id) || !is_hex32(f.session_id)) continue;
+            (void)json::get_int(it, "session_ms", f.session_ms);
+            (void)json::get_int(it, "idle_ms", f.idle_ms);
+            (void)json::get_int(it, "index", f.index);
+            if (f.session_ms < 0) f.session_ms = 0;
+            f.idle_ms = (std::min)(nonneg(f.idle_ms), f.session_ms);
+            p.received.push_back(std::move(f));
+        }
+    }
+    return p;
+}
+
+struct Reconciled {
+    Totals totals;                        // the assignment's progress
+    std::int64_t received_sessions = 0;   // of which the service received
+    std::int64_t local_only_sessions = 0; // recorded here, not received yet
+    // The last session in time order is not knowable from the service's
+    // figures alone; the last LOCAL session is the caller's.
+};
+
+// THE UNION. `local` is this computer's ledger (every session it recorded).
+// Without a received list the service's sums cannot be told apart from the
+// local sessions, so the larger of the two is taken (never their sum, which
+// could count a session twice).
+inline Reconciled reconcile_progress(const std::vector<SessionFigure>& local, const ServiceProgress& svc) {
+    Reconciled r;
+    if (svc.known && svc.listed) {
+        std::vector<std::string> ids;
+        for (const auto& f : svc.received) {
+            if (std::find(ids.begin(), ids.end(), f.session_id) != ids.end()) continue;
+            ids.push_back(f.session_id);
+            r.totals.session_ms += f.session_ms;
+            r.totals.idle_ms += f.idle_ms;
+            r.received_sessions += 1;
+        }
+        for (const auto& f : local) {
+            if (std::find(ids.begin(), ids.end(), f.session_id) != ids.end()) continue;
+            ids.push_back(f.session_id);
+            r.totals.session_ms += nonneg(f.session_ms);
+            r.totals.idle_ms += (std::min)(nonneg(f.idle_ms), nonneg(f.session_ms));
+            r.local_only_sessions += 1;
+        }
+    } else {
+        Totals mine;
+        for (const auto& f : local) {
+            mine.session_ms += nonneg(f.session_ms);
+            mine.idle_ms += (std::min)(nonneg(f.idle_ms), nonneg(f.session_ms));
+            mine.sessions += 1;
+        }
+        if (svc.known && svc.totals.session_ms > mine.session_ms) {
+            r.totals = svc.totals;
+            r.received_sessions = svc.totals.sessions;
+        } else {
+            r.totals = mine;
+            r.local_only_sessions = mine.sessions;
+        }
+    }
+    r.totals.sessions = r.received_sessions + r.local_only_sessions;
+    if (r.totals.idle_ms > r.totals.session_ms) r.totals.idle_ms = r.totals.session_ms;
+    r.totals.effective_ms = r.totals.session_ms - r.totals.idle_ms;
+    return r;
+}
+
+// The Client's write of a service answer's progress: never BACKWARDS. The
+// service only ever adds received sessions, so an answer that states fewer
+// than the document already holds is an older answer arriving late (a
+// relayed read that crossed a receipt) and is not written.
+inline bool progress_is_not_older(std::string_view next, std::string_view held) {
+    const ServiceProgress n = parse_service_progress(next);
+    if (!n.known) return false;
+    const ServiceProgress h = parse_service_progress(held);
+    if (!h.known) return true;
+    return n.totals.sessions >= h.totals.sessions;
+}
+
+// The one write of an assignment's progress document (the VIRULE Client's,
+// from any service answer that carries it). True when it was written.
+inline bool store_progress(const Root& r, const std::string& assignment_id, std::string_view progress) {
+    if (r.dir.empty() || !is_hex32(assignment_id)) return false;
+    const auto path = progress_path(r, assignment_id);
+    if (!progress_is_not_older(progress, read_document(path))) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    return write_file_atomic(path, std::string(progress) + "\n");
+}
+
 // The early completion as the wrapper records it. `body` is what the
 // service receives: {request_id, reason, explanation}.
 struct EarlyRequest {

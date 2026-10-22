@@ -51,7 +51,8 @@
 //     rename; a previous revision's folder is replaced only at that moment;
 //   - AN UPDATE (2026-10-21: the same job moved on to a newer revision) never
 //     touches the installation while its game or panels are up (the
-//     wrapper's presence, evaluation_evidence.hpp session_running), keeps
+//     launcher's busy, client/launcher.hpp: the wrapper's presence, any
+//     process inside the game folder, a launch being started), keeps
 //     every file of the installed game the new package does not carry (its
 //     saves), and swaps with a way back: if the new folder cannot be put in
 //     place the previous one is put back, so the evaluator is never left
@@ -59,7 +60,8 @@
 //   - a game removes itself (removing -> removed) only after its report was
 //     acknowledged, never while it runs, and only its own folder;
 //   - nothing is reported installed without the verified completion the
-//     service acknowledged.
+//     service acknowledged; `installed_revision_id` then names the revision
+//     on disk, and it stays while an update moves the job on (2026-10-22).
 //
 // The service is reached through `Service` (the account's DPoP calls in
 // production; a loopback stand-in in the harness), so the driver's own
@@ -299,15 +301,42 @@ struct DriverConfig {
     // Start the Admin host headless for a stalled Admin-side stage; false =
     // not started (an Admin is running, or no host is known).
     std::function<bool(const ed::Job&)> resume_headless;
+    // THE LAUNCHER'S ANSWER (2026-10-22, client/launcher.hpp busy): is the
+    // assignment's game up in any form (its wrapper, panels or process, or
+    // a launch being started)? Never replaced or removed while it is.
+    // Unset (the unit harness): the wrapper's presence alone.
+    std::function<bool(const std::string&)> busy;
+    // A job's state changed: the Admin's change counter (evaluation_changes).
+    std::function<void()> on_change;
+    // An install placed its revision (and, once per process, every
+    // installed assignment): the service's progress is fetched and kept,
+    // so a fresh installation knows the assignment's whole history.
+    std::function<void(const std::string&)> after_install;
 };
 
 namespace detail {
 
 inline std::int64_t now_of(const DriverConfig& cfg) { return cfg.now ? cfg.now() : (std::int64_t)std::time(nullptr); }
 
+inline bool game_busy(const DriverConfig& cfg, const std::string& assignment_id) {
+    return cfg.busy ? cfg.busy(assignment_id) : ev::session_running(assignment_id);
+}
+
+// Every write of a job; a CHANGED STATE is noted for the Admin (a byte count
+// moving is not: the Admin reads a moving job on its own cadence).
 inline void save(const DriverConfig& cfg, ed::Job& j) {
+    static std::mutex m;
+    static std::map<std::string, std::string> last;
     j.updated_utc = utc_now();
     ed::write_job(cfg.root, j);
+    bool moved = false;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        auto it = last.find(j.id);
+        moved = it == last.end() || it->second != j.state;
+        last[j.id] = j.state;
+    }
+    if (moved && cfg.on_change) cfg.on_change();
 }
 
 inline void log(const DriverConfig& cfg, const std::string& t) { if (cfg.log) cfg.log("transfers: " + t); }
@@ -725,7 +754,7 @@ inline bool carry_over(const fs::path& from, const fs::path& to, std::string& wh
 // acknowledgment, main.cpp), never while it runs, and only its own folder
 // (<installs>\<game uuid>, as the job names it).
 inline void run_removal(const DriverConfig& cfg, ed::Job& j) {
-    if (ev::session_running(j.assignment_id)) {
+    if (game_busy(cfg, j.assignment_id)) {
         j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
         save(cfg, j);
         return;
@@ -854,7 +883,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         const bool updating = fs::exists(dst, ec);
         // NEVER WHILE IT RUNS: an update waits for the game and its panels
         // to close (looked at again shortly, not on the failure ladder).
-        if (updating && ev::session_running(j.assignment_id)) {
+        if (updating && game_busy(cfg, j.assignment_id)) {
             j.error = "Close the game to finish the update.";
             j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
             save(cfg, j);
@@ -885,7 +914,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
                 defer(cfg, j, why);
                 return;
             }
-            if (ev::session_running(j.assignment_id)) {   // started meanwhile
+            if (game_busy(cfg, j.assignment_id)) {   // started meanwhile
                 fs::remove_all(staging, ec);
                 j.error = "Close the game to finish the update.";
                 j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
@@ -925,13 +954,20 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             return;
         }
         fs::remove(temp, ec);
+        // The service's progress for the assignment first (bounded, best
+        // effort), so an installed game's first launch already states the
+        // assignment's whole history (a fresh installation).
+        if (cfg.after_install) cfg.after_install(j.assignment_id);
         j.state = "installed";
+        // The revision now on this computer's disk (ed::installed_revision):
+        // what the Admin compares with the service's required one.
+        j.installed_revision_id = j.revision_id;
         j.bytes_done = j.package_bytes;
         j.permille = 1000;
         j.error.clear();
         j.attempts = 0;
         save(cfg, j);
-        log(cfg, j.id + " installed: " + j.install_dir);
+        log(cfg, j.id + " installed: " + j.install_dir + " (revision " + j.revision_id + ")");
     }
 }
 
@@ -948,6 +984,14 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
     const std::int64_t t = now_of(cfg);
     std::string email;
     const bool signed_in = cfg.service->signed_in(email);
+    // Once per process, signed in: every installed assignment's progress
+    // from the service (a Client that just started, a fresh installation).
+    static std::set<std::string> synced;
+    for (const ed::Job& j : ed::list_jobs(cfg.root)) {
+        if (!signed_in || !cfg.after_install || !ed::is_install(j) || j.state != "installed") continue;
+        if (!synced.insert(j.assignment_id).second) continue;
+        cfg.after_install(j.assignment_id);
+    }
     for (ed::Job j : ed::list_jobs(cfg.root)) {
         if (stopping(cfg)) break;
         if (ed::is_terminal(j)) continue;

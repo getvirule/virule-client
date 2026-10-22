@@ -152,7 +152,23 @@ struct Job {
     std::string install_dir;        // <install_root>\<game_uuid>
     std::string temp_path;          // the package being downloaded
     bool paused = false;
+    // THE REVISION ON THIS COMPUTER'S DISK (2026-10-22): set when a revision
+    // is placed (`installed`), kept while an update moves `revision_id` on
+    // to the next one. The service decides which revision is REQUIRED; this
+    // computer's installation is this field, never the account's download
+    // history (an account can hold a newer download on another computer or
+    // a previous installation). Empty on a record written before it existed:
+    // installed_revision() reads it from the state.
+    std::string installed_revision_id;
 };
+
+// The revision installed on this computer for an install job: the recorded
+// one, else (a record older than the field) the job's revision once it is
+// installed; "" while nothing is placed.
+inline std::string installed_revision(const Job& j) {
+    if (!j.installed_revision_id.empty()) return j.installed_revision_id;
+    return j.state == "installed" ? j.revision_id : std::string();
+}
 
 inline bool is_upload(const Job& j) { return j.kind == "upload"; }
 inline bool is_install(const Job& j) { return j.kind == "install"; }
@@ -211,6 +227,7 @@ inline std::string job_json(const Job& j) {
     o += ",\"install_dir\":" + quote(j.install_dir);
     o += ",\"temp_path\":" + quote(j.temp_path);
     o += std::string(",\"paused\":") + (j.paused ? "true" : "false");
+    o += ",\"installed_revision_id\":" + quote(j.installed_revision_id);
     return o + "}\n";
 }
 
@@ -265,6 +282,7 @@ inline bool parse_job(std::string_view text, Job& j) {
     j.temp_path = js::opt_string(text, "temp_path");
     bool paused = false;
     j.paused = js::get_bool(text, "paused", paused) && paused;
+    j.installed_revision_id = js::opt_string(text, "installed_revision_id");
     return true;
 }
 

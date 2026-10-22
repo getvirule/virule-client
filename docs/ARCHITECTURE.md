@@ -133,7 +133,9 @@ in both components).
 | local | `{"type":"uninstall_local"}` | the Apps & Features `--uninstall` launcher forwarding removal to the serving instance, so there is one teardown owner |
 | local | `{"type":"setup_takeover",...}` | Virule-Setup transferring the pending-operation envelope, or its explicit absence (see "The Setup takeover") |
 | local | `{"type":"evidence_status","assignment_id":"<32 hex>"}` | answers `{"type":"evidence_status","assignment_id","counts":{"pending","acknowledged","damaged"},"packages":[{"id","state","simulated","attempts","last_error"}],"truncated":bool}` for one evaluation assignment (see "Evaluation evidence delivery"); a read only, it never delivers; a malformed id answers `error` |
-| local | `{"type":"evaluation_changes"}` | answers `{"type":"evaluation_changes","generation":"<boot>:<n>"}` (0.9.17): a counter this process bumps on every evidence receipt, request answer and fetched developer package; the Admin reads it to learn locally that its own Client changed an evaluation, never by asking the service (see "Evaluation evidence delivery") |
+| local | `{"type":"evaluation_changes"}` | answers `{"type":"evaluation_changes","generation":"<boot>:<n>"}` (0.9.17): a counter this process bumps on every evidence receipt, request answer and fetched developer package, and (0.9.18) on every launch, exit and install job state change and every kept progress document; the Admin reads it to learn locally that its own Client changed something, never by asking the service (see "Evaluation evidence delivery", "The launcher") |
+| local | `{"type":"game_launch","assignment_id":"<32 hex>","required_revision_id"?:"<32 hex>"}` | THE LAUNCHER (0.9.18): the one launch of an installed game. Answers `{"type":"game_launch","ok":true,"pid":n}` or `ok:false` with `code` (`running`, `updating`, `not_installed`, `update_required`, `missing`, `failed`) and a plain `message` (see "The launcher") |
+| local | `{"type":"launcher_state"}` | answers `{"type":"launcher_state","assignments":[{"assignment_id","running","launching"}]}` (0.9.18): for every install job here, whether its game is up in any form, read from the system at the moment of asking |
 | local | `{"type":"setup_wait"}` | answers `{"released":bool}`: whether the takeover's next feedback surface is ready, so Setup's card may close |
 | local | `{"type":"account_status"}` | answers the account snapshot (see "VIRULE account"): `signed_in`, `phase` (idle / browser / exchanging), `offline`, `error`, and when signed in `account{email,display_name,status}`, `capabilities{developer,evaluator,qa_tester}`, `effective{developer,evaluator}`, `checked`, `qa_link_available`, `appearance` (v0.9.4); ALWAYS, signed in or out, `enabled{dev_tools,evaluator}`, the installed capabilities (v0.9.9), and `remembered{developer,evaluator}`, the roles last confirmed for an account here (0.9.12; absent until an account was confirmed on this installation). Never a token |
 | local | `{"type":"account_sign_in"}` / `{"type":"account_sign_in_cancel"}` | start (idempotent) / cancel the browser sign-in |
@@ -1548,6 +1550,21 @@ identity.`, the service's refusal). The Admin host calls it from
 refuse, then selects again before launching. Proof: `tests/transfers`
 (`test_launch_chain`).
 
+THE REVISION ON DISK (0.9.18). An install job records
+`installed_revision_id` when a revision is placed (`installed`), and keeps
+it while an update moves the job's `revision_id` on to the next one; a job
+written before the field reads it from its state (`installed_revision`).
+It is this computer's fact: the Admin's Update compares it with the
+revision the service requires, never with the account's download history.
+A placed revision (before the job reads `installed`, so its first launch
+already has it; and, once per process, every installed assignment) also
+reads the service's progress for the assignment
+(`GET /v1/assignments/<id>/progress`, kept forward only), so a fresh
+installation knows the assignment's whole history (see "Evaluation
+evidence delivery"). Every job STATE change (not a byte count) moves the
+change counter. The driver never replaces or removes a game folder while
+the launcher says the game is up (`DriverConfig::busy`).
+
 GAME ART (0.9.16, `src/client/game_art.hpp`; the service side is
 VIRULE_BACKEND `src/evaluations/art.ts`). A game's box art is held by the
 service so every installation of its developer and the evaluator of an
@@ -1563,6 +1580,56 @@ CACHE is `%LOCALAPPDATA%\VIRULE\art\<sha256>.<ext>`, content-addressed,
 so a cached image is never stale. Answers `{"type":"game_art","ok":true,
 ...}` or `ok:false` with a plain message; the Admin keeps its placeholder.
 Proof: `tests/transfers` (`test_game_art`).
+
+## The launcher (0.9.18, 2026-10-22)
+
+Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 9a ("The
+Client owns the launcher"). Code: `src/client/launcher.hpp`, one instance
+in `main.cpp`, started before the transfer driver. THE CLIENT IS THE ONE
+LOCAL AUTHORITY over a game's launch and whether it is running; the Admin
+shows what it says and keeps no running state of its own.
+
+RUNNING, read from the system at the moment of asking, never stored: a
+process this Client started for the assignment is alive (its handle); a
+process whose image lives inside the assignment's game folder is alive
+(found by a scan of the process list at every monitor turn, at most five
+seconds apart, and at every launch: the wrapper started some other way, the
+game it started, or either one after this Client restarted, ADOPTED and
+then waited on like the first); the wrapper's presence mutex exists
+(`evaluation_evidence.hpp` `running_mutex_name`, held from its first look at
+the assignment through its post-session panel); or a launch of it is being
+started. So the pre-game panel, the game and the post-game panel all read
+running, and running ends exactly when the last of them is gone.
+
+THE MONITOR (its own thread) waits on every tracked process handle and a
+wake event, with a five-second timeout for discovery; an exit is seen the
+moment it happens, and every change of the running set moves the change
+counter (`evaluation_changes`), so the Admin learns it locally.
+
+`game_launch` refuses while the game is running or a launch of it is being
+started, while the install job is anything but `installed` (an update under
+way: `updating`; a removal, or nothing installed: `not_installed`), when the
+revision on disk is not `required_revision_id` (`update_required`), and when
+the launch file is missing, all checked and the wrapper started under one
+lock (a launch latch makes `busy` read running across the start). It starts
+`<install dir>\<launch exe>` with the game folder as its working
+directory, hands on Windows' permission to come to the front (the Admin
+host granted it as the person clicked Play: `AllowSetForegroundWindow`,
+the same cooperative mechanism the browser sign-in uses), and tracks the
+process. Beside the start, never delaying it, it reads the service's
+progress for the assignment (bounded: 3 s to connect, 4 s to answer). The transfer driver asks `busy`
+(the same running test) before it swaps an update in or removes a game,
+so a game is never replaced while any part of it is up.
+
+THE PROGRESS DOCUMENT IS KEPT FROM EVERY ANSWER (0.9.18): besides the
+evidence and request answers, the Admin's own workspace read
+(`GET /v1/assignments`, relayed through `account_api`) has each order's
+progress kept, forward only, at no extra call.
+
+Proof: `tests/launcher` (the harness: this launcher, the transfer driver and
+the evidence delivery in one process) driven by
+`VIRULE_BACKEND/tools/launcher_lifecycle_staging_e2e.mjs` on live staging
+with the real wrapper and the real game.
 
 ## Evaluation evidence delivery (2026-10-14; the service since 0.9.17)
 

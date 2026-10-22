@@ -739,7 +739,7 @@ inline PassResult run_pass(const ee::Root& r, Transport& transport, std::int64_t
             // The receipt first, durably; then the payload goes.
             if (ee::acknowledge(r, rc)) {
                 remove_state(r, id);
-                if (!ans.progress.empty()) (void)ee::write_file_atomic(ee::progress_path(r, pkg.assignment_id), ans.progress + "\n");
+                if (!ans.progress.empty()) (void)ee::store_progress(r, pkg.assignment_id, ans.progress);
                 note_change();
                 ++res.delivered;
                 if (log) log("evidence: " + id + " acknowledged (receipt " + ans.receipt_id +
@@ -885,7 +885,7 @@ inline RequestResult run_requests(const ee::Root& r, Transport& transport, std::
         const std::string code = service_code(reply);
         std::string_view progress;
         if (ee::json::member(reply.body, "progress", progress) && !progress.empty() && progress.front() == '{') {
-            (void)ee::write_file_atomic(ee::progress_path(r, it.assignment), std::string(progress) + "\n");
+            (void)ee::store_progress(r, it.assignment, progress);
         }
         const bool stands = early ? (reply.status == 409 && code == "exists") : (reply.status == 409 && code == "already_submitted");
         if (reply.status == 200 || reply.status == 201 || stands) {
