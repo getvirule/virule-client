@@ -47,6 +47,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "shared/environment.hpp"
@@ -592,9 +593,20 @@ static int run_drive(int argc, char** argv) {
     cfg.log = [](const std::string& t) { std::printf("%s\n", t.c_str()); std::fflush(stdout); };
     cfg.resume_headless = [](const ed::Job& j) { std::printf("transfers: would resume headless %s\n", j.id.c_str()); std::fflush(stdout); return false; };
     HANDLE wake = vclient::evidence::create_wake_event(std::wstring(event.begin(), event.end()).c_str());
+    // "<event>.Release" stands in for main.cpp's release on a changed
+    // Evaluations view (a purchase): held uploads asked again, the driver woken.
+    HANDLE release = CreateEventW(nullptr, FALSE, FALSE, std::wstring(event.begin(), event.end()).append(L".Release").c_str());
+    std::thread releaser([&] {
+        HANDLE hs[2] = { cfg.stop_event, release };
+        while (WaitForMultipleObjects(2, hs, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+            tr::release_held_uploads();
+            SetEvent(wake);
+        }
+    });
     std::printf("driver: up\n");
     std::fflush(stdout);
     tr::run_driver(cfg, wake);
+    releaser.join();
     std::printf("driver: stopped\n");
     return 0;
 }

@@ -828,7 +828,13 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
             if (payload.find("\"GET\"") != std::string::npos && payload.find("\"/v1/evaluations\"") != std::string::npos &&
                 answer.find("\"status\":200") != std::string::npos) {
                 const std::uint64_t h = std::hash<std::string>{}(answer);
-                if (g_last_view_hash.exchange(h) != h && g_inbox_wake) SetEvent(g_inbox_wake);
+                if (g_last_view_hash.exchange(h) != h) {
+                    if (g_inbox_wake) SetEvent(g_inbox_wake);
+                    // A purchase changes this view: a held upload (UPLOAD
+                    // ELIGIBILITY, client/transfers.hpp) is asked again now.
+                    vclient::transfers::release_held_uploads();
+                    if (g_transfer_wake) SetEvent(g_transfer_wake);
+                }
             }
             return answer;
         }

@@ -1467,7 +1467,7 @@ forced pass at startup (the recovery after a crash, a kill or a Windows
 restart), then a blocked wait on `Local\VIRULE.Transfers.Wake` (the Admin
 host signals it after packaging a build or writing an install), the
 earliest retry, or its stop event. An uninstall pauses it. It moves every
-job under `%LOCALAPPDATA%\VIRULE	ransfers\<job id>\job.json` whose stage is
+job under `%LOCALAPPDATA%\VIRULE\transfers\<job id>\job.json` whose stage is
 the Client's, one at a time:
 
 - `upload` (Build for Evaluation; the Admin host hands it over as
@@ -1482,6 +1482,25 @@ the Client's, one at a time:
   `done`: the service holds the hosted build. The package file's size
   must still be the packaged one, else the job fails (`The package changed
   since it was built. Build it again.`).
+- A HELD upload (0.9.20; owner brief 2026-10-22, UPLOAD ELIGIBILITY in
+  `VIRULE_BACKEND/docs/EVALUATIONS.md`): the service refuses an upload for a
+  game with no purchased evaluation still owed, or never bought for (409
+  `no_pending_evaluation`, at opening or at completion; another account's
+  game stays a 404 failure). The job goes to `held`, never `failed`: the
+  package and the session stay and nothing is sent. It is asked again (one
+  opening, which resumes the same session; each refused ask keeps the
+  service's session alive) every 30 minutes and AT ONCE when the
+  developer's Evaluations view read through this Client (`account_api` GET
+  `/v1/evaluations`) answers something new, as a purchase makes it
+  (`release_held_uploads` beside the inbox wake in `main.cpp`); once taken
+  it continues where it stood. A session left unasked for two days (the
+  computer off) is abandoned by the service, and the released job then
+  fails with its sentence (`Build it again.`). A held job whose game has a
+  NEWER upload job (a new Build for Evaluation) is retired by this driver
+  (`failed`, `Replaced by a newer build.`) before anything is asked, so the
+  driver stays the held job's only writer; the newer build's packaging has
+  already removed the held package. An older Client fails such a job with
+  the service's sentence instead.
 - `install` (the Admin's Install writes it `queued` with the installs
   location, the game folder and the partial file's path): ask for the
   download (`POST /v1/assignments/<id>/download`: the revision, its size

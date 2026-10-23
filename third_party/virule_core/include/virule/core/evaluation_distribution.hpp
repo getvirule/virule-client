@@ -29,6 +29,15 @@
 // job per assignment.
 //
 // UPLOAD STATES   building -> packaging -> packaged -> uploading -> registering -> done | failed
+//                 packaged | registering -> held -> packaged (2026-10-22: the service
+//                              refused the upload because none of the game's purchased
+//                              evaluations is still owed, or the game was never bought
+//                              for; the package and the session are kept, the Client
+//                              asks again when the developer's evaluations change and
+//                              every 30 minutes; a new Build for Evaluation does not wait
+//                              for a held job, and the Client, the held job's only
+//                              writer, retires it (failed) once a newer upload job of
+//                              the game exists)
 // INSTALL STATES  queued -> downloading (paused) -> verifying -> extracting -> installed | failed
 //                 installed -> queued (an UPDATE: the same job moves on to a newer revision;
 //                              the installed revision stays on disk until the verified
@@ -172,6 +181,10 @@ inline std::string installed_revision(const Job& j) {
 
 inline bool is_upload(const Job& j) { return j.kind == "upload"; }
 inline bool is_install(const Job& j) { return j.kind == "install"; }
+
+// A built and packaged upload the service will not take yet (UPLOAD
+// STATES): neither running nor failed, and never in the way of a new build.
+inline bool is_held(const Job& j) { return j.kind == "upload" && j.state == "held"; }
 
 inline bool is_terminal(const Job& j) {
     return j.state == "done" || j.state == "failed" || j.state == "installed" || j.state == "removed";

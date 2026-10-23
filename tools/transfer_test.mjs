@@ -28,7 +28,11 @@
 // account's job waits untouched; an install: the download in ranges,
 // resumed from a kill, verified, extracted, the ticket and credential
 // written, the completion reported; a wrong package fails and tells the
-// service; Pause and Resume.
+// service; Pause and Resume; UPLOAD ELIGIBILITY: an upload refused for want
+// of a purchased evaluation still owed (or of any purchase) is held with its
+// package, asked again on a release, continued once eligible; one refused at
+// completion completes the same session; a newer build retires a held job;
+// another account's game (404) fails rather than holds.
 
 import { spawn, execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -87,7 +91,11 @@ const md5 = (b) => crypto.createHash("md5").update(b).digest("hex");
 const PART = 32 * 1024 * 1024;
 
 // ---- the loopback service
-const mode = { down: false, dropUploads: false, loseSessions: false, damageOnce: 0 };
+const mode = { down: false, dropUploads: false, loseSessions: false, damageOnce: 0,
+  // UPLOAD ELIGIBILITY (2026-10-22): games with no purchased evaluation still
+  // owed (409 no_pending_evaluation at open and completion), games nobody
+  // ever bought for (the same 409), another account's game (404).
+  ineligible: new Set(), unbought: new Set(), foreign: new Set() };
 const sessions = new Map();     // session id -> { build_uuid, package_bytes, sha, parts: Map(n -> {sha, md5, bytes}), uploadAlive, state, game }
 const byBuild = new Map();      // build uuid -> session id
 const log = [];                 // every request
@@ -112,6 +120,11 @@ const server = http.createServer(async (req, res) => {
   if ((m = /^\/v1\/evaluations\/games\/([0-9a-f]{32})\/uploads$/.exec(url)) && req.method === "POST") {
     const b = JSON.parse(raw.toString("utf8"));
     if (b.content_bytes > 20 * 1024 ** 3) return err(res, 400, "invalid_request", "This game is 23 GB. The limit is 20 GB.");
+    if (mode.foreign.has(m[1])) return err(res, 404, "not_found", "No such game.");
+    if (mode.unbought.has(m[1])) return err(res, 409, "no_pending_evaluation", "A pending evaluation is required.");
+    if (mode.ineligible.has(m[1]) && !(byBuild.has(b.build_uuid) && sessions.get(byBuild.get(b.build_uuid)).state === "verified")) {
+      return err(res, 409, "no_pending_evaluation", "A pending evaluation is required.");
+    }
     if (byBuild.has(b.build_uuid)) {
       const s = sessions.get(byBuild.get(b.build_uuid));
       if (s.sha !== b.package_sha256) return err(res, 409, "conflict", "This build was already uploaded with different contents.");
@@ -154,6 +167,7 @@ const server = http.createServer(async (req, res) => {
     const s = sessions.get(m[1]);
     if (!s || mode.loseSessions) return err(res, 404, "not_found", "No such upload.");
     if (s.state === "verified") return json(res, 200, { session: { session_id: s.id, state: "verified" } });
+    if (mode.ineligible.has(s.game) || mode.refuseCompleteFor === s.game) return err(res, 409, "no_pending_evaluation", "A pending evaluation is required.");
     if (s.parts.size !== s.parts_total) return err(res, 409, "incomplete", "Not every part has arrived.");
     const whole = Buffer.concat([...s.parts.keys()].sort((x, y) => x - y).map((k) => s.parts.get(k).bytes));
     if (whole.length !== s.package_bytes || sha256(whole) !== s.sha) return err(res, 409, "integrity", "The parts do not add up to the package.");
@@ -334,6 +348,77 @@ try {
   await signal();
   await sleep(1500);
   check("a job of another account is never carried under this one", readJob(J8).state === "packaged" && readJob(J8).session_id === "", readJob(J8));
+
+  // ============================= 8b. upload eligibility: held, never failed
+  // (owner brief 2026-10-22) The service refuses an upload for a game with no
+  // purchased evaluation still owed or never bought for (409 no_pending_evaluation): the job
+  // is HELD with its package; a release (a purchase changed the developer's
+  // evaluations) asks again and the upload continues; one refused at its
+  // completion keeps its session and completes once released.
+  const release = () => run("signal", EVENT + ".Release");
+  const GH = rid();
+  mode.ineligible.add(GH);
+  const [JH] = (await run("package", VROOT, GH, "6000")).split(" ");
+  await signal();
+  const heldH = await waitFor(() => readJob(JH)?.state === "held", 10000);
+  check("every evaluation delivered: the upload is held, not failed, its package kept",
+    !!heldH && fs.existsSync(readJob(JH).package_path) && readJob(JH).next_attempt_utc > Date.now() / 1000 + 60, readJob(JH));
+  const opensWhileHeld = requestsFor(new RegExp(`games/${GH}/uploads`)).length;
+  await signal();
+  await sleep(1200);
+  check("a plain wake does not ask again while it is held", requestsFor(new RegExp(`games/${GH}/uploads`)).length === opensWhileHeld && readJob(JH).state === "held");
+  await release();
+  await sleep(1200);
+  check("a release asks again and, still refused, it stays held", requestsFor(new RegExp(`games/${GH}/uploads`)).length === opensWhileHeld + 1 && readJob(JH).state === "held", readJob(JH));
+  mode.ineligible.delete(GH);
+  await release();
+  done = await waitFor(() => readJob(JH)?.state === "done", 20000);
+  check("eligible (a purchase): released, it uploads and completes from the same package", !!done && packages.get(readJob(JH).session_id)?.sha === readJob(JH).package_sha256, readJob(JH));
+  const GN = rid();
+  mode.unbought.add(GN);
+  const [JN] = (await run("package", VROOT, GN, "3000")).split(" ");
+  await signal();
+  check("never bought for (the same 409): held too", !!(await waitFor(() => readJob(JN)?.state === "held", 10000)), readJob(JN));
+  mode.unbought.delete(GN);
+  await release();
+  check("the first purchase releases it", !!(await waitFor(() => readJob(JN)?.state === "done", 20000)), readJob(JN));
+  // Refused at completion: the parts went, the evaluation was delivered meanwhile.
+  const GC = rid();
+  const [JC] = (await run("package", VROOT, GC, "7000")).split(" ");
+  const sessionsBefore = sessions.size;
+  // The open goes through; only the completion is refused.
+  mode.refuseCompleteFor = GC;
+  await signal();
+  const heldC = await waitFor(() => readJob(JC)?.state === "held", 15000);
+  check("refused at completion: held with its session and its parts", !!heldC && readJob(JC).session_id !== "" &&
+    sessions.get(readJob(JC).session_id)?.parts.size === 1 && sessions.size === sessionsBefore + 1, readJob(JC));
+  mode.refuseCompleteFor = "";
+  await release();
+  done = await waitFor(() => readJob(JC)?.state === "done", 20000);
+  check("released: the same session completes, no part sent twice", !!done && sessions.get(readJob(JC).session_id).parts.get(1).received === 1 &&
+    sessions.size === sessionsBefore + 1, readJob(JC));
+  // A newer Build for Evaluation of the same game: the driver, the held job's
+  // only writer, retires the held one and carries the new one.
+  const GR = rid();
+  mode.ineligible.add(GR);
+  const [JR] = (await run("package", VROOT, GR, "2500")).split(" ");
+  await signal();
+  await waitFor(() => readJob(JR)?.state === "held", 10000);
+  const opensR = requestsFor(new RegExp(`games/${GR}/uploads`)).length;
+  mode.ineligible.delete(GR);
+  await sleep(1100); // a later creation second than the held job's
+  const [JR2] = (await run("package", VROOT, GR, "2600")).split(" ");
+  await release();
+  done = await waitFor(() => readJob(JR2)?.state === "done", 20000);
+  check("a newer build of the game retires the held job (failed, never carried) and uploads itself",
+    !!done && readJob(JR).state === "failed" && readJob(JR).error === "Replaced by a newer build." &&
+    requestsFor(new RegExp(`games/${GR}/uploads`)).length === opensR + 1, [readJob(JR), readJob(JR2)?.state]);
+  // Another account's game (404) is not a hold: the job fails as before.
+  const GF = rid();
+  mode.foreign.add(GF);
+  const [JF] = (await run("package", VROOT, GF, "1500")).split(" ");
+  await signal();
+  check("another account's game (404) fails the job, never holds it", !!(await waitFor(() => readJob(JF)?.state === "failed", 10000)), readJob(JF));
 
   // ===================================================== 9. an install, end to end
   const A1 = rid();

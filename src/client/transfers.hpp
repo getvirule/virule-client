@@ -8,6 +8,7 @@
 // is the Client's:
 //
 //   upload   packaged -> uploading -> registering -> done | failed
+//            packaged | registering -> held -> packaged (2026-10-22)
 //            The Admin host built and packaged the game and handed the job
 //            over as `packaged`. This driver opens (or resumes) the upload
 //            session, sends every part the service does not hold (32 MiB,
@@ -39,6 +40,15 @@
 //     the record; a session the service no longer knows (404) is opened
 //     again; everything else backs off (10 s, 1 min, 5 min, 15 min, 30 min,
 //     then 30 min forever) and never gives up;
+//   - UPLOAD ELIGIBILITY (owner brief 2026-10-22): an upload the service
+//     refuses because no purchased evaluation of the game is still owed, or
+//     none was ever bought (409 no_pending_evaluation), is HELD, never
+//     failed: the package and the session stay, nothing is sent, and it is
+//     asked again whenever the developer's evaluations change (a purchase;
+//     main.cpp release_held_uploads) and every 30 minutes (each ask keeps
+//     the service's session alive); once the service takes it, it continues
+//     where it stood. A held job whose game has a NEWER upload job (a new
+//     Build for Evaluation) is retired here, by its only writer;
 //   - the package file must still be the one that was packaged (its size);
 //     otherwise the job fails and says so, never mixing two builds;
 //   - a job belongs to the account that started it: with another account
@@ -229,8 +239,17 @@ struct Controls {
     std::mutex m;
     std::set<std::string> paused;     // assignment ids
     std::set<std::string> retry;      // assignment ids whose failed install is tried again
+    bool release_held = false;        // ask the service again for every held upload, now
 };
 inline Controls& controls() { static Controls c; return c; }
+
+// The developer's evaluations changed (main.cpp: their view read through
+// this Client answered something new, as a purchase does): every held
+// upload is asked again at the next pass. The caller wakes the driver.
+inline void release_held_uploads() {
+    std::lock_guard<std::mutex> lock(controls().m);
+    controls().release_held = true;
+}
 
 inline bool is_paused(const std::string& assignment_id) {
     std::lock_guard<std::mutex> lock(controls().m);
@@ -385,6 +404,20 @@ inline std::string body_code(const std::string& body) {
     return c;
 }
 
+// The service will not take this upload yet (UPLOAD ELIGIBILITY): kept as it
+// is, asked again when released or after the backoff cap.
+inline void hold(const DriverConfig& cfg, ed::Job& j, const std::string& why) {
+    j.state = "held";
+    j.error = why;
+    j.attempts = 0;
+    j.next_attempt_utc = now_of(cfg) + kBackoffCap;
+    save(cfg, j);
+    log(cfg, j.id + " held: " + why);
+}
+inline bool refused_for_eligibility(const Reply& r) {
+    return r.status == 409 && body_code(r.body) == "no_pending_evaluation";
+}
+
 inline std::vector<std::int64_t> uploaded_of(const std::string& body) {
     std::vector<std::int64_t> out;
     std::string_view raw;
@@ -437,6 +470,11 @@ inline bool open_session(const DriverConfig& cfg, ed::Job& j) {
         j.error.clear();
         save(cfg, j);
         return true;
+    }
+    // Not eligible yet, or no purchase at all: held, never failed.
+    if (refused_for_eligibility(r)) {
+        hold(cfg, j, body_message(r.body));
+        return false;
     }
     if (r.status == 400 || r.status == 404 || r.status == 403 || r.status == 409) {
         fail(cfg, j, body_message(r.body));
@@ -555,6 +593,9 @@ inline void complete_session(const DriverConfig& cfg, ed::Job& j) {
         return;
     }
     if (r.status == 410 || r.status == 404) { j.session_id.clear(); j.parts_done.clear(); j.bytes_done = 0; j.state = "packaged"; save(cfg, j); return; }
+    // Every evaluation delivered while the parts travelled: the session is
+    // kept and completed once the service takes it.
+    if (refused_for_eligibility(r)) { hold(cfg, j, body_message(r.body)); return; }
     if (r.status == 400 || r.status == 403 || r.status == 409) { fail(cfg, j, body_message(r.body)); return; }
     defer(cfg, j, r.status == 0 ? "Couldn't reach our servers right now." : body_message(r.body));
 }
@@ -562,8 +603,19 @@ inline void complete_session(const DriverConfig& cfg, ed::Job& j) {
 inline void run_upload(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
     if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
     if (j.account_email != email) return;   // another account: untouched
+    if (j.state == "held") {
+        // A new Build for Evaluation of the game replaced it: retired, never
+        // carried (this driver is the held job's only writer).
+        ed::Job newest;
+        if (ed::newest_upload_for_game(cfg.root, j.game_id, newest) && newest.id != j.id) {
+            fail(cfg, j, "Replaced by a newer build.");
+            return;
+        }
+    }
     if (!package_intact(j)) { fail(cfg, j, "The package changed since it was built. Build it again."); return; }
-    if (j.state == "packaged" || j.session_id.empty()) {
+    // A held upload asks again by opening its session: the service resumes
+    // the same one (its parts kept) or answers it verified.
+    if (j.state == "packaged" || j.state == "held" || j.session_id.empty()) {
         if (!open_session(cfg, j)) return;
     }
     if (j.state == "uploading") {
@@ -997,6 +1049,14 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
     // Once per process, signed in: every installed assignment's progress
     // from the service (a Client that just started, a fresh installation).
     static std::set<std::string> synced;
+    // Released (the developer's evaluations changed): every held upload is
+    // asked again in this pass, whatever its wait.
+    bool release = false;
+    {
+        std::lock_guard<std::mutex> lock(controls().m);
+        release = controls().release_held;
+        controls().release_held = false;
+    }
     for (const ed::Job& j : ed::list_jobs(cfg.root)) {
         if (!signed_in || !cfg.after_install || !ed::is_install(j) || j.state != "installed") continue;
         if (!synced.insert(j.assignment_id).second) continue;
@@ -1025,6 +1085,7 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
             pr.next_due_utc = pr.next_due_utc ? std::min(pr.next_due_utc, t + kResumeEverySeconds) : t + kResumeEverySeconds;
             continue;
         }
+        if (release && ed::is_held(j)) j.next_attempt_utc = 0;
         if (j.next_attempt_utc > t && j.next_attempt_utc - t <= kBackoffCap) {
             pr.next_due_utc = pr.next_due_utc ? std::min(pr.next_due_utc, j.next_attempt_utc) : j.next_attempt_utc;
             continue;
