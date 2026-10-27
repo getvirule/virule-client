@@ -1659,6 +1659,47 @@ the evidence delivery in one process) driven by
 `VIRULE_BACKEND/tools/launcher_lifecycle_staging_e2e.mjs` on live staging
 with the real wrapper and the real game.
 
+## The runtime report (2026-10-26, unreleased; `src/client/runtime_report.hpp`)
+
+Why: an evaluator's assignment expires at the concealed four-hour buffer
+past its six-day deadline only when its game is known NOT to be running;
+a running or undetermined game keeps it until Day 7 (owner decision
+2026-10-26; the service's half is `VIRULE_BACKEND/docs/EVALUATIONS.md`
+"Expiry and reassignment"). The service cannot see this computer, so this
+Client, the launcher's authority over what runs, tells it.
+
+WHAT: for every assignment installed here (an install job that is not
+`removing` or `removed`, whose `ticket.json` names its evaluator),
+`POST /v1/assignments/<id>/runtime` `{machine_key, running, timestamp,
+machine_signature}`, `running` the launcher's `busy_scanned` (a fresh
+process scan), signed with THIS MACHINE'S identity (`dev_machine.cred`
+through `machine_identity::sign_hex`, the key the evaluator credential
+binds) over `virule-evaluation-runtime.v1|<assignment>|<evaluator>|
+<machine_key>|<1|0>|<timestamp>`. Under the account's own DPoP call
+(`AccountTransferService::call`), and only for the signed-in evaluator's
+own assignments (the evidence owner decision, `client/evidence_owner.hpp`:
+signed out or another account, nothing is sent).
+
+WHEN: at start (after the launcher's first scan, so a game already running
+reads running), at every change the launcher notes (its change hook wakes
+the thread; a burst settles for two seconds), and every 30 minutes. The
+state is SAMPLED as each report is signed, never queued: a failed post is
+simply a new observation at the next wake or interval, so a stale sample
+can never arrive after a launch.
+
+WHAT IT CANNOT DO: shorten anything. The service treats a report it cannot
+use (none, a running one, one too close to a launch, another machine's
+silence) as UNKNOWN, which keeps the assignment until Day 7; a missing
+launcher reports running. An older Client sends nothing, with the same
+result, so no minimum Client version is needed.
+
+Proof: `tests\runtime_report\run_tests.bat` (the units: the wire byte for
+byte, which assignments, the cycle and its refusals; then
+`tools\runtime_report_test.mjs`, one real cycle's reports sent to the real
+service code in process: accepted for a bound machine and kept as observed,
+refused for an unbound machine, a tampered state, another evaluator; an
+older observation never replacing a newer one).
+
 ## Evaluation evidence delivery (2026-10-14; the service since 0.9.17)
 
 Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 6. Format,

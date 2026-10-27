@@ -63,6 +63,7 @@
 #include "client/takeover.hpp"
 #include "client/transfers.hpp"
 #include "client/launcher.hpp"
+#include "client/runtime_report.hpp"
 #include "client/game_art.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
@@ -273,6 +274,13 @@ void keep_workspace_progress(const std::string& payload, const std::string& answ
 HANDLE g_launcher_stop = nullptr;
 vclient::launcher::Launcher* g_launcher = nullptr;
 
+// THE RUNTIME REPORT (client/runtime_report.hpp; owner decision
+// 2026-10-26): tells the service, signed by this machine, whether each
+// installed assignment's game is running, so an assignment is expired at
+// the concealed buffer only when its game is known closed. Woken by every
+// launcher change; stopped with the launcher.
+vclient::runtime_report::Reporter* g_runtime_report = nullptr;
+
 // SESSION RECOVERY (client/evaluation_recovery.hpp; OWNER RULING 2026-10-22:
 // the wrapper's own recovery, windowless). Checked at Client start and at
 // every game's last process exit.
@@ -307,7 +315,10 @@ void start_launcher() {
     g_launcher_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     la::Config cfg;
     cfg.root = vclient::paths::virule_data_root();
-    cfg.on_change = [] { vclient::evidence::note_change(); };
+    cfg.on_change = [] {
+        vclient::evidence::note_change();
+        if (g_runtime_report) g_runtime_report->wake();
+    };
     cfg.refresh_progress = refresh_assignment_progress;
     cfg.log = [](const std::string& t) { vclient::log::client(t); };
     cfg.stop_event = g_launcher_stop;
@@ -320,6 +331,42 @@ void start_launcher() {
     HANDLE h = CreateThread(nullptr, 0,
         [](LPVOID) -> DWORD {
             g_launcher->run();
+            return 0;
+        },
+        nullptr, 0, nullptr);
+    if (h) CloseHandle(h);
+}
+
+void start_runtime_report() {
+    namespace rr = vclient::runtime_report;
+    using Owner = vclient::evidence::Owner;
+    rr::Config cfg;
+    cfg.root = vclient::paths::virule_data_root();
+    cfg.running = [](const std::string& assignment_id) {
+        // No launcher, no knowledge: report running (the service keeps the
+        // assignment), never a guess that the game is closed.
+        return g_launcher ? g_launcher->busy_scanned(assignment_id) : true;
+    };
+    // The evaluator's own account only (client/evidence_owner.hpp).
+    static vclient::evidence_owner::Resolver owner(vclient::paths::virule_data_root(), &g_transfer_service);
+    cfg.may_report = [](const std::string& assignment_id, const std::string& evaluator_id) {
+        const Owner o = owner.owner(assignment_id, evaluator_id);
+        return o != Owner::SignedOut && o != Owner::OtherAccount;
+    };
+    cfg.machine_key = [] { return vclient::machine_identity::public_key_hex(); };
+    cfg.sign = [](const std::string& m) { return vclient::machine_identity::sign_hex(m); };
+    cfg.post = [](const std::string& path, const std::string& body) {
+        return g_transfer_service.call("POST", path, body, "application/json", {}).status;
+    };
+    cfg.log = [](const std::string& t) { vclient::log::client(t); };
+    cfg.stop_event = g_launcher_stop;
+    g_runtime_report = new rr::Reporter(std::move(cfg));   // lives as long as the process
+    HANDLE h = CreateThread(nullptr, 0,
+        [](LPVOID) -> DWORD {
+            // After the launcher's first scan, so a game already running
+            // (a Client restart) is reported running, never closed.
+            Sleep(vclient::launcher::kDiscoverMs + 1000);
+            g_runtime_report->run();
             return 0;
         },
         nullptr, 0, nullptr);
@@ -1136,6 +1183,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // game folder): it finds any game already running (a Client restart)
     // before anything else looks.
     start_launcher();
+    start_runtime_report();
 
     // Game distribution: Build for Evaluation's upload and the evaluator's
     // install are carried by this process (client/transfers.hpp), whether

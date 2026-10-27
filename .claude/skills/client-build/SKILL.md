@@ -38,6 +38,9 @@ node tools\bridge_test.mjs                # bridge protocol/security matrix
 tests\usage\run_tests.bat                 # usage spool, check-in and update-health units, then the
                                           # check-in end to end against the real service code
                                           # (needs ..\..\VIRULE_BACKEND); starts NO client
+tests\runtime_report\run_tests.bat        # the runtime report (assignment expiry) units, then one real
+                                          # cycle's signed reports against the real service code
+                                          # (needs ..\..\VIRULE_BACKEND); starts NO client
 tests\evidence\run_tests.bat              # evaluation evidence queue units, then the sandboxed
                                           # delivery run (tools\evidence_queue_test.mjs: the
                                           # client's evidence thread in a test exe, loopback
