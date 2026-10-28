@@ -131,7 +131,7 @@ struct Target {
 // The service's canonical instant as epoch seconds; -1 if malformed.
 inline std::int64_t parse_utc(const std::string& s) {
     int y, mo, d, h, mi, se;
-    if (s.size() != 20 || s[19] != 'Z' || std::sscanf(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ", &y, &mo, &d, &h, &mi, &se) != 6) return -1;
+    if (s.size() != 20 || s[19] != 'Z' || sscanf_s(s.c_str(), "%4d-%2d-%2dT%2d:%2d:%2dZ", &y, &mo, &d, &h, &mi, &se) != 6) return -1;
     std::tm tm{};
     tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = se;
     const std::time_t t = _mkgmtime(&tm);
