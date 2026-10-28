@@ -90,6 +90,7 @@
 #include <string>
 #include <vector>
 
+#include "client/assignment_cleanup.hpp"
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
@@ -813,8 +814,9 @@ inline bool carry_over(const fs::path& from, const fs::path& to, std::string& wh
 // THE GAME REMOVES ITSELF (2026-10-21; UIUX.md Assignments: "after a
 // successful report submission and confirmed upload the game removes
 // itself"): only after the report's receipt (evidence_queue run_requests'
-// acknowledgment, main.cpp), never while it runs, and only its own folder
-// (<installs>\<game uuid>, as the job names it).
+// acknowledgment, main.cpp), or once the assignment truly expired
+// (run_install, client/assignment_cleanup.hpp), never while it runs, and
+// only its own folder (<installs>\<game uuid>, as the job names it).
 inline void run_removal(const DriverConfig& cfg, ed::Job& j) {
     if (game_busy(cfg, j.assignment_id)) {
         j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
@@ -834,10 +836,21 @@ inline void run_removal(const DriverConfig& cfg, ed::Job& j) {
     j.error.clear();
     j.attempts = 0;
     save(cfg, j);
-    log(cfg, j.id + " removed after the report was acknowledged");
+    log(cfg, j.id + (vclient::assignment_cleanup::is_expired(cfg.root, j.assignment_id)
+        ? " removed: the assignment expired" : " removed after the report was acknowledged"));
 }
 
 inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
+    // A TRULY EXPIRED ASSIGNMENT installs and updates nothing again (owner
+    // brief 2026-10-28; client/assignment_cleanup.hpp): what is there is
+    // removed instead.
+    if (vclient::assignment_cleanup::is_expired(cfg.root, j.assignment_id)) {
+        j.state = "removing";
+        j.next_attempt_utc = 0;
+        save(cfg, j);
+        log(cfg, j.id + ": the assignment expired; removing instead of installing");
+        return;
+    }
     if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
     if (j.account_email != email) return;
     // Paused: by the bridge's live request, or as the record says (a pause

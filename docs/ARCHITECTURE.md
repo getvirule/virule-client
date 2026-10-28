@@ -1659,7 +1659,7 @@ the evidence delivery in one process) driven by
 `VIRULE_BACKEND/tools/launcher_lifecycle_staging_e2e.mjs` on live staging
 with the real wrapper and the real game.
 
-## The runtime report (2026-10-26, unreleased; `src/client/runtime_report.hpp`)
+## The runtime report (2026-10-26; 0.9.21 with expiry cleanup; `src/client/runtime_report.hpp`)
 
 Why: an evaluator's assignment expires at the concealed four-hour buffer
 past its six-day deadline only when its game is known NOT to be running;
@@ -1687,6 +1687,22 @@ state is SAMPLED as each report is signed, never queued: a failed post is
 simply a new observation at the next wake or interval, so a stale sample
 can never arrive after a launch.
 
+THE ANSWER'S STATE (owner brief 2026-10-28): the service answers `{ok:
+true, state}`, the assignment's own state. `expired` (truly expired, at
+either threshold) starts the MANDATORY CLEANUP below. A wake is also set
+for just after each installed assignment's ABSOLUTE instant (168 h from the
+service-signed `accepted_utc` in `ticket.json`), so an online Client hears
+`expired` at once and no session runs on past it.
+
+THE ABSOLUTE DEADLINE WITHOUT THE SERVICE: when the service cannot be asked
+for an assignment (no answer, signed out, another account, no machine
+identity) and this computer's clock is more than 15 minutes past its
+absolute instant (the service's clock allowance), the Client expires it
+locally (mark source `local`). Whenever the service answers, the service
+decides. The 4-hour expiry is never decided locally; signed out, its
+cleanup waits for the next sign-in (the launch check refuses the game
+meanwhile).
+
 WHAT IT CANNOT DO: shorten anything. The service treats a report it cannot
 use (none, a running one, one too close to a launch, another machine's
 silence) as UNKNOWN, which keeps the assignment until Day 7; a missing
@@ -1699,6 +1715,51 @@ byte, which assignments, the cycle and its refusals; then
 service code in process: accepted for a bound machine and kept as observed,
 refused for an unbound machine, a tampered state, another evaluator; an
 older observation never replacing a newer one).
+
+## Expired assignment cleanup (0.9.21, 2026-10-28; `src/client/assignment_cleanup.hpp`)
+
+Why: a truly expired assignment must not leave the developer's game on the
+evaluator's computer or ever be played again (owner brief 2026-10-28;
+`VIRULE_BACKEND/docs/EVALUATIONS.md` "Expiry and reassignment"; product:
+`v2_mvp/docs/EVALUATION_VIRULE.md` section 8).
+
+THE ORDER, each step repeatable (a crash, a locked file or a restart at any
+point only means the next cycle runs it again; nothing is ever undone):
+
+1. THE MARK, first, because it is the revoke:
+   `evaluator\assignments\<id>\expired.json` (`{version, source:
+   "service"|"local", marked_utc}`, written atomically, never removed). From
+   then the launcher refuses `game_launch` (`code: "expired"`, `This
+   assignment has expired.`) and the transfer driver installs or updates
+   nothing for it (an install job is turned to `removing`).
+2. CLOSE: `Launcher::terminate` terminates every process of the assignment
+   (the wrapper this Client started, any process whose image lives in its
+   game folder) and waits up to five seconds for the exits.
+3. FINALIZE: the session recovery (`evaluation_recovery.hpp` `check_now`)
+   packages a session the close left without a package, while the wrapper
+   binary is still there; the package is delivered as usual and the service
+   keeps it as record only.
+4. REMOVE: only the job's own folder directly inside the installs location
+   and named by its game id (the report removal's guards), and the
+   download's temp file; the job becomes `removed`. Still running or in use:
+   left for the next cycle.
+5. THE DRAFT: `report_draft.json` (the unsubmitted prose and scores) is
+   deleted. The Admin, if open, also forgets its copy and deletes it.
+
+KEPT: the rest of `evaluator\assignments\<id>\` (ticket, ledger, outbox,
+receipts) so evidence on its way still delivers. Nothing outside VIRULE's
+own folders is touched. Each cycle of the runtime report thread first
+resumes every marked cleanup (`marked()`), so a Client started offline or
+after a crash finishes it before anything else, and every launch is
+refused from the mark on. A change bumps the change counter, so an open
+Admin re-reads the service and moves the order to EXPIRED.
+
+Proof: `tests\runtime_report\run_tests.bat` (the answer's state, the local
+cut and its margin, signed out, the wakes; the cleanup: mark first,
+waiting while running, closed then recovered then removed, the draft
+deleted, the evidence folder and the mark kept, repeated with nothing more
+to do, a folder outside the installs location never deleted; the launcher's
+refusal).
 
 ## Evaluation evidence delivery (2026-10-14; the service since 0.9.17)
 

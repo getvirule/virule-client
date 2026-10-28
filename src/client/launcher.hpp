@@ -43,6 +43,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/assignment_cleanup.hpp"
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
@@ -70,6 +71,8 @@ inline constexpr const char* kUpdateRequired = "Update the game first.";
 inline constexpr const char* kMissing = "The installed game is missing. Install it again.";
 inline constexpr const char* kAlreadyRunning = "This game is already running.";
 inline constexpr const char* kNotStarted = "The game could not be started.";
+// The assignment truly expired (client/assignment_cleanup.hpp).
+inline constexpr const char* kExpired = "This assignment has expired.";
 
 // How often processes this Client did not start are looked for.
 inline constexpr DWORD kDiscoverMs = 5000;
@@ -212,6 +215,35 @@ public:
         return result;
     }
 
+    // AN EXPIRED ASSIGNMENT'S GAME IS CLOSED (owner brief 2026-10-28;
+    // client/assignment_cleanup.hpp): every process of the assignment this
+    // Client started or found in its game folder is terminated, and the
+    // exits are waited for (up to five seconds). True when none is left.
+    bool terminate(const std::string& assignment_id) {
+        if (!ev::is_hex32(assignment_id)) return true;
+        std::vector<HANDLE> waits;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            adopt_locked();
+            for (const auto& t : tracked_) {
+                if (t.assignment != assignment_id || !detail::alive(t.process)) continue;
+                HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, t.pid);
+                if (!h) { say("launcher: pid " + std::to_string(t.pid) + " of " + assignment_id + " could not be opened to close it"); continue; }
+                if (TerminateProcess(h, 1)) say("launcher: closed pid " + std::to_string(t.pid) + " of expired " + assignment_id);
+                waits.push_back(h);
+            }
+        }
+        for (HANDLE h : waits) {
+            (void)WaitForSingleObject(h, 5000);
+            CloseHandle(h);
+        }
+        reap();
+        if (wake_) SetEvent(wake_);
+        std::lock_guard<std::mutex> lock(m_);
+        adopt_locked();
+        return !busy_locked(assignment_id);
+    }
+
     // The bridge's launcher_state: every assignment this computer has an
     // install job for, and whether its game is running.
     std::string state_json() {
@@ -281,6 +313,8 @@ private:
     }
 
     bool launchable(const std::string& assignment, const std::string& required, ed::Job& job, std::string& code, std::string& why) {
+        // A truly expired assignment is never launched again.
+        if (vclient::assignment_cleanup::is_expired(cfg_.root, assignment)) { code = "expired"; why = kExpired; return false; }
         if (!ed::install_for_assignment(cfg_.root, assignment, job)) { code = "not_installed"; why = kNotInstalled; return false; }
         if (job.state != "installed") {
             const bool on_disk = !ed::installed_revision(job).empty();

@@ -64,6 +64,7 @@
 #include "client/transfers.hpp"
 #include "client/launcher.hpp"
 #include "client/runtime_report.hpp"
+#include "client/assignment_cleanup.hpp"
 #include "client/game_art.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
@@ -337,6 +338,26 @@ void start_launcher() {
     if (h) CloseHandle(h);
 }
 
+// AN EXPIRED ASSIGNMENT'S MANDATORY CLEANUP (client/assignment_cleanup.hpp;
+// owner brief 2026-10-28): its game closed (the launcher), the session the
+// close interrupted packaged (the recovery), the game removed and the
+// unsubmitted draft deleted; resumed from its mark until nothing is left.
+vclient::assignment_cleanup::Config cleanup_config() {
+    vclient::assignment_cleanup::Config c;
+    c.root = vclient::paths::virule_data_root();
+    c.terminate = [](const std::string& id) { return g_launcher ? g_launcher->terminate(id) : true; };
+    c.recover = [](const std::string& id) { if (g_recovery) (void)g_recovery->check_now(id); };
+    c.busy = [](const std::string& id) {
+        return g_launcher ? g_launcher->busy_scanned(id) : virule::core::evaluation_evidence::session_running(id);
+    };
+    c.log = [](const std::string& t) { vclient::log::client(t); };
+    c.on_change = [] {
+        vclient::evidence::note_change();
+        if (g_transfer_wake) SetEvent(g_transfer_wake);
+    };
+    return c;
+}
+
 void start_runtime_report() {
     namespace rr = vclient::runtime_report;
     using Owner = vclient::evidence::Owner;
@@ -356,7 +377,25 @@ void start_runtime_report() {
     cfg.machine_key = [] { return vclient::machine_identity::public_key_hex(); };
     cfg.sign = [](const std::string& m) { return vclient::machine_identity::sign_hex(m); };
     cfg.post = [](const std::string& path, const std::string& body) {
-        return g_transfer_service.call("POST", path, body, "application/json", {}).status;
+        const vclient::transfers::Reply r = g_transfer_service.call("POST", path, body, "application/json", {});
+        return rr::Answer{ r.status, r.body };
+    };
+    // A TRUE EXPIRY (the service's answer, or the absolute deadline with
+    // the service unreachable): the mark first (the revoke), then the
+    // cleanup, resumed every cycle until it is done.
+    cfg.expired = [](const std::string& id, const std::string& source) {
+        namespace ac = vclient::assignment_cleanup;
+        if (!ac::mark(vclient::paths::virule_data_root(), id, source, std::time(nullptr))) {
+            vclient::log::client("expired assignment " + id + ": the mark could not be written; asked again next cycle");
+            return;
+        }
+        vclient::evidence::note_change();
+        (void)ac::run(cleanup_config(), id);
+    };
+    cfg.resume_cleanups = [] {
+        namespace ac = vclient::assignment_cleanup;
+        const auto c = cleanup_config();
+        for (const auto& id : ac::marked(c.root)) (void)ac::run(c, id);
     };
     cfg.log = [](const std::string& t) { vclient::log::client(t); };
     cfg.stop_event = g_launcher_stop;
