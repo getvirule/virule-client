@@ -219,6 +219,8 @@ const server = http.createServer(async (req, res) => {
   }
   if ((m = /^\/v1\/assignments\/([0-9a-f]{32})\/ticket$/.exec(url)) && req.method === "GET") {
     if (!assignments.has(m[1])) return err(res, 404, "not_found", "No such assignment.");
+    // A game under a security hold (VIRULE_BACKEND security.ts heldRefusal).
+    if (assignments.get(m[1]).held) return err(res, 409, "security_hold", "This game is unavailable while it is reviewed.");
     const t = { version: 1, assignment_id: m[1], evaluator_id: "e".repeat(32), game_uuid: assignments.get(m[1]).game, accepted_utc: "2026-10-20T10:00:00Z", signature: "1".repeat(128) };
     tickets.push(t);
     return json(res, 200, { ticket: t });
@@ -468,6 +470,54 @@ try {
   check("the credential is written for this machine", cred.machine_key === MACHINE && cred.evaluator_id === "e".repeat(32), cred);
   check("the partial download was removed", !fs.existsSync(readJob(JI).temp_path));
   check("the download was fetched in ranges", requestsFor(new RegExp(`download/${d1.id}$`)).length >= 1 && requestsFor(new RegExp(`download/${d1.id}$`)).every((l) => /^bytes=\d+-\d+$/.test(l.headers.range)));
+
+  // ============ 9b. the verified content record (owner brief 2026-10-30 section 3)
+  // The install's clean scan (real Microsoft Defender on this computer) is
+  // recorded beside the job: the revision and every delivered file.
+  const recordPath = path.join(VROOT, "transfers", JI, "verified.txt");
+  const recordOf = () => {
+    try {
+      const lines = fs.readFileSync(recordPath, "utf8").split("\n");
+      const files = new Map(lines.slice(2).filter(Boolean).map((l) => { const [size, mtime, key] = l.split("\t"); return [key, { size: Number(size), mtime }]; }));
+      return { format: lines[0], revision: lines[1], files };
+    } catch { return null; }
+  };
+  const rec1 = recordOf();
+  check("the install records what its clean scan verified: the revision and the delivered launch file",
+    !!rec1 && rec1.format === "virule-verified-content.v1" && rec1.revision === zipRevision && rec1.files.get("game.exe")?.size === 200010 &&
+    readJob(JI).scan_revision_id === zipRevision && readJob(JI).scan_outcome === "clean", { rec1, job: readJob(JI) });
+  // Files the game wrote after it ran (a save) and a changed data file are
+  // NOT verified until they are scanned: the driver verifies them at its
+  // first pass (and whenever the launcher or a game's exit asks), and the
+  // record then takes them in.
+  fs.mkdirSync(path.join(installDir, "Saves"), { recursive: true });
+  fs.writeFileSync(path.join(installDir, "Saves", "slot1.sav"), "save data ".repeat(50));
+  fs.writeFileSync(path.join(installDir, "readme.txt"), "a file the record never saw");
+  killDriver();
+  await startDriver();
+  const verified = await waitFor(() => { const r = recordOf(); return r && r.files.has("saves/slot1.sav") && r.files.has("readme.txt") ? r : null; }, 60000);
+  check("new and changed files are scanned and taken into the record; the delivered file stays vouched for",
+    !!verified && verified.files.get("game.exe")?.mtime === rec1.files.get("game.exe").mtime && readJob(JI).scan_revision_id === zipRevision &&
+    readJob(JI).state === "installed" && !readJob(JI).security_held,
+    { verified: verified && [...verified.files.keys()], scan: readJob(JI).scan_outcome, log: driverOut.split("\n").filter((l) => /installed content/.test(l)) });
+
+  // ===== 9c. a held game is refused BEFORE anything is placed (section 3)
+  const AHX = rid();
+  const GHX = rid();
+  const heldRevision = rid();
+  packages.set(heldRevision, { bytes: zipBytes, sha: sha256(zipBytes), launch: "Game.exe" });
+  assignments.set(AHX, { revision: heldRevision, game: GHX, held: true });
+  const JHX = await run("install", VROOT, AHX, GHX, heldRevision, sha256(zipBytes), String(zipBytes.length), "Game.exe");
+  await signal();
+  const heldDone = await waitFor(() => readJob(JHX)?.state === "failed", 30000);
+  const dHX = [...downloads.values()].find((d) => d.assignment === AHX);
+  check("a game held while it was downloaded and scanned is never placed: failed with the service's sentence, no folder, no package, no completion",
+    !!heldDone && readJob(JHX).error === "This game is unavailable while it is reviewed." && !fs.existsSync(path.join(VROOT, "installs", GHX)) &&
+    !fs.existsSync(readJob(JHX).temp_path) && dHX?.state !== "completed", readJob(JHX));
+  await run("control", VROOT, JSON.stringify({ type: "transfer_control", assignment_id: AHX, action: "retry" }));
+  await signal();
+  await sleep(1500);
+  check("Retry asks again and the hold still refuses it (never placed)", !fs.existsSync(path.join(VROOT, "installs", GHX)), readJob(JHX));
 
   // ========================================= 10. a wrong package fails and tells
   const A2 = rid();

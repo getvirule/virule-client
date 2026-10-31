@@ -245,6 +245,45 @@ bool refresh_assignment_progress(const std::string& assignment_id) {
     return true;
 }
 
+// THE SERVICE'S CURRENT WORD BEFORE EVERY PLAY (owner brief 2026-10-30,
+// "Finalize Malware Scanning" section 3; client/launcher.hpp): the
+// assignment's launch ticket asked for now, bounded like the progress read
+// above. -1 when no account is signed in here (the wrapper's own online
+// check still decides), 0 when the service was not reached.
+vclient::launcher::Config::ServiceWord prelaunch_service_check(const std::string& assignment_id) {
+    namespace acct = vclient::account;
+    namespace ee = virule::core::evaluation_evidence;
+    vclient::launcher::Config::ServiceWord w;
+    if (!ee::is_hex32(assignment_id) || !acct::signed_in()) { w.status = -1; return w; }
+    const std::string path = "/v1/assignments/" + assignment_id + "/ticket";
+    const acct::Endpoint e = acct::api_endpoint();
+    unsigned long status = 0;
+    std::string body;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::wstring h;
+        if (!acct::transfer_headers("GET", path, h, attempt == 1)) { w.status = -1; return w; }
+        // At most 9 s an attempt (two only after a 401): with the folder
+        // walk it stays inside the Admin host's 30 s wait for game_launch
+        // (admin_host.cpp LaunchEvaluationGame), so the host never reports
+        // the Client unreachable while the Client goes on to launch.
+        vclient::http::Timeouts t;
+        t.resolve_ms = 2000;
+        t.connect_ms = 2000;
+        t.send_ms = 2000;
+        t.receive_ms = 3000;
+        status = 0;
+        body.clear();
+        (void)vclient::http::request(L"GET", e.host.c_str(), e.port, e.secure, acct::widen(path), h, "", 64 * 1024, status, body, t);
+        if (status != 401) break;
+    }
+    w.status = static_cast<int>(status);
+    if (status != 200 && status != 0) {
+        w.code = vclient::transfers::detail::body_code(body);        // {"error":{"code","message"}}
+        w.message = vclient::transfers::detail::body_message(body);
+    }
+    return w;
+}
+
 // THE EVALUATOR'S WORKSPACE READ, RELAYED (2026-10-22): the Admin's own
 // GET /v1/assignments passes through this Client (account_api); every
 // order's progress in its answer is kept (forward only, store_progress), so
@@ -321,12 +360,22 @@ void start_launcher() {
         if (g_runtime_report) g_runtime_report->wake();
     };
     cfg.refresh_progress = refresh_assignment_progress;
+    cfg.service_check = prelaunch_service_check;
+    cfg.request_verification = [](const std::string& assignment_id) {
+        vclient::transfers::request_verification(assignment_id);
+        if (g_transfer_wake) SetEvent(g_transfer_wake);
+    };
     cfg.log = [](const std::string& t) { vclient::log::client(t); };
     cfg.stop_event = g_launcher_stop;
     // The game's last process exited: a finished session left without a
     // package is recovered (client/evaluation_recovery.hpp).
     cfg.on_stopped = [](const std::string& assignment_id) {
         if (g_recovery) (void)g_recovery->check(assignment_id);
+        // What the session wrote in the game folder (its saves, the
+        // wrapper's log) is verified now, so the next Play needs no wait
+        // (client/launcher.hpp, transfers.hpp verify_installed).
+        vclient::transfers::request_verification(assignment_id);
+        if (g_transfer_wake) SetEvent(g_transfer_wake);
     };
     g_launcher = new la::Launcher(std::move(cfg));   // lives as long as the process
     HANDLE h = CreateThread(nullptr, 0,

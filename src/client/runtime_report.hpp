@@ -74,6 +74,7 @@
 #endif
 #include <windows.h>
 
+#include "client/security_marks.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 
@@ -221,6 +222,12 @@ public:
                     if (a.status == 200) {
                         ++accepted;
                         answered = true;
+                        // SECURITY (2026-10-30, client/security_marks.hpp): the
+                        // service's hold and protection, kept until it says otherwise.
+                        if (!security_marks::set(cfg_.root, t.assignment_id, security_marks::kHold, security_marks::says(a.body, "security_hold")) ||
+                            !security_marks::set(cfg_.root, t.assignment_id, security_marks::kProtected, security_marks::says(a.body, "security_protected"))) {
+                            say("runtime report: " + t.assignment_id + " security state could not be recorded");
+                        }
                         if (says_expired(a.body)) {
                             say("runtime report: " + t.assignment_id + " expired (service)");
                             if (cfg_.expired) cfg_.expired(t.assignment_id, "service");
@@ -241,7 +248,10 @@ public:
 
     // The absolute deadline passed by more than the local margin (the
     // local clock), for an assignment whose acceptance is known.
+    // Never for an assignment the service PROTECTED after a security
+    // detection (client/security_marks.hpp): its expiry is administrative.
     bool local_cut_due(const Target& t) const {
+        if (security_marks::has(cfg_.root, t.assignment_id, security_marks::kProtected)) return false;
         return t.accepted > 0 && (std::int64_t)cfg_.now() > t.accepted + kAbsoluteSeconds + kLocalMarginSeconds;
     }
 

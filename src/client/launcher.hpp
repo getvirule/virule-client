@@ -23,6 +23,24 @@
 // a timer standing in for a lifecycle; the periodic scan only DISCOVERS
 // processes this Client did not start.
 //
+// BEFORE EVERY PLAY (owner brief 2026-10-30, "Finalize Malware Scanning",
+// section 3), in this order, each failing closed:
+//   1. THE SERVICE'S CURRENT WORD: the assignment's launch ticket is asked
+//      for now (GET /v1/assignments/<id>/ticket, bounded), so a security
+//      hold placed anywhere refuses Play here at once (409 security_hold),
+//      never only at the next 30-minute runtime report; the hold marker
+//      follows the answer. No answer refuses Play. Signed out, the Client
+//      cannot ask; the wrapper's own online check (below) still decides.
+//   2. THE CONTENT IS WHAT WAS SCANNED: the installed folder is compared
+//      with the record of its last clean scan (virule/core/
+//      verified_content.hpp); anything new or changed is scanned first by
+//      the transfer driver (asked now), and Play waits until it is.
+//   3. THE WRAPPER'S OWN ONLINE CHECK (v2_mvp evaluation_auth.hpp), signed
+//      by the service at every launch on every path, the double-click and
+//      the post-game Play included: it refuses a held game too
+//      (VIRULE_BACKEND authorize.ts), so a stale local answer never
+//      launches anything.
+//
 // ONE LAUNCH AT A TIME PER ASSIGNMENT. `launch` refuses while the
 // assignment is running or a launch of it is already being started, while
 // its install job is anything but installed (an update, a removal), and
@@ -44,9 +62,12 @@
 #include <vector>
 
 #include "client/assignment_cleanup.hpp"
+#include "client/security_marks.hpp"
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
+#include "virule/core/malware_scan.hpp"
+#include "virule/core/verified_content.hpp"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -63,6 +84,8 @@ namespace ed = virule::core::evaluation_distribution;
 namespace ev = virule::core::evaluation_evidence;
 namespace js = vclient::json_scan;
 namespace fs = std::filesystem;
+namespace ms = virule::core::malware_scan;
+namespace vc = virule::core::verified_content;
 
 // The working sentences of a refused launch (the Admin's controls' note).
 inline constexpr const char* kNotInstalled = "This game isn't installed yet.";
@@ -73,6 +96,17 @@ inline constexpr const char* kAlreadyRunning = "This game is already running.";
 inline constexpr const char* kNotStarted = "The game could not be started.";
 // The assignment truly expired (client/assignment_cleanup.hpp).
 inline constexpr const char* kExpired = "This assignment has expired.";
+// LOCAL MALWARE SCANNING (owner briefs 2026-10-30; WORKING WORDING, PENDING
+// OWNER DECISION): the game is held after a detection (here or, as the
+// service says, anywhere), or its installed content is not verified yet
+// (normal progress names no antivirus: "Verifying", as the meters read).
+// A scan that cannot run here says why (malware_scan.hpp
+// unverified_sentence).
+inline constexpr const char* kSecurityHold = "This game is unavailable while it is reviewed.";
+inline constexpr const char* kVerifying = "Verifying game files. Try again in a moment.";
+// The service could not be asked before Play (the approved connection
+// sentence, as transfers.hpp states it).
+inline constexpr const char* kOffline = "Couldn't reach our servers right now.";
 
 // How often processes this Client did not start are looked for.
 inline constexpr DWORD kDiscoverMs = 5000;
@@ -91,6 +125,14 @@ struct Config {
     // recovery check (client/evaluation_recovery.hpp). Called on the monitor
     // thread; must not block.
     std::function<void(const std::string& assignment_id)> on_stopped;
+    // THE SERVICE'S CURRENT WORD before Play (header, step 1): the status of
+    // GET /v1/assignments/<id>/ticket (0 = not reached, -1 = not signed in
+    // here), its error code and message. Bounded; called outside the lock.
+    struct ServiceWord { int status = 0; std::string code, message; };
+    std::function<ServiceWord(const std::string& assignment_id)> service_check;
+    // Ask the transfer driver to verify the assignment's installed content
+    // now (transfers.hpp request_verification + its wake).
+    std::function<void(const std::string& assignment_id)> request_verification;
 };
 
 namespace detail {
@@ -166,6 +208,9 @@ public:
         std::string code, why;
         std::string result;
         bool started = false;
+        // Steps 1 and 2 of the header, outside the lock (a service call and
+        // a walk of the game folder must never stall busy() or the monitor).
+        if (!before_play(assignment, code, why)) return refusal(code, why);
         {
             std::lock_guard<std::mutex> lock(m_);
             adopt_locked();
@@ -322,6 +367,19 @@ private:
             why = on_disk ? kUpdating : kNotInstalled;
             return false;
         }
+        // NEVER UNTRUSTED CONTENT (2026-10-30): a game this computer's scan
+        // blocked, a game the service holds (client/security_marks.hpp, kept
+        // current by before_play and the runtime report; the wrapper's own
+        // online check refuses a held game too), or content not scanned
+        // clean (installed before scanning existed: the transfer driver
+        // scans it, then Play is offered).
+        if (job.security_held || security_marks::has(cfg_.root, assignment, security_marks::kHold)) {
+            code = "security_hold"; why = kSecurityHold; return false;
+        }
+        if (job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) {
+            not_verified(job, code, why);
+            return false;
+        }
         if (!required.empty() && ev::is_hex32(required) && ed::installed_revision(job) != required) {
             code = "update_required";
             why = kUpdateRequired;
@@ -333,6 +391,56 @@ private:
             code = "missing";
             why = kMissing;
             return false;
+        }
+        return true;
+    }
+
+    // Say what is true: a scan that cannot run here is not "verifying".
+    static void not_verified(const ed::Job& job, std::string& code, std::string& why) {
+        code = "not_scanned";
+        if (job.scan_outcome == "unavailable") {
+            const ms::Availability a = ms::scanning_availability();
+            if (!a.usable) { why = ms::unverified_sentence(ms::Outcome::unavailable, a.why, ""); return; }
+        }
+        why = kVerifying;
+    }
+
+    // THE CHECKS BEFORE EVERY PLAY THAT TAKE TIME (header, steps 1 and 2).
+    bool before_play(const std::string& assignment, std::string& code, std::string& why) {
+        // Already up: the launch below says so (a running game writes its
+        // folder; that is verified after it exits, not reported as Verifying).
+        if (busy_scanned(assignment)) return true;
+        // The refusals this computer already knows keep their own sentences
+        // (expired, not installed, being updated): launchable() gives them,
+        // never a service answer in their place.
+        {
+            ed::Job local;
+            if (vclient::assignment_cleanup::is_expired(cfg_.root, assignment) ||
+                !ed::install_for_assignment(cfg_.root, assignment, local) || local.state != "installed") return true;
+        }
+        if (cfg_.service_check) {
+            const Config::ServiceWord w = cfg_.service_check(assignment);
+            if (w.status == 200) {
+                if (!security_marks::set(cfg_.root, assignment, security_marks::kHold, false)) say("launch: the hold marker of " + assignment + " could not be cleared");
+            } else if (w.status == 409 && w.code == "security_hold") {
+                (void)security_marks::set(cfg_.root, assignment, security_marks::kHold, true);
+                code = "security_hold"; why = kSecurityHold; return false;
+            } else if (w.status == 0) {
+                code = "offline"; why = kOffline; return false;
+            } else if (w.status != -1) {
+                // The service refused the launch ticket (the assignment is no
+                // longer active, not this account's): its own sentence.
+                say("launch: the service refused the ticket of " + assignment + " (" + std::to_string(w.status) + " " + w.code + ")");
+                code = "not_authorized"; why = w.message.empty() ? std::string(kNotStarted) : w.message; return false;
+            }
+        }
+        ed::Job job;
+        if (!ed::install_for_assignment(cfg_.root, assignment, job) || job.state != "installed") return true;   // launchable() says why
+        if (job.security_held || job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) return true;
+        if (!vc::verified_now(cfg_.root, job.id, path_of(job.install_dir), ed::installed_revision(job))) {
+            if (cfg_.request_verification) cfg_.request_verification(assignment);
+            say("launch: the installed content of " + assignment + " changed since its last scan; verifying first");
+            code = "not_scanned"; why = kVerifying; return false;
         }
         return true;
     }

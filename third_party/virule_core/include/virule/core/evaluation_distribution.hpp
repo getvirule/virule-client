@@ -28,7 +28,13 @@
 // (the newest `upload` job of a game is the game's delivery); one install
 // job per assignment.
 //
-// UPLOAD STATES   building -> packaging -> packaged -> uploading -> registering -> done | failed
+// UPLOAD STATES   scanning_source -> building -> packaging -> scanning_package -> packaged
+//                              -> uploading -> registering -> done | failed
+//                 (2026-10-30, owner brief: LOCAL MALWARE SCANNING, malware_scan.hpp: the
+//                              original game is scanned before the build and the built
+//                              package before it is handed over; only a clean scan goes
+//                              on, anything else fails the job with `scan_outcome` set,
+//                              and a detection carries an `incident` the Client reports)
 //                 packaged | registering -> held -> packaged (2026-10-22: the service
 //                              refused the upload because none of the game's purchased
 //                              evaluations is still owed, or the game was never bought
@@ -38,7 +44,12 @@
 //                              for a held job, and the Client, the held job's only
 //                              writer, retires it (failed) once a newer upload job of
 //                              the game exists)
-// INSTALL STATES  queued -> downloading (paused) -> verifying -> extracting -> installed | failed
+// INSTALL STATES  queued -> downloading (paused) -> verifying -> extracting -> scanning -> installed | failed
+//                 (2026-10-30: the delivered build is scanned after extraction, before it is
+//                              placed; a detection, or the antivirus removing a file at any
+//                              stage, fails the job for good (`security_held`: Install again
+//                              refuses that revision) and reports an `incident`; the service's
+//                              `security_hold` refusal fails it the same way, never retried)
 //                 installed -> queued (an UPDATE: the same job moves on to a newer revision;
 //                              the installed revision stays on disk until the verified
 //                              replacement is swapped in, and the game's own files that
@@ -169,6 +180,19 @@ struct Job {
     // a previous installation). Empty on a record written before it existed:
     // installed_revision() reads it from the state.
     std::string installed_revision_id;
+    // LOCAL MALWARE SCANNING (2026-10-30, malware_scan.hpp). The outcome of
+    // the last scan of this job's content ("" = not scanned); for an install,
+    // the revision whose delivered content scanned clean (a job installed
+    // before scanning existed has none and is scanned before its next Play).
+    std::string scan_outcome;
+    std::string scan_revision_id;
+    // A detection or removal to report to the service (a JSON object as
+    // text; "" = none), and whether the service has recorded it.
+    std::string incident;
+    bool incident_reported = false;
+    // The service holds this game, or this computer's scan blocked this
+    // revision: no retry, Install again or Play of it.
+    bool security_held = false;
 };
 
 // The revision installed on this computer for an install job: the recorded
@@ -241,6 +265,11 @@ inline std::string job_json(const Job& j) {
     o += ",\"temp_path\":" + quote(j.temp_path);
     o += std::string(",\"paused\":") + (j.paused ? "true" : "false");
     o += ",\"installed_revision_id\":" + quote(j.installed_revision_id);
+    o += ",\"scan_outcome\":" + quote(j.scan_outcome);
+    o += ",\"scan_revision_id\":" + quote(j.scan_revision_id);
+    o += ",\"incident\":" + quote(j.incident);
+    o += std::string(",\"incident_reported\":") + (j.incident_reported ? "true" : "false");
+    o += std::string(",\"security_held\":") + (j.security_held ? "true" : "false");
     return o + "}\n";
 }
 
@@ -296,6 +325,12 @@ inline bool parse_job(std::string_view text, Job& j) {
     bool paused = false;
     j.paused = js::get_bool(text, "paused", paused) && paused;
     j.installed_revision_id = js::opt_string(text, "installed_revision_id");
+    j.scan_outcome = js::opt_string(text, "scan_outcome");
+    j.scan_revision_id = js::opt_string(text, "scan_revision_id");
+    j.incident = js::opt_string(text, "incident");
+    bool reported = false, held = false;
+    j.incident_reported = js::get_bool(text, "incident_reported", reported) && reported;
+    j.security_held = js::get_bool(text, "security_held", held) && held;
     return true;
 }
 

@@ -94,6 +94,8 @@
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
+#include "virule/core/malware_scan.hpp"
+#include "virule/core/verified_content.hpp"
 #include "miniz/miniz.h"
 
 #if defined(_WIN32)
@@ -114,6 +116,8 @@ namespace ed = virule::core::evaluation_distribution;
 namespace ev = virule::core::evaluation_evidence;
 namespace js = vclient::json_scan;
 namespace fs = std::filesystem;
+namespace ms = virule::core::malware_scan;
+namespace vc = virule::core::verified_content;
 
 using Log = std::function<void(const std::string&)>;
 
@@ -137,6 +141,9 @@ inline std::int64_t backoff_seconds(std::int64_t failures) {
 }
 // A stalled Admin-side stage is resumed headless at most this often.
 inline constexpr std::int64_t kResumeEverySeconds = 300;
+// An installed game whose content was never scanned (installed before
+// scanning existed) is scanned again at most this often while not clean.
+inline constexpr std::int64_t kRescanEverySeconds = 1800;
 inline constexpr DWORD kPollWithoutWakeMs = 60000;
 inline constexpr DWORD kPausedPollMs = 60000;
 
@@ -240,9 +247,19 @@ struct Controls {
     std::mutex m;
     std::set<std::string> paused;     // assignment ids
     std::set<std::string> retry;      // assignment ids whose failed install is tried again
+    std::set<std::string> verify;     // installed games whose content is verified again now
     bool release_held = false;        // ask the service again for every held upload, now
 };
 inline Controls& controls() { static Controls c; return c; }
+
+// THE INSTALLED CONTENT IS VERIFIED AGAIN (owner brief 2026-10-30 section 3;
+// virule/core/verified_content.hpp): asked by the launcher when Play found
+// files the record does not vouch for, and when the game's last process
+// exited (its saves, its log). The caller wakes the driver.
+inline void request_verification(const std::string& assignment_id) {
+    std::lock_guard<std::mutex> lock(controls().m);
+    controls().verify.insert(assignment_id);
+}
 
 // The developer's evaluations changed (main.cpp: their view read through
 // this Client answered something new, as a purchase does): every held
@@ -310,7 +327,7 @@ inline std::string control(const std::string& payload, const fs::path& root) {
             j.state = "paused"; j.paused = true; j.updated_utc = utc_now(); ed::write_job(root, j);
         } else if (action == "resume" && j.state == "paused") {
             j.state = "downloading"; j.paused = false; j.updated_utc = utc_now(); ed::write_job(root, j);
-        } else if (action == "retry" && j.state == "failed") {
+        } else if (action == "retry" && j.state == "failed" && !j.security_held) {
             j.state = "queued"; j.paused = false; j.error.clear(); j.attempts = 0; j.next_attempt_utc = 0;
             j.updated_utc = utc_now(); ed::write_job(root, j);
         }
@@ -394,6 +411,75 @@ inline bool stopping(const DriverConfig& cfg) {
     return cfg.stop_event && WaitForSingleObject(cfg.stop_event, 0) == WAIT_OBJECT_0;
 }
 
+// ------------------------------------------------ local malware scanning ----
+// (owner brief 2026-10-30; virule/core/malware_scan.hpp). The evaluator's
+// delivered build is scanned after extraction and before it is placed; the
+// antivirus acting on the package or the game files at ANY stage (Windows
+// refusing a file as infected, errno 225/226, or Defender's own record naming
+// the path) is a security outcome, never a retry. A file that merely went
+// missing or changed with NO such evidence is not one: a download is retried
+// (defer) and a scan reads `incomplete`. A detection holds that revision on this computer
+// for good (`security_held`), fails the job, tells the service the download
+// was refused, and reports an INCIDENT the service records (which holds the
+// game for every evaluator). Nothing here ever runs the game's files.
+
+// The sentences (WORKING WORDING, PENDING OWNER DECISION). A detection
+// names Windows Security; the rest is malware_scan.hpp unverified_sentence
+// (owner brief 2026-10-30 section 2: verification could not be completed,
+// enable Defender where that is the remedy, never an instruction about
+// another antivirus).
+inline constexpr const char* kInstallThreat = "Windows Security found a threat in this game, so it was not installed.";
+
+inline std::string scan_sentence(const ms::Result& r) {
+    if (ms::is_incident(r.outcome)) return kInstallThreat;
+    return ms::unverified_sentence(r.outcome, r.why_unavailable, "Install");
+}
+
+/** Defender recorded acting on one of `paths` since `since_utc`. */
+inline bool antivirus_acted(const std::vector<fs::path>& paths, const std::string& since_utc, std::vector<ms::Threat>& seen) {
+    return ms::detail::defender_events(paths, since_utc, seen) && !seen.empty();
+}
+
+/** A scan that is not clean ends the install: VIRULE's own temporary files
+ *  go (the antivirus already holds what it took), an incident is kept for
+ *  the service, and the job fails with one sentence. */
+inline void scan_failed(const DriverConfig& cfg, ed::Job& j, const ms::Result& r, const std::string& operation,
+                        const fs::path& temp, const fs::path& staging) {
+    std::error_code ec;
+    if (!staging.empty()) fs::remove_all(staging, ec);
+    j.scan_outcome = ms::outcome_name(r.outcome);
+    if (ms::is_incident(r.outcome)) {
+        fs::remove(temp, ec);
+        j.security_held = true;
+        j.incident = ms::incident_json(r, ed::random_hex32(), operation, "", j.revision_id);
+        j.incident_reported = false;
+        if (!j.download_id.empty()) {
+            (void)cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/failed",
+                "{\"reason\":\"security\"}", "application/json", {});
+        }
+        j.bytes_done = 0;
+    }
+    log(cfg, j.id + " scan " + j.scan_outcome + " (" + operation + "): " + r.detail.substr(0, 400));
+    fail(cfg, j, scan_sentence(r));
+}
+
+/** The removal Defender recorded (or a refused file), as a scan result. */
+inline ms::Result removal_of(const std::vector<ms::Threat>& seen, const std::string& path, const std::string& detail_text) {
+    ms::Result r = ms::removed_by_antivirus(path, detail_text);
+    if (!seen.empty()) r.threats = seen;
+    return r;
+}
+
+/** Another job of this assignment held this revision (this computer's own
+ *  detection): it is never downloaded or installed here again. */
+inline bool revision_held_here(const fs::path& root, const std::string& assignment_id, const std::string& revision_id) {
+    for (const ed::Job& o : ed::list_jobs(root)) {
+        if (ed::is_install(o) && o.assignment_id == assignment_id && o.security_held && o.revision_id == revision_id) return true;
+    }
+    return false;
+}
+
+
 inline std::string body_message(const std::string& body) {
     std::string m;
     (void)js::find_string_in(body, 0, body.size(), "message", m);
@@ -403,6 +489,22 @@ inline std::string body_code(const std::string& body) {
     std::string c;
     (void)js::find_string_in(body, 0, body.size(), "code", c);
     return c;
+}
+
+/** Report a recorded incident to the service, once: the developer's on the
+ *  game, the evaluator's on the assignment. A refusal the service will
+ *  always give (4xx but 429) is logged and not sent again. */
+inline void report_incident(const DriverConfig& cfg, ed::Job& j) {
+    const std::string route = ed::is_upload(j)
+        ? "/v1/evaluations/games/" + j.game_uuid + "/security/incident"
+        : "/v1/assignments/" + j.assignment_id + "/security/incident";
+    const Reply r = cfg.service->call("POST", route, j.incident, "application/json", {});
+    if (r.status == 200 || r.status == 201 || (r.status >= 400 && r.status < 500 && r.status != 429)) {
+        if (r.status >= 400) log(cfg, j.id + " incident refused by the service (" + std::to_string(r.status) + "): " + body_message(r.body));
+        j.incident_reported = true;
+        save(cfg, j);
+        log(cfg, j.id + " incident reported");
+    }
 }
 
 // The service will not take this upload yet (UPLOAD ELIGIBILITY): kept as it
@@ -701,14 +803,21 @@ inline fs::path credential_path(const fs::path& root) { return root / L"security
 // says whether a failure is the service being unreachable or answering
 // badly (the install defers and tries again) or this computer's (no
 // identity: the install fails).
-struct ChainOutcome { bool ok = false; bool retryable = true; std::string why; };
+struct ChainOutcome { bool ok = false; bool retryable = true; std::string why; std::string code; };
 
 inline ChainOutcome ensure_launch_chain(const DriverConfig& cfg, const std::string& assignment_id,
                                         const std::string& install_dir, const std::string& launch_exe,
                                         const std::string& revision_id) {
     ChainOutcome r;
     const Reply t = cfg.service->call("GET", "/v1/assignments/" + assignment_id + "/ticket", "", "", {});
-    if (t.status != 200) { r.why = t.status == 0 ? "Couldn't reach our servers right now." : body_message(t.body); return r; }
+    if (t.status != 200) {
+        r.why = t.status == 0 ? "Couldn't reach our servers right now." : body_message(t.body);
+        r.code = t.status == 0 ? std::string() : body_code(t.body);
+        // A GAME UNDER A SECURITY HOLD (VIRULE_BACKEND security.ts) is a
+        // final answer until it is released, never a retry.
+        if (t.status == 409 && r.code == "security_hold") r.retryable = false;
+        return r;
+    }
     std::string_view ticket_raw;
     if (!ev::json::member(t.body, "ticket", ticket_raw)) { r.why = "The service answered without a ticket."; return r; }
     std::string ticket(ticket_raw);
@@ -760,15 +869,6 @@ inline ChainOutcome ensure_launch_chain(const DriverConfig& cfg, const std::stri
     if (!ev::write_file_atomic(credential_path(cfg.root), cred_doc)) { r.why = "The credential could not be written."; return r; }
     r.ok = true;
     return r;
-}
-
-// The install's step: a failure defers (the service) or fails (this
-// computer) the job.
-inline bool write_launch_chain(const DriverConfig& cfg, ed::Job& j) {
-    const ChainOutcome r = ensure_launch_chain(cfg, j.assignment_id, j.install_dir, j.launch_exe, j.revision_id);
-    if (r.ok) return true;
-    if (r.retryable) defer(cfg, j, r.why); else fail(cfg, j, r.why);
-    return false;
 }
 
 // "verify" (control): an INSTALLED assignment's chain made current; the
@@ -840,6 +940,78 @@ inline void run_removal(const DriverConfig& cfg, ed::Job& j) {
         ? " removed: the assignment expired" : " removed after the report was acknowledged"));
 }
 
+/** THE INSTALLED CONTENT, VERIFIED (owner decisions 2026-10-30,
+ *  VIRULE/docs/specs/evaluation-security.md "Scan cadence";
+ *  virule/core/verified_content.hpp plan_scan). What the record of the last
+ *  clean scan does not vouch for is scanned where it stands, before the
+ *  launcher offers Play: ONLY the new or changed files (the game's saves,
+ *  the wrapper's log, an executable it left behind; a new folder of only new
+ *  files as one target), with the wrapper's original copied out beside them
+ *  (never run) only when the launch file changed. Unchanged content is
+ *  never scanned again. The whole folder is scanned only when there is no
+ *  record of this revision (content installed before scanning existed, an
+ *  update, a replacement build). Clean takes the scanned files into the record; a
+ *  detection holds the revision here and reports an incident (the antivirus
+ *  took what it found); anything else leaves them unverified, so Play stays
+ *  refused, and is tried again at the next request. Never while it runs. */
+inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
+    const std::string revision = ed::installed_revision(j);
+    const fs::path dir = path_of(j.install_dir);
+    std::error_code ec;
+    if (revision.empty() || !fs::is_directory(dir, ec) || j.security_held) return;
+    vc::Record prior;
+    const bool have = j.scan_revision_id == revision && vc::read_record(vc::record_path(cfg.root, j.id), prior);
+    const vc::Unverified u = vc::unverified(dir, have ? &prior : nullptr, revision);
+    if (!u.whole && u.files.empty()) {
+        if (j.scan_revision_id != revision) { j.scan_revision_id = revision; save(cfg, j); }
+        return;
+    }
+    const vc::ScanPlan plan = vc::plan_scan(u, j.launch_exe);
+    const bool whole = plan.whole;
+    const fs::path scan_dir = path_of(j.install_root) / L".virule-staging" / (dir.filename().wstring() + L".scan");
+    fs::remove_all(scan_dir, ec);
+    const std::string since = ms::detail::utc_now();
+    const auto keep_going = [&]() { return !stopping(cfg) && !game_busy(cfg, j.assignment_id); };
+    ms::Result r;
+    if (whole) {
+        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+        if (!x.ok) {
+            if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
+            else { r.outcome = ms::Outcome::error; r.detail = x.why; }
+        } else {
+            r = ms::scan({dir, scan_dir}, since, keep_going, {});
+        }
+    } else if (plan.launch_changed) {
+        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+        if (!x.ok) {
+            if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
+            else { r.outcome = ms::Outcome::error; r.detail = x.why; }
+        } else {
+            std::vector<fs::path> targets = vc::paths_of(dir, plan.targets);
+            targets.push_back(scan_dir);
+            r = ms::scan(targets, since, keep_going, {});
+        }
+    } else {
+        r = ms::scan(vc::paths_of(dir, plan.targets), since, keep_going, {});
+    }
+    fs::remove_all(scan_dir, ec);
+    j.scan_outcome = ms::outcome_name(r.outcome);
+    if (r.outcome == ms::Outcome::clean) {
+        const vc::Record next = vc::after_clean_scan(dir, have ? &prior : nullptr, revision, u.now,
+                                                     whole ? std::vector<std::string>{} : u.files);
+        if (vc::write_record(vc::record_path(cfg.root, j.id), next)) j.scan_revision_id = revision;
+        else log(cfg, j.id + " the verified content record could not be written");
+    } else if (ms::is_incident(r.outcome)) {
+        j.security_held = true;
+        j.incident = ms::incident_json(r, ed::random_hex32(), "launch", "", revision);
+        j.incident_reported = false;
+        j.error = kInstallThreat;
+    }
+    save(cfg, j);
+    log(cfg, j.id + " installed content " + (whole ? "scan " : "verification of " + std::to_string(u.files.size()) + " file(s) ") +
+        j.scan_outcome + ": " + r.detail.substr(0, 300));
+}
+
 inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
     // A TRULY EXPIRED ASSIGNMENT installs and updates nothing again (owner
     // brief 2026-10-28; client/assignment_cleanup.hpp): what is there is
@@ -869,6 +1041,9 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         const Reply a = cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download", "{}", "application/json", {});
         if (a.status != 200) {
             if (a.status == 409 && body_code(a.body) == "no_build") { fail(cfg, j, body_message(a.body)); return; }
+            // THE GAME IS HELD after a security detection (VIRULE_BACKEND
+            // security.ts): a final answer until it is released, never retried.
+            if (a.status == 409 && body_code(a.body) == "security_hold") { fail(cfg, j, body_message(a.body)); return; }
             if (a.status == 404 || a.status == 403) { fail(cfg, j, body_message(a.body)); return; }
             defer(cfg, j, a.status == 0 ? "Couldn't reach our servers right now." : body_message(a.body));
             return;
@@ -886,6 +1061,8 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             defer(cfg, j, "The service answered with a malformed download.");
             return;
         }
+        // A revision this computer's own scan blocked is never fetched again.
+        if (revision_held_here(cfg.root, j.assignment_id, rid)) { j.security_held = true; j.revision_id = rid; fail(cfg, j, kInstallThreat); return; }
         if (rid != j.revision_id || sha != j.package_sha256) {
             // The service names another revision than this job was made for
             // (the developer replaced the build before the download began):
@@ -908,7 +1085,17 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         save(cfg, j);
         fs::create_directories(temp.parent_path(), ec);
         FILE* out = nullptr;
-        if (_wfopen_s(&out, temp.wstring().c_str(), L"ab") != 0 || !out) { defer(cfg, j, "The download could not be written."); return; }
+        if (_wfopen_s(&out, temp.wstring().c_str(), L"ab") != 0 || !out) {
+            // Real-time protection refused the package: a security outcome.
+            if (ms::detail::blocked_by_antivirus_errno()) {
+                std::vector<ms::Threat> seen;
+                (void)antivirus_acted({temp}, j.created_utc, seen);
+                scan_failed(cfg, j, removal_of(seen, j.temp_path, "Windows refused the downloaded package."), "download", temp, {});
+                return;
+            }
+            defer(cfg, j, "The download could not be written.");
+            return;
+        }
         bool stopped = false;
         while (j.bytes_done < j.package_bytes) {
             if (stopping(cfg) || is_paused(j.assignment_id)) { stopped = true; break; }
@@ -939,7 +1126,20 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
     }
     if (j.state == "verifying") {
         std::string sha;
-        if (!sha256_file_hex(temp, sha, [&]() { return !stopping(cfg); })) { if (stopping(cfg)) return; defer(cfg, j, "The download could not be verified."); return; }
+        const bool hashed = sha256_file_hex(temp, sha, [&]() { return !stopping(cfg); });
+        if (!hashed && stopping(cfg)) return;
+        // THE ANTIVIRUS TOOK OR REFUSED THE PACKAGE (a stored zip with a
+        // threat is removed whole), as Defender's record says: a security
+        // outcome, never a re-download. A package that merely went missing
+        // with no such record (a cleanup, the person) is retried as before.
+        {
+            std::vector<ms::Threat> seen;
+            if (antivirus_acted({temp}, j.created_utc, seen)) {
+                scan_failed(cfg, j, removal_of(seen, j.temp_path, "The downloaded package was removed or refused by the antivirus."), "download", temp, {});
+                return;
+            }
+        }
+        if (!hashed) { defer(cfg, j, "The download could not be verified."); return; }
         if (sha != j.package_sha256) {
             (void)cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/failed",
                 "{\"reason\":\"integrity\"}", "application/json", {});
@@ -952,7 +1152,8 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         j.state = "extracting";
         save(cfg, j);
     }
-    if (j.state == "extracting") {
+    // A scan interrupted mid-way starts again from the verified package.
+    if (j.state == "extracting" || j.state == "scanning") {
         const fs::path dst = path_of(j.install_dir);
         const fs::path staging = path_of(j.install_root) / L".virule-staging" / dst.filename();
         const bool updating = fs::exists(dst, ec);
@@ -967,17 +1168,62 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         fs::remove_all(staging, ec);
         fs::create_directories(staging, ec);
         std::string why;
+        const std::string extract_since = ms::detail::utc_now();
         if (!extract_zip(temp, staging, why, [&]() { return !stopping(cfg); })) {
+            if (stopping(cfg)) { fs::remove_all(staging, ec); return; }
+            // The antivirus refused or took a file while it was written out.
+            std::vector<ms::Threat> seen;
+            if (antivirus_acted({staging, temp}, extract_since, seen)) {
+                scan_failed(cfg, j, removal_of(seen, why, "A game file was refused or removed by the antivirus while it was extracted."), "install", temp, staging);
+                return;
+            }
             fs::remove_all(staging, ec);
-            if (stopping(cfg)) return;
             fail(cfg, j, why);
             return;
         }
         if (!fs::is_regular_file(staging / path_of(j.launch_exe), ec) || ec) {
+            std::vector<ms::Threat> seen;
+            if (antivirus_acted({staging, temp}, extract_since, seen)) {
+                scan_failed(cfg, j, removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus."), "install", temp, staging);
+                return;
+            }
             fs::remove_all(staging, ec);
             fail(cfg, j, "The installed game has no " + j.launch_exe + ".");
             return;
         }
+        // SCAN THE DELIVERED BUILD before it is placed (header): every file
+        // extracted, and the original executable copied out of the wrapper
+        // (which the antivirus does not open), never run. Only clean goes on.
+        // What it scanned is recorded once placed (verified_content.hpp).
+        vc::Inventory delivered;
+        {
+            j.state = "scanning";
+            save(cfg, j);
+            (void)vc::inventory(staging, delivered);
+            const fs::path scan_dir = path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".scan");
+            fs::remove_all(scan_dir, ec);
+            const ms::Extracted x = ms::extract_wrapped_originals(staging, scan_dir, [&]() { return !stopping(cfg); });
+            ms::Result r;
+            if (!x.ok) {
+                if (stopping(cfg)) { fs::remove_all(scan_dir, ec); fs::remove_all(staging, ec); return; }
+                if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
+                else { r.outcome = ms::Outcome::error; r.detail = x.why; r.scanner = "Microsoft Defender Antivirus"; }
+            } else {
+                r = ms::scan({staging, scan_dir}, extract_since, [&]() { return !stopping(cfg); }, {});
+            }
+            fs::remove_all(scan_dir, ec);
+            if (r.outcome == ms::Outcome::canceled && stopping(cfg)) { fs::remove_all(staging, ec); return; }
+            if (r.outcome != ms::Outcome::clean) { scan_failed(cfg, j, r, "install", temp, staging); return; }
+            // Recorded with the revision only once it is PLACED (below), so a
+            // failed update never leaves the installed one looking unscanned.
+            j.scan_outcome = "clean";
+            save(cfg, j);
+        }
+        // The record of what was verified in the folder being replaced: the
+        // evaluator's own files carried over (below) stay verified only if
+        // they are exactly what that record vouched for.
+        vc::Record previous;
+        const bool had_previous = updating && vc::read_record(vc::record_path(cfg.root, j.id), previous);
         if (updating) {
             // THE GAME'S OWN FILES STAY: everything in the installed folder
             // the new package does not carry (saves, settings the game
@@ -994,6 +1240,19 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
                 j.error = "Close the game to finish the update.";
                 j.next_attempt_utc = now_of(cfg) + kWhileRunningSeconds;
                 save(cfg, j);
+                return;
+            }
+        }
+        // THE SERVICE'S CURRENT WORD BEFORE ANYTHING IS PLACED (owner brief
+        // 2026-10-30 section 3: a current authorization that the game is not
+        // held, before installation): the launch chain is asked for now, and
+        // a held game is refused here, the installed folder untouched.
+        {
+            const ChainOutcome chain = ensure_launch_chain(cfg, j.assignment_id, j.install_dir, j.launch_exe, j.revision_id);
+            if (!chain.ok) {
+                fs::remove_all(staging, ec);
+                if (chain.code == "security_hold") { fs::remove(temp, ec); fail(cfg, j, chain.why); return; }
+                if (chain.retryable) defer(cfg, j, chain.why); else fail(cfg, j, chain.why);
                 return;
             }
         }
@@ -1016,10 +1275,34 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             return;
         }
         if (updating) fs::remove_all(old, ec);
-        if (!write_launch_chain(cfg, j)) return;
+        // THE VERIFIED CONTENT RECORD of what was just placed: the delivered
+        // files as scanned, and the carried-over files the previous record
+        // vouched for. Anything else carried over is verified below, before
+        // Play is offered.
+        {
+            vc::Record placed = vc::after_clean_scan(dst, nullptr, j.revision_id, delivered, {});
+            if (had_previous) {
+                vc::Inventory now;
+                if (vc::inventory(dst, now)) {
+                    for (const auto& [k, seen] : now) {
+                        if (placed.files.count(k) || delivered.count(k)) continue;
+                        const auto p = previous.files.find(k);
+                        if (p != previous.files.end() && p->second == seen) placed.files[k] = seen;
+                    }
+                }
+            }
+            if (!vc::write_record(vc::record_path(cfg.root, j.id), placed)) log(cfg, j.id + " the verified content record could not be written");
+        }
         const Reply done = cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/complete",
             "{\"sha256\":\"" + j.package_sha256 + "\",\"bytes\":" + std::to_string(j.package_bytes) + "}", "application/json", {});
         if (done.status != 200) {
+            // THE GAME WAS HELD while this computer installed it: final, never
+            // retried (the next pass would extract and scan it all again).
+            if (done.status == 409 && body_code(done.body) == "security_hold") {
+                fs::remove(temp, ec);
+                fail(cfg, j, body_message(done.body));
+                return;
+            }
             if (done.status == 409 && body_code(done.body) == "conflict") {
                 // The download row is over (a failure was recorded before);
                 // ask again and report with the new id next pass.
@@ -1037,6 +1320,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         // The revision now on this computer's disk (ed::installed_revision):
         // what the Admin compares with the service's required one.
         j.installed_revision_id = j.revision_id;
+        j.scan_revision_id = j.revision_id;   // scanned clean above, now placed
         j.bytes_done = j.package_bytes;
         j.permille = 1000;
         j.error.clear();
@@ -1077,15 +1361,43 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
     }
     for (ed::Job j : ed::list_jobs(cfg.root)) {
         if (stopping(cfg)) break;
+        // SECURITY (2026-10-30): an incident the service has not recorded yet
+        // is sent, a failed job's included (it is retried every pass until
+        // the service answers).
+        if (signed_in && !j.incident.empty() && !j.incident_reported) report_incident(cfg, j);
+        // THE INSTALLED CONTENT IS VERIFIED before its next Play (the
+        // launcher refuses until then; verified_content.hpp), never while it
+        // runs: at once when asked (the launcher found unverified files, the
+        // game's last process exited) and at this driver's first pass; a
+        // game never scanned (installed before scanning existed) is also
+        // tried at most every kRescanEverySeconds.
+        if (ed::is_install(j) && j.state == "installed" && !j.security_held && !game_busy(cfg, j.assignment_id)) {
+            static std::map<std::string, std::int64_t> last_scan;
+            static std::set<std::string> looked;
+            bool asked = false;
+            {
+                std::lock_guard<std::mutex> lock(controls().m);
+                asked = controls().verify.erase(j.assignment_id) > 0;
+            }
+            const bool first = looked.insert(j.id).second;
+            const auto it = last_scan.find(j.id);
+            const bool legacy_due = j.scan_revision_id != ed::installed_revision(j) &&
+                (it == last_scan.end() || t - it->second >= kRescanEverySeconds);
+            if (asked || first || legacy_due) {
+                last_scan[j.id] = t;
+                verify_installed(cfg, j);
+            }
+        }
         if (ed::is_terminal(j)) continue;
         // A failed install the person asked to try again.
         {
             std::lock_guard<std::mutex> lock(controls().m);
-            if (ed::is_install(j) && controls().retry.erase(j.assignment_id) && j.state == "failed") {
+            if (ed::is_install(j) && controls().retry.erase(j.assignment_id) && j.state == "failed" && !j.security_held) {
                 j.state = "queued"; j.error.clear(); j.attempts = 0; j.next_attempt_utc = 0; save(cfg, j);
             }
         }
-        if (ed::is_upload(j) && (j.state == "building" || j.state == "packaging")) {
+        if (ed::is_upload(j) && (j.state == "building" || j.state == "packaging" ||
+                                 j.state == "scanning_source" || j.state == "scanning_package")) {
             // The Admin host's stage. Stalled: start the host headless, rarely.
             if (ed::process_alive(j.owner_pid)) continue;
             const auto it = last_resume.find(j.id);

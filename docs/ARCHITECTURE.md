@@ -599,6 +599,18 @@ STABLE, SIGNED binary reused unchanged across releases. No normal release,
 staging or production, builds, signs or substitutes Setup; updating VIRULE
 never requires a new Setup.
 
+WINDOWS 10 AND LATER (owner decision 2026-10-30,
+`VIRULE/docs/specs/evaluation-security.md` "Windows support"): Setup is the
+authoritative enforcement point. FIRST in `wWinMain`, before its command
+line is read and before anything is downloaded, listened for or written, it
+reads the real version (`src/shared/os_support.hpp`, `RtlGetVersion`, never
+the manifest-dependent `GetVersionEx` / VersionHelpers) and refuses a major
+version below 10 on its card with `VIRULE requires Windows 10 or later.`
+(WORKING WORDING); Windows 10 and 11 pass. Test: `tests\os_support`. IN
+SOURCE ONLY: the two permanent signed Setups predate it, so it reaches users
+only when the owner authorizes re-cutting both (below). The Client itself
+adds no refusal: an installation that exists keeps working.
+
 Setup is environment-specific at compile time (the client manifest URL, the
 download prefix and `kRequireAuthenticode` come from `launch_policy.hpp`): a
 production Setup fetches only the production manifest, accepts only
@@ -1564,8 +1576,8 @@ retry re-queues a failed install; answers `{"type":"transfer_control","ok":true}
 
 THE LAUNCH CHAIN IS MADE CURRENT BEFORE A LAUNCH (0.9.15; defect correction
 2026-10-21). `verify` runs the install's own chain step again for an
-INSTALLED assignment (`ensure_launch_chain`, the core `write_launch_chain`
-wraps): the ticket is asked and written again, and the evaluator credential
+INSTALLED assignment (`ensure_launch_chain`, which the install also runs
+before it places a build): the ticket is asked and written again, and the evaluator credential
 is issued again when the machine key it is bound to is not this computer's
 current one (the Admin re-issues `dev_machine.cred` on its first run, and
 the credential must be bound to the key the wrapper will derive from that
@@ -1608,6 +1620,108 @@ CACHE is `%LOCALAPPDATA%\VIRULE\art\<sha256>.<ext>`, content-addressed,
 so a cached image is never stale. Answers `{"type":"game_art","ok":true,
 ...}` or `ok:false` with a plain message; the Admin keeps its placeholder.
 Proof: `tests/transfers` (`test_game_art`).
+
+## Local malware scanning (owner briefs 2026-10-30, STAGING, no Client version allocated yet)
+
+Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 9b; the
+service half: `VIRULE_BACKEND/docs/EVALUATIONS.md` "Security incidents and
+holds". The engine is `virule/core/malware_scan.hpp` and the record of what
+was verified is `virule/core/verified_content.hpp`, both vendored
+byte-identical from v2_mvp beside `evaluation_distribution.hpp` (whose job
+record gains `scan_outcome`, `scan_revision_id`, `incident`,
+`incident_reported`, `security_held` and the states `scanning_source`,
+`scanning_package`, install `scanning`). The primary engine is Microsoft
+Defender Antivirus in its ACTIVE state; when another antivirus replaces it,
+the AMSI compatibility path (vendored `amsi_scan.hpp`) is tried and accepts
+only an explicitly validated provider (none is validated yet: the shipped
+allowlist is empty). Any other configuration, Defender disabled, passive or
+in limited periodic scanning is `unavailable` and blocks (the evidence:
+malware_scan.hpp "WHICH DEFENDER STATES SCAN"; the policy
+`VIRULE/docs/specs/evaluation-security.md`).
+
+THE INSTALL (`src/client/transfers.hpp` `run_install`): after the
+package's SHA-256 and extraction into `.virule-staging`, `scanning` copies
+the wrapper's original executable out (never run) and scans it with every
+extracted file; only `clean` goes on. For an update the evaluator's own
+files are then carried over. BEFORE ANYTHING IS PLACED the launch chain is
+asked for (`ensure_launch_chain`, the ticket GET): a 409 `security_hold`
+fails the job for good with the service's sentence, the package and the
+staging folder removed, the installed folder untouched. Once placed, the
+VERIFIED CONTENT RECORD (`<root>\transfers\<job>\verified.txt`) lists every
+delivered file as scanned (relative path, size, write time, the revision)
+and the carried-over files the previous record vouched for; the scanned
+revision is `scan_revision_id`. The antivirus refusing or taking the
+package or a file at download, verify or extraction (a refused open, or
+Defender's record naming the path; a file that merely went missing with no
+such record is retried as before) is a security outcome, never `defer` and
+never a re-download. A detection: the staging folder and the package go,
+`security_held` (retry and Install again refuse that revision here),
+`/download/<id>/failed` with reason `security`, and the incident is kept on
+the job. The service's 409 `security_hold` at `/complete` also fails the job
+for good. A job in `scanning` that was interrupted extracts and scans again.
+
+THE INSTALLED CONTENT IS VERIFIED BEFORE EVERY PLAY (`verify_installed`):
+the folder is compared with the record; new or changed files (the game's
+saves, the wrapper's log, an executable it left behind) are scanned, and
+ONLY those (`verified_content.hpp` `plan_scan`: a new folder of only new
+files is one target; the wrapper's original is copied out only when the
+launch file changed); unchanged content is never scanned again, and the
+whole folder only when no record of the installed revision exists (an
+update, a replacement build, content installed before scanning existed)
+(owner decisions 2026-10-30, "Scan cadence"); clean takes them into
+the record (never a file that changed during the scan). It runs at once when
+the launcher asks (Play found unverified files) and when a game's last
+process exits (`on_stopped` in `main.cpp`), at the driver's first pass, and
+for a game never scanned (installed before scanning existed) at most every
+30 minutes; never while the game runs. A detection there holds the revision
+here and reports an incident. Size and write time are compared, not hashes:
+any ordinary change is caught, a person deliberately restoring a file's
+size and time on their own computer is not (reported, not solvable on an
+evaluator-controlled computer).
+
+INCIDENTS are reported by `run_pass` from any job, a failed one included,
+until the service answers (developer: `/v1/evaluations/games/<uuid>/
+security/incident` for an upload job the Admin host failed; evaluator:
+`/v1/assignments/<id>/security/incident`).
+
+BEFORE EVERY PLAY (`src/client/launcher.hpp`, its header): (1) the
+service's current word, the ticket GET bounded at 2 s per step and 3 s to
+answer, inside the Admin host's 30 s wait for `game_launch` (`main.cpp`
+`prelaunch_service_check`): 409 `security_hold` refuses
+Play and sets the hold marker, 200 clears it, no answer refuses with
+`Couldn't reach our servers right now.`, any other refusal states the
+service's sentence; signed out the Client cannot ask and the wrapper's
+check decides; (2) the record: anything unverified asks the driver to
+verify and refuses with `Verifying game files. Try again in a moment.`
+(code `not_scanned`); (3) the wrapper's own online authorization, signed by
+the service at EVERY launch on every path (Client Play, the Admin host's
+development start, a double-click, the post-game Play), which refuses a held
+game too (`VIRULE_BACKEND` `authorize.ts`; takes effect once IDENTITY_DB
+0020 and the Worker are deployed). The wrapper then runs its LOCAL CHECK
+(`verified_content.hpp` `wrapper_launch_check`) from this Client's records:
+installed in this folder, not held (job or marker), revision scanned clean,
+every recorded file unchanged (its own `.virule\logs\` excepted). Files the
+record never saw are left to the Client's launcher, so the post-game Play
+in the wrapper's panel, and a double-click after a session, can start the
+game before files its last session wrote are scanned (they are scanned
+when it exits). A staging build's development simulation
+(`dev_simulation.json` with no `evaluator.cred`) skips both; it is a
+developer's tool, never present on an evaluator's computer by itself.
+
+THE SERVICE'S SECURITY STATE (`src/client/security_marks.hpp`): the runtime
+report's answer `security_hold` / `security_protected`, and the pre-Play
+ticket answer for the hold, are kept as two marker files beside the
+assignment's ticket. The runtime reporter never applies its offline
+absolute cut to a protected assignment. A Defender exclusion over a scanned
+folder is undetectable unelevated (reported). Stalled Admin-side stages
+include the two scanning states (`resume_headless`).
+
+OBSERVED (2026-10-30): Defender once quarantined this repository's unsigned
+`tests\transfers` harness built in the Dropbox tree as
+`Trojan:Win32/Bearfoos.A!ml` (machine learning); the same source built
+elsewhere and the pre-change harness were not flagged, and it did not
+reproduce. Unsigned binaries carrying the scanner are a false-positive risk
+to watch at the first staging build.
 
 ## The launcher (0.9.18, 2026-10-22)
 

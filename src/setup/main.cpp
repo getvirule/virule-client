@@ -77,6 +77,7 @@
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/login_start.hpp"
+#include "shared/os_support.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
 #include "shared/residency.hpp"
@@ -368,6 +369,19 @@ bool poll_release(bool& answered) {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // WINDOWS 10 AND LATER ONLY (owner decision 2026-10-30;
+    // shared/os_support.hpp). FIRST, before the command line is read and
+    // before anything is downloaded, listened for or written, so no flag and
+    // no entry point installs VIRULE on an earlier Windows.
+    {
+        const vclient::os_support::WindowsVersion os = vclient::os_support::current_windows();
+        if (!vclient::os_support::is_supported(os)) {
+            vclient::setup_window::show();
+            return fail(vclient::os_support::kUnsupportedSentence,
+                        "unsupported Windows " + std::to_string(os.major) + "." +
+                            std::to_string(os.minor) + "." + std::to_string(os.build));
+        }
+    }
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool allow_unsigned = false; // development only; the hash gate always holds
