@@ -606,10 +606,11 @@ line is read and before anything is downloaded, listened for or written, it
 reads the real version (`src/shared/os_support.hpp`, `RtlGetVersion`, never
 the manifest-dependent `GetVersionEx` / VersionHelpers) and refuses a major
 version below 10 on its card with `VIRULE requires Windows 10 or later.`
-(WORKING WORDING); Windows 10 and 11 pass. Test: `tests\os_support`. IN
-SOURCE ONLY: the two permanent signed Setups predate it, so it reaches users
-only when the owner authorizes re-cutting both (below). The Client itself
-adds no refusal: an installation that exists keeps working.
+(the owner's brief 2026-10-31: "Known Windows major version below 10 must
+show: VIRULE requires Windows 10 or later."); Windows 10 and 11 pass. Test:
+`tests\os_support`. LIVE in both environments since 2026-10-31: both
+canonical Setups were re-cut from 3454b27 (below). The Client itself adds no
+refusal: an installation that exists keeps working.
 
 Setup is environment-specific at compile time (the client manifest URL, the
 download prefix and `kRequireAuthenticode` come from `launch_policy.hpp`): a
@@ -621,8 +622,8 @@ identity and timestamped, committed in this repository:
 
 | File | Pinned in `release/setup/canonical_setup.json` |
 |---|---|
-| `release/setup/production/Virule-Setup.exe` | Setup 0.9.0, source 474ca95, signed 2026-10-06 |
-| `release/setup/staging/Virule-Setup.exe` | the one signed staging Setup (see its pin) |
+| `release/setup/production/Virule-Setup.exe` | Setup 0.9.22, source 3454b27, signed 2026-10-31 |
+| `release/setup/staging/Virule-Setup.exe` | Setup 0.9.22, source 3454b27, signed 2026-10-31 |
 
 `helpers/canonical_setup.ps1` is the one check, and it fails closed: a
 missing pin, a missing file, any byte or size difference, an invalid,
@@ -647,17 +648,27 @@ together: `build.ps1 -Stage setup -Environment Production` and
 `-Environment Staging`, sign both exact files with the VIRULE identity, then
 `helpers/approve_canonical_setup.ps1 -Production <file> -Staging <file>
 -SourceCommit <sha> -Replace` (it refuses to replace one environment alone),
-commit `release/setup/`, publish. The one single-environment approval ever
+commit `release/setup/`, publish. Signing:
+`VIRULE_SECURITY\artifact-signing\sign_client_setup.bat` signs the
+production build; `-Environment Staging` signs the staging build in its own
+`build\Release\x64\staging\` leaf (manifest group `clientSetupStaging`),
+so neither binary is ever copied into the other's place. Publishing: the
+staging Setup goes out with the next `release_staging.ps1`; the production
+Setup goes onto the CURRENT latest client release with `publish.ps1`'s own
+Setup step (`gh release upload <latest tag> Virule-Setup.exe --clobber`,
+then `Assert-PublishedSetup`), because `publish.ps1` itself publishes the
+`version.h` client and a Setup change never needs a client release (re-cut
+2026-10-31: onto v0.9.0). The one single-environment approval ever
 allowed was the first staging pin (2026-10-19), because no staging Setup
 existed.
 
-KNOWN SOURCE DIFFERENCE (owner decision pending): the production Setup is
-0.9.0 (474ca95, 2026-10-06, preserved by owner ruling); the staging Setup
-was cut from 9c4f552 (0.9.11), whose Setup code adds the evaluator entry
-point in the handoff envelope (0.9.9) and the "Continuing…" card copy and
-palette (0.9.10). Cutting staging from 474ca95 would have removed the
-evaluator install from staging. The next authorized Setup change brings
-both to one commit.
+BOTH SETUPS SHARE ONE SOURCE since the 2026-10-31 re-cut (3454b27; owner
+brief 2026-10-31): the production Setup gained what the staging one already
+had (the evaluator entry point, 0.9.9; the "Continuing…" card, 0.9.10) and
+both gained the Windows 10 refusal. Compatibility with the production 0.9.0
+client was checked in source: 0.9.0 reads the takeover by key and ignores
+the added `capability` field, and `state.json`'s added `enabled_*` fields
+are ignored by its loader (independent verifier PASS).
 
 Why: on 2026-10-19 every staging client release rebuilt and published an
 UNSIGNED staging Setup, which Windows showed as "Publisher: Unknown" and

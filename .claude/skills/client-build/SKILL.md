@@ -64,7 +64,8 @@ publishers ship `release\setup\<environment>\Virule-Setup.exe`, pinned in
 `helpers\canonical_setup.ps1` (fails closed). `-Stage all` builds the client
 and service only. Both Setups are permanent: only an owner-authorized change
 to Setup itself re-cuts them, BOTH together from one commit (`-Stage setup`
-for each environment, sign both, `helpers\approve_canonical_setup.ps1
+for each environment, sign both with `sign_client_setup.bat` and
+`sign_client_setup.bat -Environment Staging`, `helpers\approve_canonical_setup.ps1
 -Production -Staging -SourceCommit -Replace`; it refuses one alone)
 (`docs\ARCHITECTURE.md`, The canonical Setup).
 
