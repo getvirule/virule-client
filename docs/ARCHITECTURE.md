@@ -1621,7 +1621,7 @@ so a cached image is never stale. Answers `{"type":"game_art","ok":true,
 ...}` or `ok:false` with a plain message; the Admin keeps its placeholder.
 Proof: `tests/transfers` (`test_game_art`).
 
-## Local malware scanning (owner briefs 2026-10-30, STAGING, no Client version allocated yet)
+## Local malware scanning (owner briefs 2026-10-30, ON STAGING since 2026-10-31 in Client 0.9.22)
 
 Product contract: `v2_mvp/docs/EVALUATION_VIRULE.md` section 9b; the
 service half: `VIRULE_BACKEND/docs/EVALUATIONS.md` "Security incidents and
