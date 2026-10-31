@@ -36,8 +36,9 @@ namespace vclient::os_support {
 
 inline constexpr unsigned long kMinimumMajorVersion = 10;
 
-// The one sentence an unsupported computer is told (WORKING WORDING, PENDING
-// OWNER DECISION; no em dash).
+// The one sentence an unsupported computer is told: the owner's (brief
+// 2026-10-31, VIRULE/docs/specs/evaluation-security.md decision 14; no em
+// dash).
 inline constexpr const wchar_t* kUnsupportedSentence = L"VIRULE requires Windows 10 or later.";
 
 struct WindowsVersion {
