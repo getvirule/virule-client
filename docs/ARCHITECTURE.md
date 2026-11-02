@@ -1759,7 +1759,7 @@ job's `source_path` or `build_path` since the job began, else its own scan
 of the game's folder; found, its own incident (`scan_source`, or
 `scan_package` once a build was packaged); not found, nothing is sent.
 
-## Developer verification and the upload gate (owner brief 2026-11-02, "Client Security Authority Phase 2"; STAGING; `src/client/transfers.hpp`, `upload_verification.hpp`, `client_seal.hpp`)
+## Developer verification and the upload gate (owner brief 2026-11-02, "Client Security Authority Phase 2"; ON STAGING since 2026-11-02 in Client 0.9.23; `src/client/transfers.hpp`, `upload_verification.hpp`, `client_seal.hpp`)
 
 THE CLIENT OWNS THE DEVELOPER-SIDE VERDICT (`VIRULE/docs/specs/evaluation-security.md`
 decisions 19 and 21). The Admin host's `scanning_source` (`Analyzing`) is a
@@ -1810,7 +1810,7 @@ host's statement that it built a package, nothing more.
   package between the read and the extraction and back (accepted MVP
   boundary, decision 23).
 
-## Machine proofs (owner brief 2026-11-02; STAGING; `src/shared/machine_proof.hpp`, `src/client/main.cpp` AccountTransferService; the service half `VIRULE_BACKEND/docs/EVALUATIONS.md` "Machine proofs")
+## Machine proofs (owner brief 2026-11-02; ON STAGING since 2026-11-02 in Client 0.9.23; `src/shared/machine_proof.hpp`, `src/client/main.cpp` AccountTransferService; the service half `VIRULE_BACKEND/docs/EVALUATIONS.md` "Machine proofs")
 
 The routes only this Client's drivers make carry a proof from this
 computer's Ed25519 identity (`dev_machine.cred`), the QA link's convention
