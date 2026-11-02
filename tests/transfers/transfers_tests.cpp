@@ -447,14 +447,18 @@ static void test_launch_chain() {
     CHECK(ticket.find("\"assignment_id\":\"" + assignment + "\"") != std::string::npos &&
           ticket.find("\"install_path\":") != std::string::npos && ticket.find("\"launch_exe\":\"Game.exe\"") != std::string::npos);
     CHECK(cred.find("\"machine_key\":\"" + k1 + "\"") != std::string::npos);
-    // The same key again: the held credential stays (no second issue).
+    // The same key again: the key is PROVED again (owner brief 2026-11-02:
+    // the credential request carries the proof of possession and is always
+    // made, so a binding the service does not count as proved is proved
+    // before a launch); the service answers the held credential unchanged.
     CHECK(tr::control(verify, root).find("\"ok\":true") != std::string::npos);
-    CHECK(svc.ticket_calls == 2 && svc.credential_calls == 1);
+    CHECK(svc.ticket_calls == 2 && svc.credential_calls == 2);
+    CHECK(svc.last_credential_body.find(k1) != std::string::npos);
     // The machine key changed under the credential (the Admin re-issued
     // dev_machine.cred): the credential is issued again for the NEW key.
     svc.machine = k2;
     CHECK(tr::control(verify, root).find("\"ok\":true") != std::string::npos);
-    CHECK(svc.credential_calls == 2);
+    CHECK(svc.credential_calls == 3);
     CHECK(svc.last_credential_body.find(k2) != std::string::npos);
     CHECK(ev::read_document(tr::detail::credential_path(root)).find("\"machine_key\":\"" + k2 + "\"") != std::string::npos);
     // No machine identity at all: a plain, non-retryable refusal; nothing written over the held files.
@@ -482,7 +486,7 @@ static int run_package(int argc, char** argv) {
     if (argc < 5 || !redirected_or_die()) return 2;
     const fs::path root = fs::path(std::string(argv[2]));
     const std::string game_uuid = argv[3];
-    const std::uint64_t bytes = std::strtoull(argv[4], nullptr, 10);
+    std::uint64_t bytes = std::strtoull(argv[4], nullptr, 10);
     fs::create_directories(root / "packages");
     ed::Job j;
     j.id = ed::random_hex32();
@@ -495,8 +499,23 @@ static int run_package(int argc, char** argv) {
     j.launch_exe = "Game.exe";
     j.file_count = 3;
     const fs::path pkg = root / "packages" / fs::path(j.build_uuid + ".zip");
+    // A REAL package (2026-11-02: the Client extracts and verifies it before
+    // any upload): one stored Game.exe, sized so the archive is exactly
+    // `bytes` long (a stored zip's overhead is constant for one entry).
+    std::string content(static_cast<size_t>(bytes > 512 ? bytes - 512 : 1), '\0');
+    {
+        std::mt19937_64 rng(std::hash<std::string>{}(j.build_uuid));
+        for (auto& c : content) c = static_cast<char>(rng());
+    }
+    write_zip(pkg, { { "Game.exe", content } });
+    {
+        std::error_code ec;
+        const std::uint64_t got = fs::file_size(pkg, ec);
+        if (bytes > 512 && got != bytes) { content.resize(static_cast<size_t>(content.size() + bytes - got)); write_zip(pkg, { { "Game.exe", content } }); }
+    }
     std::string sha;
-    write_random(pkg, bytes, &sha);
+    tr::sha256_file_hex(pkg, sha);
+    bytes = fs::file_size(pkg);
     j.package_path = utf8(pkg);
     j.manifest_path = utf8(root / "packages" / fs::path(j.build_uuid + ".manifest.json"));
     j.package_bytes = bytes;
@@ -592,6 +611,22 @@ static int run_drive(int argc, char** argv) {
     cfg.stop_event = CreateEventW(nullptr, TRUE, FALSE, std::wstring(event.begin(), event.end()).append(L".Stop").c_str());
     cfg.log = [](const std::string& t) { std::printf("%s\n", t.c_str()); std::fflush(stdout); };
     cfg.resume_headless = [](const ed::Job& j) { std::printf("transfers: would resume headless %s\n", j.id.c_str()); std::fflush(stdout); return false; };
+    // THE CLIENT'S OWN VERIFICATION runs for every upload; here its scan is a
+    // stand-in (VIRULE_TEST_SCAN: clean, the default; detected; unavailable).
+    // The install's scan stays the real one; the shipped Client has no seam.
+    cfg.scan = [](const std::vector<fs::path>& targets, const std::string&, const std::function<bool()>&) {
+        char v[32] = {};
+        const DWORD n = GetEnvironmentVariableA("VIRULE_TEST_SCAN", v, sizeof(v));
+        const std::string mode = n > 0 && n < sizeof(v) ? std::string(v) : "clean";
+        tr::ms::Result r;
+        r.scanner = "Test scanner";
+        r.path = "defender";
+        r.outcome = mode == "detected" ? tr::ms::Outcome::detected : mode == "unavailable" ? tr::ms::Outcome::unavailable : tr::ms::Outcome::clean;
+        if (r.outcome == tr::ms::Outcome::detected) r.threats.push_back({ "Test:Detected", tr::ms::detail::path_utf8(targets.front()), "Quarantine" });
+        std::printf("transfers: test scan %s of %zu target(s)\n", mode.c_str(), targets.size());
+        std::fflush(stdout);
+        return r;
+    };
     HANDLE wake = vclient::evidence::create_wake_event(std::wstring(event.begin(), event.end()).c_str());
     // "<event>.Release" stands in for main.cpp's release on a changed
     // Evaluations view (a purchase): held uploads asked again, the driver woken.
@@ -1019,6 +1054,402 @@ static void test_assignment_open() {
     CHECK(ao::is_hex32(std::string(32, 'f')) && !ao::is_hex32("XYZ"));
 }
 
+// ------------------------------------------------------- the upload gate ----
+// THE CLIENT OWNS THE DEVELOPER'S VERDICT (owner brief 2026-11-02, "Client
+// Security Authority Phase 2" sections 4 to 9 and 19). Every case builds the
+// state the transfer driver sees DIRECTLY (a job file as the Admin host, a
+// patched host or any local program could write it), never through the
+// Admin, and asserts what reaches the service.
+
+// The service's upload half, in memory: sessions by build, the parts held,
+// and every byte it was sent.
+struct UploadService final : tr::Service {
+    struct Session { std::string build, sha; std::uint64_t bytes = 0; std::map<std::int64_t, std::string> parts; bool done = false; };
+    std::map<std::string, Session> sessions;   // session id -> session
+    int opens = 0, puts = 0, completes = 0, incidents = 0, incident_calls = 0, refuse_incidents = 0;
+    std::string last_open, last_incident, last_incident_route;
+    bool signed_in(std::string& out) override { out = "dev@example.com"; return true; }
+    tr::Reply call(const char* method, const std::string& path, const std::string& body,
+                   const std::string&, const std::vector<tr::Header>&) override {
+        tr::Reply r;
+        const std::string m = method;
+        auto uploaded = [](const Session& s) {
+            std::string o = "[";
+            for (const auto& [n, _] : s.parts) o += (o.size() > 1 ? "," : "") + std::to_string(n);
+            return o + "]";
+        };
+        if (m == "POST" && path.find("/security/incident") != std::string::npos) {
+            ++incident_calls;
+            if (refuse_incidents > 0) { --refuse_incidents; r.status = 401; r.body = "{\"error\":{\"code\":\"machine_not_bound\",\"message\":\"x\"}}"; return r; }
+            ++incidents; last_incident = body; last_incident_route = path; r.status = 201; r.body = "{}"; return r;
+        }
+        if (m == "POST" && path.size() > 8 && path.compare(path.size() - 8, 8, "/uploads") == 0) {
+            ++opens;
+            last_open = body;
+            std::string build, sha;
+            std::int64_t bytes = 0;
+            (void)vclient::json_scan::find_string_in(body, 0, body.size(), "build_uuid", build);
+            (void)vclient::json_scan::find_string_in(body, 0, body.size(), "package_sha256", sha);
+            (void)ev::json::get_int(body, "package_bytes", bytes);
+            for (auto& [id, s] : sessions) {
+                if (s.build == build) {
+                    if (s.sha != sha) { r.status = 409; r.body = "{\"error\":{\"code\":\"conflict\",\"message\":\"Different contents.\"}}"; return r; }
+                    r.status = 200; r.body = "{\"session_id\":\"" + id + "\",\"state\":\"uploading\",\"uploaded\":" + uploaded(s) + "}"; return r;
+                }
+            }
+            const std::string id = ed::random_hex32();
+            sessions[id] = Session{ build, sha, static_cast<std::uint64_t>(bytes), {}, false };
+            r.status = 201; r.body = "{\"session_id\":\"" + id + "\",\"state\":\"uploading\",\"uploaded\":[]}"; return r;
+        }
+        const std::string up = "/v1/evaluations/uploads/";
+        if (path.compare(0, up.size(), up) == 0) {
+            const std::string id = path.substr(up.size(), 32);
+            auto it = sessions.find(id);
+            if (it == sessions.end()) { r.status = 404; r.body = "{\"error\":{\"code\":\"not_found\",\"message\":\"No.\"}}"; return r; }
+            Session& s = it->second;
+            const std::string rest = path.substr(up.size() + 32);
+            if (m == "GET" && rest.empty()) { r.status = 200; r.body = "{\"state\":\"uploading\",\"uploaded\":" + uploaded(s) + "}"; return r; }
+            if (m == "PUT" && rest.compare(0, 7, "/parts/") == 0) {
+                ++puts;
+                s.parts[std::strtoll(rest.substr(7).c_str(), nullptr, 10)] = body;
+                r.status = 200; r.body = "{\"uploaded\":" + uploaded(s) + "}"; return r;
+            }
+            if (m == "POST" && rest == "/complete") {
+                ++completes;
+                std::string all;
+                for (const auto& [n, b] : s.parts) all += b;
+                if (tr::sha256_hex(all) != s.sha) { r.status = 409; r.body = "{\"error\":{\"code\":\"integrity\",\"message\":\"No.\"}}"; return r; }
+                s.done = true;
+                r.status = 200; r.body = "{}"; return r;
+            }
+        }
+        r.status = 404;
+        return r;
+    }
+    bool get_range_to_file(const std::string&, std::uint64_t, std::uint64_t, FILE*, std::uint64_t&, unsigned long& status_out,
+                           const std::function<bool()>&) override { status_out = 0; return false; }
+    std::string machine_key() override { return std::string(64, '1'); }
+    // Everything the service holds for the build, as one byte string.
+    std::string received(const std::string& build) const {
+        for (const auto& [_, s] : sessions) if (s.build == build) { std::string all; for (const auto& [n, b] : s.parts) all += b; return all; }
+        return {};
+    }
+};
+
+// A packaged job exactly as the Admin host hands one over (or as anything
+// else could write one): a real stored package of one Game.exe.
+static ed::Job packaged_job(const fs::path& root, const std::string& content) {
+    ed::Job j;
+    j.id = ed::random_hex32();
+    j.kind = "upload";
+    j.state = "packaged";
+    j.account_email = "dev@example.com";
+    j.game_uuid = ed::random_hex32();
+    j.game_id = "local-" + j.game_uuid.substr(0, 8);
+    j.build_uuid = ed::random_hex32();
+    j.built_utc = "2026-11-02T10:00:00Z";
+    j.launch_exe = "Game.exe";
+    j.created_utc = tr::utc_now();
+    const fs::path dir = root / "builds" / "package";
+    fs::create_directories(dir);
+    const fs::path pkg = dir / fs::path(j.build_uuid + ".zip");
+    write_zip(pkg, { { "Game.exe", content } });
+    j.package_path = utf8(pkg);
+    j.package_bytes = fs::file_size(pkg);
+    tr::sha256_file_hex(pkg, j.package_sha256);
+    j.parts_total = static_cast<std::int64_t>(ed::parts_total(j.package_bytes));
+    j.bytes_total = j.package_bytes;
+    ed::write_job(root, j);
+    return j;
+}
+
+static std::string random_bytes_str(size_t n, unsigned seed) {
+    std::mt19937_64 rng(seed);
+    std::string s(n, '\0');
+    for (auto& c : s) c = static_cast<char>(rng());
+    return s;
+}
+
+static void drive_once(tr::DriverConfig& cfg) {
+    std::map<std::string, std::int64_t> last;
+    (void)tr::run_pass(cfg, last);
+}
+
+static void test_upload_gate() {
+    SECTION("the upload gate: no Client verification, no upload");
+    namespace uv = vclient::upload_verification;
+    namespace ms = virule::core::malware_scan;
+    const fs::path root = temp_root("gate");
+    UploadService svc;
+    int scans = 0;
+    ms::Outcome next = ms::Outcome::clean;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string&) {};
+    cfg.scan = [&](const std::vector<fs::path>& targets, const std::string&, const std::function<bool()>&) {
+        ++scans;
+        ms::Result r;
+        r.scanner = "Test scanner";
+        r.path = "defender";
+        r.outcome = next;
+        if (next == ms::Outcome::detected) r.threats.push_back({ "Test:Detected", ms::detail::path_utf8(targets.front()), "Quarantine" });
+        return r;
+    };
+    ed::Job got;
+
+    // 1. A FORGED "CLEAN" JOB: every field the Admin could set says verified
+    // and mid-upload; the Client has no record of its own. It verifies first,
+    // and with an unsupported scanner nothing is ever sent.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(4000, 1));
+        j.state = "uploading";
+        j.scan_outcome = "clean";
+        j.session_id = ed::random_hex32();
+        j.parts_done = { 1 };
+        ed::write_job(root, j);
+        next = ms::Outcome::unavailable;
+        drive_once(cfg);
+        CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.scan_outcome == "unavailable");
+        CHECK(svc.opens == 0 && svc.puts == 0 && scans == 1);
+        CHECK(!fs::exists(uv::record_path(root, j.id)));
+    }
+    // 2. A DETECTION never uploads: the job fails with the threat sentence,
+    // the incident is this Client's own (sealed) and is what is reported.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(4000, 2));
+        next = ms::Outcome::detected;
+        drive_once(cfg);
+        CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.error.find("found a threat") != std::string::npos);
+        CHECK(svc.opens == 0 && svc.puts == 0);
+        uv::Incident inc;
+        CHECK(uv::read_incident(root, j.id, inc) && inc.incident.find("\"scan_package\"") != std::string::npos &&
+              inc.incident.find(j.build_uuid) != std::string::npos);
+        drive_once(cfg);   // the next pass reports it
+        CHECK(svc.incidents == 1 && svc.last_incident_route == "/v1/evaluations/games/" + j.game_uuid + "/security/incident");
+        drive_once(cfg);
+        CHECK(svc.incidents == 1);   // reported once
+    }
+    // 2b. A REFUSED PROOF (401: the key not proved yet, a clock) is never
+    // final: the incident is sent again and recorded exactly once.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(4000, 21));
+        next = ms::Outcome::detected;
+        svc.refuse_incidents = 1;
+        const int before = svc.incidents, calls = svc.incident_calls;
+        drive_once(cfg);   // the verification fails, the incident is kept
+        drive_once(cfg);   // reported: 401
+        uv::Incident inc;
+        CHECK(svc.incident_calls == calls + 1 && svc.incidents == before && uv::read_incident(root, j.id, inc) && !inc.reported);
+        drive_once(cfg);   // reported again: recorded
+        drive_once(cfg);   // and never again
+        CHECK(svc.incident_calls == calls + 2 && svc.incidents == before + 1 && uv::read_incident(root, j.id, inc) && inc.reported);
+    }
+    // 2c. THE EVALUATOR'S PRE-PLAY CHECK finds a threat in the installed game:
+    // this Client's own incident, reported to the assignment once.
+    {
+        const fs::path games = root / "installs";
+        const std::string assignment = ed::random_hex32(), revision = ed::random_hex32(), game = ed::random_hex32();
+        fs::create_directories(games / game);
+        std::ofstream(games / game / "Game.exe") << "installed";
+        ed::Job j;
+        j.id = ed::random_hex32();
+        j.kind = "install";
+        j.state = "installed";
+        j.account_email = "dev@example.com";
+        j.assignment_id = assignment;
+        j.game_uuid = game;
+        j.revision_id = revision;
+        j.installed_revision_id = revision;
+        j.launch_exe = "Game.exe";
+        j.install_root = utf8(games);
+        j.install_dir = utf8(games / game);
+        j.created_utc = tr::utc_now();
+        ed::write_job(root, j);
+        next = ms::Outcome::detected;
+        const int before = svc.incidents;
+        drive_once(cfg);   // the check finds it
+        drive_once(cfg);   // the next pass reports it
+        ed::Job got2;
+        CHECK(ed::read_job(root, j.id, got2) && got2.security_held && got2.incident.empty());
+        CHECK(svc.incidents == before + 1 && svc.last_incident_route == "/v1/assignments/" + assignment + "/security/incident" &&
+              svc.last_incident.find("\"launch\"") != std::string::npos && svc.last_incident.find(revision) != std::string::npos);
+        drive_once(cfg);
+        CHECK(svc.incidents == before + 1);
+    }
+    // 3. AN INCIDENT WRITTEN INTO A JOB FILE is never sent (the host, or
+    // anything else, cannot make this Client hold a game).
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(3000, 3));
+        j.state = "failed";
+        j.incident = "{\"incident_id\":\"" + ed::random_hex32() + "\",\"operation\":\"scan_package\",\"outcome\":\"detected\"}";
+        j.incident_reported = false;
+        ed::write_job(root, j);
+        const int before = svc.incidents;
+        drive_once(cfg);
+        CHECK(svc.incidents == before);
+    }
+    // 4. A FORGED RECORD (unsealed, or sealed by another key) authorizes nothing.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(5000, 4));
+        fs::create_directories(uv::record_path(root, j.id).parent_path());
+        std::ofstream(uv::record_path(root, j.id)) << "{\"format\":\"virule-upload-verification.v1\",\"job_id\":\"" << j.id
+            << "\",\"package_sha256\":\"" << j.package_sha256 << "\",\"part_sha256\":[\"" << j.package_sha256 << "\"],\"seal\":\"" << std::string(64, 'a') << "\"}";
+        uv::Record forged;
+        CHECK(!uv::read_record(root, j.id, forged));
+        next = ms::Outcome::unavailable;
+        const int s0 = scans;
+        drive_once(cfg);
+        CHECK(scans == s0 + 1 && ed::read_job(root, j.id, got) && got.state == "failed" && svc.opens == 0);
+    }
+    // 5. THE HEALTHY PATH: verified, then uploaded with THIS CLIENT'S figures,
+    // and the service holds exactly the verified bytes.
+    ed::Job ok_job;
+    {
+        ok_job = packaged_job(root, random_bytes_str(6000, 5));
+        // The host's figures are wrong on purpose (a patched host): the
+        // Client's own are what the service is told.
+        ok_job.content_bytes = 1;
+        ok_job.file_count = 99;
+        ed::write_job(root, ok_job);
+        next = ms::Outcome::clean;
+        drive_once(cfg);
+        CHECK(ed::read_job(root, ok_job.id, got) && got.state == "done");
+        uv::Record rec;
+        CHECK(uv::read_record(root, ok_job.id, rec) && rec.package_sha256 == ok_job.package_sha256 && rec.file_count == 1 && rec.content_bytes == 6000);
+        CHECK(svc.last_open.find("\"file_count\":1,") != std::string::npos && svc.last_open.find("\"content_bytes\":6000,") != std::string::npos);
+        CHECK(tr::sha256_hex(svc.received(ok_job.build_uuid)) == ok_job.package_sha256);
+    }
+    // 6. BYTES CHANGED AFTER VERIFICATION (same size, the write time put
+    // back): the changed part is never sent; the upload stops.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(7000, 6));
+        next = ms::Outcome::clean;
+        // Verify only: a session that refuses to open keeps it at packaged.
+        CHECK(tr::detail::verify_package(cfg, j));
+        const fs::path pkg = tr::path_of(j.package_path);
+        const auto t = fs::last_write_time(pkg);
+        {
+            std::fstream f(pkg, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp(200);
+            f.put('X');
+        }
+        fs::last_write_time(pkg, t);
+        const int p0 = svc.puts;
+        drive_once(cfg);
+        CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.error.find("changed since it was built") != std::string::npos);
+        CHECK(svc.puts == p0 && svc.received(j.build_uuid).empty());
+        CHECK(!fs::exists(uv::record_path(root, j.id)));
+    }
+    // 7. A RESTART MID-UPLOAD WITHOUT THE CLIENT'S RECORD (it was lost, or
+    // never this Client's): verified again before another byte is sent.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(3000, 7));
+        next = ms::Outcome::clean;
+        CHECK(tr::detail::verify_package(cfg, j));
+        uv::remove_record(root, j.id);
+        j.state = "uploading";
+        j.session_id = ed::random_hex32();
+        ed::write_job(root, j);
+        const int s0 = scans;
+        drive_once(cfg);
+        CHECK(scans == s0 + 1 && ed::read_job(root, j.id, got) && got.state == "done");
+    }
+    // 8. A HELD UPLOAD keeps its verification while the package is unchanged,
+    // and verifies again once it moved (a rebuilt package at the same path).
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(3000, 8));
+        next = ms::Outcome::clean;
+        CHECK(tr::detail::verify_package(cfg, j));
+        ed::read_job(root, j.id, j);
+        j.state = "held";
+        ed::write_job(root, j);
+        const int s0 = scans;
+        drive_once(cfg);
+        CHECK(scans == s0 && ed::read_job(root, j.id, got) && got.state == "done");
+        ed::Job k = packaged_job(root, random_bytes_str(3000, 9));
+        CHECK(tr::detail::verify_package(cfg, k));
+        ed::read_job(root, k.id, k);
+        k.state = "held";
+        ed::write_job(root, k);
+        write_zip(tr::path_of(k.package_path), { { "Game.exe", random_bytes_str(3100, 10) } });
+        const int s1 = scans;
+        drive_once(cfg);
+        // Rebuilt under the job: not the package the host recorded, so it stops.
+        CHECK(scans == s1 && ed::read_job(root, k.id, got) && got.state == "failed" && got.error.find("changed since it was built") != std::string::npos);
+    }
+    // 9. ANOTHER BUILD under the same job id (the job re-pointed): the record
+    // is of another build, so it is verified again.
+    {
+        ed::Job j = packaged_job(root, random_bytes_str(2000, 11));
+        next = ms::Outcome::clean;
+        CHECK(tr::detail::verify_package(cfg, j));
+        uv::Record rec;
+        std::string why;
+        ed::read_job(root, j.id, j);
+        CHECK(uv::vouches(root, j, rec, why));
+        j.build_uuid = ed::random_hex32();
+        CHECK(!uv::vouches(root, j, rec, why) && why.find("another build") != std::string::npos);
+    }
+    // 10. THE HOST'S PRECHECK SAID "detected": the Client establishes it from
+    // its own scan of the game's folder before anything is reported.
+    {
+        const fs::path source = root / "game";
+        fs::create_directories(source);
+        std::ofstream(source / "Game.exe") << "game";
+        ed::Job j;
+        j.id = ed::random_hex32();
+        j.kind = "upload";
+        j.state = "failed";
+        j.account_email = "dev@example.com";
+        j.game_id = "precheck";
+        j.game_uuid = ed::random_hex32();
+        j.scan_outcome = "detected";
+        j.source_path = utf8(source);
+        j.created_utc = tr::utc_now();
+        ed::write_job(root, j);
+        next = ms::Outcome::clean;
+        const int i0 = svc.incidents;
+        drive_once(cfg);
+        uv::Incident inc;
+        CHECK(svc.incidents == i0 && uv::read_incident(root, j.id, inc) && inc.examined && inc.incident.empty());
+        ed::Job j2 = j;
+        j2.id = ed::random_hex32();
+        ed::write_job(root, j2);
+        next = ms::Outcome::detected;
+        drive_once(cfg);
+        drive_once(cfg);
+        CHECK(svc.incidents == i0 + 1 && svc.last_incident.find("\"scan_source\"") != std::string::npos);
+    }
+    fs::remove_all(root);
+}
+
+// THE HEALTHY DEFENDER PATH, for real: Microsoft Defender on this computer
+// verifies a small clean package; where it cannot scan, it never uploads.
+static void test_upload_gate_real_defender() {
+    SECTION("the upload gate with the real scanner of this computer");
+    namespace ms = virule::core::malware_scan;
+    const fs::path root = temp_root("gate-real");
+    UploadService svc;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string& t) { std::printf("   %s\n", t.c_str()); };
+    ed::Job j = packaged_job(root, "a small clean game file " + random_bytes_str(64, 12));
+    const bool usable = ms::scanning_availability().usable;
+    drive_once(cfg);
+    ed::Job got;
+    CHECK(ed::read_job(root, j.id, got));
+    if (usable) {
+        CHECK(got.state == "done" && svc.completes == 1);
+        std::printf("   (Defender available: verified and uploaded)\n");
+    } else {
+        CHECK(got.state == "failed" && svc.opens == 0);
+        std::printf("   (no supported scanner here: refused, nothing uploaded)\n");
+    }
+    fs::remove_all(root);
+}
+
 int main(int argc, char** argv) {
     // The recovery-only mode as an installed wrapper with the marker runs
     // it (test_recovery_rules starts a copy of this exe as Game.exe).
@@ -1043,6 +1474,8 @@ int main(int argc, char** argv) {
     test_evidence_owner();
     test_recovery_rules();
     test_assignment_open();
+    test_upload_gate();
+    test_upload_gate_real_defender();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
 }

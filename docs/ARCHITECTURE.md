@@ -106,8 +106,26 @@ allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
 listed local development origins in `src/client/bridge.hpp`); anything
 else is dropped at handshake. A connection with NO Origin header is a
 local control connection (second-instance forwarding, Setup's shutdown
-request); local processes already run with the user's full power, so the
-origin check defends against the web, not against local code.
+request). The origin check defends against the WEB, not against local
+code: any local program can reach the control messages.
+
+LOCAL CALLERS VERSUS OPERATION AUTHORIZATION (owner decision 2026-11-02,
+`VIRULE/docs/specs/evaluation-security.md` decision 16). Reaching the
+bridge is never permission to skip a VIRULE rule. A privileged VIRULE
+operation enforces its own invariants at the component that owns its
+credential or action, whoever asked: there is no "trusted Admin" caller,
+since the Admin reaches this bridge exactly as any local program does and
+its screen checks are presentation only. Being a local caller suffices only
+for what such a program could already do itself (open virule://, run Setup
+or an update). Examples: an evaluation purchase is refused by the Client
+before it uses its authorization when this computer cannot verify games;
+the relay admits only the Admin's own requests, never the routes of the
+Client's own drivers. LIMIT: the account session and device key are
+DPAPI user-scope protected, which stops copying and other Windows users but
+is NOT a hardware boundary against hostile code already running as this
+user; VIRULE claims no protection from such code, only that it offers no
+supported path around its own rules (stronger endpoint isolation: open
+items).
 
 ### Message set (closed, versioned)
 
@@ -146,7 +164,8 @@ in both components).
 | local | `{"type":"account_link_qa"}` | the explicit QA identity link (the person chose it in the Admin) |
 | local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
 | local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
-| local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` (at most four `/[A-Za-z0-9_-]+` segments) made here under this installation's DPoP authorization; the body is the message's LAST field, raw JSON. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
+| local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` made here under this installation's DPoP authorization; since 2026-11-02 ONLY the Admin's own requests (`account_relay.hpp` `admin_route_ok`, see "Desktop account"), anything else is `bad_request`; the body is the message's LAST field, raw JSON. A purchase (POST `/v1/evaluations/purchases`) on a computer that is not ready answers `{"status":0,"error":"not_ready","reason","message"}` and nothing is sent. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"\|"not_ready"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
+| local | `{"type":"evaluation_purchase_readiness"}` | (2026-11-02) can THIS computer buy an evaluation now: THE CLIENT'S ANSWER, which the Admin only shows (`src/shared/evaluation_purchase_readiness.hpp`, the one rule). Answers `{"type":"evaluation_purchase_readiness","ready":bool,"reason":"supported"\|"unsupported_windows"\|"defender_off"\|"defender_out_of_date"\|"antivirus_unsupported","message":"<the owner's sentence, empty when ready>"}`; no product name, path or version leaves the Client (the detail is in its log). Refused to pages |
 | local | `{"type":"transfer_control","assignment_id":"<32 hex>","action":"pause"\|"resume"\|"retry"\|"verify"}` | GAME DISTRIBUTION (v0.9.14): pause, resume or re-queue the evaluator's install job for that assignment; `verify` (0.9.15) makes an INSTALLED assignment's launch chain current before the Admin launches its wrapper (see "Game distribution"); answers `{"type":"transfer_control","ok":bool}` (`verify` adds `"message"`); a malformed id or action answers `error` |
 | local | `{"type":"transfer_wake"}` | signal the transfer driver to run a pass now (the Admin host wrote or changed a job record); answers `{"type":"transfer_wake","ok":true}` |
 | local | `{"type":"transfer_status"}` | answers `{"type":"transfer_status","jobs":[...],"truncated":bool}`: every job record under `%LOCALAPPDATA%\VIRULE\transfers` as it stands (bounded); a read only |
@@ -290,6 +309,40 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   Client. A 401 refreshes once (a refused refresh signs out, as anywhere);
   no answer marks the snapshot offline. VIRULE_BACKEND
   `docs/EVALUATIONS.md` is the contract.
+  - ONLY THE ADMIN'S REQUESTS (owner decision 2026-11-02, `admin_route_ok`):
+    GET `/v1/evaluations` and `/v1/assignments`; POST `purchases`, `seen`,
+    `games/<id>`, `games/<id>/build`, `<id>/rating`; POST `preferences`,
+    `support`, `offers/open`, `offers/<id>/{close,accept,reject,decline}`
+    (ids 32 lowercase hex). The routes of the Client's own drivers
+    (`credential`, `<a>/runtime`, both `security/incident`, `<a>/download`
+    and its `complete`/`failed`, `games/<id>/uploads`, `uploads/*`,
+    `<a>/evidence/*`, `<a>/progress`, `early-completion`, `report`, `art`,
+    `<a>/ticket`) are refused before a token is touched: they are made only
+    by `transfers.hpp`, `runtime_report.hpp` and the evidence delivery,
+    where their scan, verification and machine binding happen. Since the
+    Phase 2 brief (2026-11-02) the service also requires a MACHINE PROOF on
+    the state-changing ones ("Machine proofs" below), so a lower-level
+    caller holding the account's authorization cannot make them either.
+  - PURCHASE ENFORCEMENT (owner decision 2026-11-02): `api_call` recognizes
+    POST `/v1/evaluations/purchases` on the parsed request it would send
+    (`account_relay::is_purchase`) and decides this computer's readiness
+    (`src/shared/evaluation_purchase_readiness.hpp`, the ONE rule: the
+    `os_support.hpp` Windows rule and `malware_scan::scanning_availability()`)
+    BEFORE it loads the device key, has or refreshes a token, makes the
+    DPoP proof or sends anything. Not ready: `{"status":0,"error":
+    "not_ready","reason","message"}`, nothing reaches the service, the
+    idempotency key is unspent, and the same request succeeds once the
+    computer is fixed. The caller does not matter; there is no simulation
+    exception. The Admin's readiness display is this rule's answer
+    (`evaluation_purchase_readiness`), never its own.
+  - STAGING-ONLY TEST SEAM `--test-purchase-blocker=<reason>` (ignored in
+    production): a blocker reported on top of the real answer. It can only
+    refuse, never make a computer ready. Proof against the real binary:
+    `tools/purchase_enforcement_test.mjs` (a direct local caller and the
+    Admin host's exact translation refused for each reason with nothing
+    reaching the real service routes; fixed, the same key buys once; the
+    drivers' routes refused). Units: `tests/purchase_readiness`,
+    `tests/account_relay`.
 - QA link: reads `qa_tester.cred`, proves the credential's machine key
   (dev_machine.cred), sends both under the DPoP authorization. The QA
   credential is never changed; QA keeps working without any account.
@@ -1494,7 +1547,9 @@ job under `%LOCALAPPDATA%\VIRULE\transfers\<job id>\job.json` whose stage is
 the Client's, one at a time:
 
 - `upload` (Build for Evaluation; the Admin host hands it over as
-  `packaged`): open or resume the service's upload session for the build
+  `packaged`): FIRST THE CLIENT'S OWN VERIFICATION (`verifying`; owner brief
+  2026-11-02, "Developer verification and the upload gate" below), then
+  open or resume the service's upload session for the build
   (`POST /v1/evaluations/games/<uuid>/uploads`; the same build always
   answers the same session), READ BACK which parts the service holds
   (`GET /uploads/<session>`), send every missing 32 MiB part with its
@@ -1502,9 +1557,9 @@ the Client's, one at a time:
   send again; 410 = renew the storage upload under the same session and
   send everything again; 404 = open the session again), complete it
   (`POST .../complete`; 409 `incomplete` = read back and continue), then
-  `done`: the service holds the hosted build. The package file's size
-  must still be the packaged one, else the job fails (`The package changed
-  since it was built. Build it again.`).
+  `done`: the service holds the hosted build. Every part must be the part
+  this Client verified (its SHA-256), else the job fails (`The package
+  changed since it was built. Build it again.`).
 - A HELD upload (0.9.20; owner brief 2026-10-22, UPLOAD ELIGIBILITY in
   `VIRULE_BACKEND/docs/EVALUATIONS.md`): the service refuses an upload for a
   game with no purchased evaluation still owed, or never bought for (409
@@ -1692,8 +1747,103 @@ evaluator-controlled computer).
 
 INCIDENTS are reported by `run_pass` from any job, a failed one included,
 until the service answers (developer: `/v1/evaluations/games/<uuid>/
-security/incident` for an upload job the Admin host failed; evaluator:
-`/v1/assignments/<id>/security/incident`).
+security/incident`; evaluator: `/v1/assignments/<id>/security/incident`),
+and ONLY INCIDENTS THIS CLIENT PRODUCED (2026-11-02): each is kept sealed in
+Client-owned storage (`client\incidents\<job>.json`,
+`src/client/upload_verification.hpp`), never in the job, whose `incident`
+field (written by older builds) is never sent. When the Admin host's
+precheck, build or packaging met the antivirus (the job failed with
+`scan_outcome` `detected` or `removed`), the Client establishes it itself,
+once (`establish_host_detection`): Defender's own record of acting on the
+job's `source_path` or `build_path` since the job began, else its own scan
+of the game's folder; found, its own incident (`scan_source`, or
+`scan_package` once a build was packaged); not found, nothing is sent.
+
+## Developer verification and the upload gate (owner brief 2026-11-02, "Client Security Authority Phase 2"; STAGING; `src/client/transfers.hpp`, `upload_verification.hpp`, `client_seal.hpp`)
+
+THE CLIENT OWNS THE DEVELOPER-SIDE VERDICT (`VIRULE/docs/specs/evaluation-security.md`
+decisions 19 and 21). The Admin host's `scanning_source` (`Analyzing`) is a
+non-authoritative precheck that can only stop a job; it builds, packages and
+hands over `packaged`, and it declares nothing clean. A `packaged` job is the
+host's statement that it built a package, nothing more.
+
+- VERIFYING (`verify_package`): the job goes to `verifying` (owner 0: this
+  Client's stage; the Admin shows `Verifying`). The Client reads the package
+  once for its SHA-256 and the SHA-256 of every 32 MiB part, compares the
+  whole digest with the one the host packaged, lists the archive's contents
+  (the 20 GB cap), checks free space for one more copy, extracts it with the
+  install's zip-slip-guarded extractor into `<package>.verify` beside it,
+  copies the wrapper's original executable into `<package>.verify-originals`
+  (`extract_wrapped_originals`, never run), and scans the package, the
+  extraction and the originals (`malware_scan.hpp`, the one engine and
+  policy). Both scratch folders are always removed.
+- THE RECORD: clean, with the package still the size and last write time it
+  was read with, the Client writes `client\upload_verification\<job>.json`:
+  job, game, build, package path, size, write time, SHA-256, part digests,
+  content size, file count, launch file, scanner and versions, sealed with an
+  HMAC-SHA256 under the Client's own random key (`client\seal.key`, DPAPI,
+  entropy `VIRULE.Client.Seal.v1`; unreadable, it is replaced, which only
+  means verifying again). The job then carries the Client's figures.
+- THE GATE (`run_upload`): the record must be sealed by this Client and name
+  this job, game, build and package path, and the package must still have
+  its size and write time; otherwise the Client verifies again (a first
+  upload, a restart, a lost or foreign record, a held upload whose package
+  moved) or stops. Nothing in the job (`scan_outcome`, `state`, `incident`)
+  is read as authority. The session is opened with the record's digest,
+  size, content size, file count and launch file, and each part's SHA-256
+  must equal the recorded part before it is sent; a difference drops the
+  record and fails the job. Held and resumed uploads keep the record only
+  while the package is unchanged.
+- FAILURES: unsupported, unavailable, error and incomplete scans fail the job
+  with `malware_scan.hpp` `unverified_sentence(..., "Build")`; a detection or
+  removal with `Windows Security found a threat in this game, so it was not
+  sent.`, and it is the Client's own incident (`scan_package`, its build).
+- TESTS: `tests/transfers` `test_upload_gate` (the state the driver sees,
+  built directly: a forged clean job, a detection, an incident written into
+  a job file, a forged record, the healthy path with wrong host figures,
+  bytes changed after verification with the write time put back, a restart
+  without the record, held uploads changed and unchanged, another build
+  under the same job, a host-reported detection established or not) and
+  `test_upload_gate_real_defender` (this computer's real scanner).
+- LIMIT: the Client and the Admin are the same Windows user; a program
+  running as that user could read the DPAPI-protected key or change the
+  package between the read and the extraction and back (accepted MVP
+  boundary, decision 23).
+
+## Machine proofs (owner brief 2026-11-02; STAGING; `src/shared/machine_proof.hpp`, `src/client/main.cpp` AccountTransferService; the service half `VIRULE_BACKEND/docs/EVALUATIONS.md` "Machine proofs")
+
+The routes only this Client's drivers make carry a proof from this
+computer's Ed25519 identity (`dev_machine.cred`), the QA link's convention
+(`<API host>|<device id>`, `account_link_qa`):
+
+- BINDING: the evaluator credential request (`ensure_launch_chain`) is
+  `{machine_key, timestamp, machine_signature}` over
+  `virule-evaluator-bind.v1|<host>|<device id>|<key>|<timestamp>`, and it is
+  made at every launch-chain refresh, even when the credential held here
+  matches, so a binding the service does not count as proved is proved
+  before the wrapper needs it. The developer's key is proved at `POST
+  /v1/evaluations/machine` (`virule-developer-machine.v1`).
+- REQUEST PROOFS, signed centrally in `AccountTransferService::call` for
+  exactly `machine_proof::role_of`'s routes (the evaluator's incident,
+  download `complete`/`failed`, evidence package registration, early
+  completion and report; the developer's incident, upload session open and
+  complete): headers `x-virule-machine-key`, `-timestamp`, `-signature` over
+  `virule-evaluation-request.v1|<host>|<device id>|<role>|<METHOD>|<path>|<sha256 of the body>|<timestamp>`,
+  signed afresh at every attempt (never stored with a queued request). A
+  `machine_not_bound` answer (a first use, a re-issued identity, a staging
+  reset) proves the key for the role once and asks once more; the runtime
+  report's own proof gets the same treatment (the service answers it
+  `machine_not_bound` for an unproved key). A proven route is NEVER sent
+  without its proof: no identity or no device id yet is "no answer" (status
+  0, the driver's own ladder; the device id is asked for), and an incident
+  answered 401 is sent again, never marked reported.
+- None of these routes is reachable through the local relay
+  (`account_relay.hpp`); the relay's own routes carry no machine proof.
+- DOWNLOADS: a receipt the service refuses as `not_delivered` (it never
+  streamed the whole package to the assignment) deletes the partial file and
+  downloads again from the first byte.
+- LIMIT: the machine key is shared with the Admin and the wrapper, so a proof
+  establishes this computer, not which VIRULE component asked.
 
 BEFORE EVERY PLAY (`src/client/launcher.hpp`, its header): (1) the
 service's current word, the ticket GET bounded at 2 s per step and 3 s to
@@ -1885,6 +2035,23 @@ waiting while running, closed then recovered then removed, the draft
 deleted, the evidence folder and the mark kept, repeated with nothing more
 to do, a folder outside the installs location never deleted; the launcher's
 refusal).
+
+## The report waits for this computer's sessions (owner brief 2026-11-02; `src/shared/evidence_queue.hpp` `local_completeness`)
+
+The report request is written by the Admin host; the Client posts it
+(`run_requests`). Only this Client can know a session its computer finalized
+and never sent, so it holds the report, off the failure ladder (looked at
+again every 30 s, `local_evidence_pending` in its delivery state), while any
+session finalized here (the wrapper's ledger and every package the evidence
+root holds for the assignment) has no acknowledgment (a receipt here, or the
+service's progress listing it; a simulated receipt counts only through the
+staging test transport), while the service is still receiving one, or while
+a session is still open here (`open_session.json`). Then it sends the report
+naming every one of those sessions in `packages`, replacing whatever list the
+request carried, so the service checks each is held whole. The predicate is
+the shared `writing_unlock` the Admin host and the wrapper read. The service
+keeps its own eligibility and completeness: it cannot know of a session the
+machine never sent, and the Client cannot make it count one it does not hold.
 
 ## Evaluation evidence delivery (2026-10-14; the service since 0.9.17)
 

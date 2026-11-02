@@ -4,11 +4,23 @@
 // service's answer is handed back. Pure string work with no dependencies,
 // so it is unit-tested on its own (tests/account_relay).
 //
-// The relay reaches EXACTLY two path families of the VIRULE API,
-// /v1/evaluations and /v1/assignments (VIRULE_BACKEND docs/EVALUATIONS.md),
-// with GET or POST. Everything else is refused before a token is touched.
+// The relay reaches EXACTLY the Admin's own requests of the two path
+// families of the VIRULE API, /v1/evaluations and /v1/assignments
+// (VIRULE_BACKEND docs/EVALUATIONS.md), with GET or POST (admin_route_ok).
+// Everything else is refused before a token is touched.
+//
+// THE CLIENT'S OWN DRIVERS' ROUTES ARE NEVER RELAYED (owner decision
+// 2026-11-02, "no lower-level bypass"): the evaluator credential for THIS
+// machine's key, the signed runtime report, the security incidents, the
+// download and its verified receipt, the upload sessions, the evidence
+// packages, early completion and the report are made only by the Client's
+// own code (client/transfers.hpp, runtime_report.hpp, evidence delivery),
+// which is where their scan, verification and machine binding happen. A
+// local program reaching this bridge cannot make them with the account's
+// authorization instead.
 
 #include <string>
+#include <vector>
 
 #include "shared/json_scan.hpp"
 
@@ -56,6 +68,49 @@ inline std::string body_of(const std::string& message) {
     return message.substr(vb, message.size() - 1 - vb);
 }
 
+/** THE ADMIN'S REQUESTS, AND ONLY THEM (owner decision 2026-11-02): the
+ *  exact set the Admin UI makes (admin_ui src/ui/evaluations/evaluationState.ts,
+ *  src/ui/assignments/assignmentState.ts, EvaluatorSupport.tsx). `path` has
+ *  already passed path_ok. An id is 32 lowercase hex, as the service routes
+ *  it (VIRULE_BACKEND src/evaluations/developer.ts, evaluator.ts). */
+inline bool is_id(const std::string& s) {
+    if (s.size() != 32) return false;
+    for (const char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+inline bool admin_route_ok(const std::string& method, const std::string& path) {
+    std::vector<std::string> seg;
+    for (size_t i = 1; i <= path.size();) {
+        const size_t j = path.find('/', i);
+        seg.push_back(path.substr(i, (j == std::string::npos ? path.size() : j) - i));
+        if (j == std::string::npos) break;
+        i = j + 1;
+    }
+    // seg[0] == "v1", seg[1] == the family.
+    if (seg.size() < 2 || seg[0] != "v1") return false;
+    const bool dev = seg[1] == "evaluations";
+    const size_t n = seg.size() - 2;
+    const auto at = [&](size_t k) -> const std::string& { return seg[k + 2]; };
+    if (method == "GET") return n == 0;   // the developer view, the evaluator workspace
+    if (method != "POST") return false;
+    if (dev) {
+        if (n == 1) return at(0) == "purchases" || at(0) == "seen";
+        if (n == 2) return (at(0) == "games" && is_id(at(1))) || (is_id(at(0)) && at(1) == "rating");   // the profile; a rating
+        if (n == 3) return at(0) == "games" && is_id(at(1)) && at(2) == "build";                       // the build record
+        return false;
+    }
+    if (n == 1) return at(0) == "preferences" || at(0) == "support";
+    if (n == 2) return at(0) == "offers" && at(1) == "open";
+    if (n == 3) {
+        return at(0) == "offers" && is_id(at(1)) &&
+               (at(2) == "close" || at(2) == "accept" || at(2) == "reject" || at(2) == "decline");
+    }
+    return false;
+}
+
 /** One relay request as the Client reads it: the method, the path and (for
  *  a POST) the raw body. `ok` false = refused before a token is touched. */
 struct Request {
@@ -69,12 +124,21 @@ inline Request parse(const std::string& message) {
     Request r;
     if (!json_scan::find_string_in(message, 0, message.size(), "method", r.method) ||
         !json_scan::find_string_in(message, 0, message.size(), "path", r.path) ||
-        (r.method != "GET" && r.method != "POST") || !path_ok(r.path)) {
+        (r.method != "GET" && r.method != "POST") || !path_ok(r.path) || !admin_route_ok(r.method, r.path)) {
         return Request{};
     }
     if (r.method == "POST") r.body = body_of(message);
     r.ok = true;
     return r;
+}
+
+/** THE PURCHASE (owner decision 2026-11-02): the one request that buys
+ *  evaluations, exactly as the service routes it (VIRULE_BACKEND
+ *  src/evaluations/developer.ts, `rest === "/purchases"`, POST). Decided on
+ *  the PARSED request, which is exactly what api_call would send, so no
+ *  spelling of the message reaches the purchase without being recognized. */
+inline bool is_purchase(const Request& r) {
+    return r.ok && r.method == "POST" && r.path == "/v1/evaluations/purchases";
 }
 
 /** The service's body trimmed of surrounding whitespace when it is a JSON
@@ -96,6 +160,16 @@ inline std::string answer(unsigned long status, const std::string& body) {
 /** The relay's answer when there was no HTTP answer at all. */
 inline std::string failure(const char* error) {
     return std::string("{\"type\":\"account_api\",\"status\":0,\"error\":\"") + error + "\"}";
+}
+
+/** The relay's answer when THIS COMPUTER cannot buy an evaluation
+ *  (shared/evaluation_purchase_readiness.hpp): nothing was sent, so there
+ *  is no HTTP status; `reason` is the readiness code and `message` the
+ *  sentence for the person. `message` is the owner's fixed copy, never
+ *  caller input, and is quoted as JSON. */
+inline std::string not_ready(const std::string& reason_json, const std::string& message_json) {
+    return "{\"type\":\"account_api\",\"status\":0,\"error\":\"not_ready\",\"reason\":" + reason_json +
+           ",\"message\":" + message_json + "}";
 }
 
 /** The largest answer handed back (inside the bridge's local frame bound). */

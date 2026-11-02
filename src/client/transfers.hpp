@@ -91,6 +91,7 @@
 #include <vector>
 
 #include "client/assignment_cleanup.hpp"
+#include "client/upload_verification.hpp"
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
@@ -237,6 +238,14 @@ struct Service {
     }
     // This installation's machine identity (the evaluator credential binds to it).
     virtual std::string machine_key() = 0;
+    // THE BINDING'S PROOF OF POSSESSION (owner brief 2026-11-02;
+    // shared/machine_proof.hpp): the body of the evaluator credential
+    // request, `{machine_key, timestamp, machine_signature}`, signed by this
+    // computer's identity for this account's device authorization. The
+    // production service signs it (main.cpp); a harness stand-in names the key.
+    virtual std::string machine_bind_body(const std::string& /*role*/) {
+        return "{\"machine_key\":\"" + machine_key() + "\"}";
+    }
 };
 
 // ------------------------------------------------------------ control ----
@@ -359,6 +368,9 @@ struct DriverConfig {
     // installed assignment): the service's progress is fetched and kept,
     // so a fresh installation knows the assignment's whole history.
     std::function<void(const std::string&)> after_install;
+    // The malware scan (malware_scan.hpp ms::scan). Unset = the real one,
+    // always, in the Client; only the unit harness stands one in.
+    std::function<ms::Result(const std::vector<fs::path>&, const std::string& since_utc, const std::function<bool()>& keep_going)> scan;
 };
 
 namespace detail {
@@ -411,6 +423,24 @@ inline bool stopping(const DriverConfig& cfg) {
     return cfg.stop_event && WaitForSingleObject(cfg.stop_event, 0) == WAIT_OBJECT_0;
 }
 
+inline ms::Result run_scan(const DriverConfig& cfg, const std::vector<fs::path>& targets, const std::string& since,
+                           const std::function<bool()>& keep_going) {
+    return cfg.scan ? cfg.scan(targets, since, keep_going) : ms::scan(targets, since, keep_going, {});
+}
+
+namespace uv = vclient::upload_verification;
+
+/** Keep an incident THIS CLIENT produced, sealed in its own storage, for the
+ *  service (reported by the pass; upload_verification.hpp). */
+inline void keep_incident(const DriverConfig& cfg, const ed::Job& j, const std::string& incident) {
+    uv::Incident i;
+    i.incident = incident;
+    i.examined = true;
+    i.route = ed::is_upload(j) ? "/v1/evaluations/games/" + j.game_uuid + "/security/incident"
+                               : "/v1/assignments/" + j.assignment_id + "/security/incident";
+    if (!uv::write_incident(cfg.root, j.id, i)) log(cfg, j.id + " the incident could not be kept for the service");
+}
+
 // ------------------------------------------------ local malware scanning ----
 // (owner brief 2026-10-30; virule/core/malware_scan.hpp). The evaluator's
 // delivered build is scanned after extraction and before it is placed; the
@@ -451,8 +481,7 @@ inline void scan_failed(const DriverConfig& cfg, ed::Job& j, const ms::Result& r
     if (ms::is_incident(r.outcome)) {
         fs::remove(temp, ec);
         j.security_held = true;
-        j.incident = ms::incident_json(r, ed::random_hex32(), operation, "", j.revision_id);
-        j.incident_reported = false;
+        keep_incident(cfg, j, ms::incident_json(r, ed::random_hex32(), operation, "", j.revision_id));
         if (!j.download_id.empty()) {
             (void)cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/failed",
                 "{\"reason\":\"security\"}", "application/json", {});
@@ -491,18 +520,22 @@ inline std::string body_code(const std::string& body) {
     return c;
 }
 
-/** Report a recorded incident to the service, once: the developer's on the
- *  game, the evaluator's on the assignment. A refusal the service will
- *  always give (4xx but 429) is logged and not sent again. */
-inline void report_incident(const DriverConfig& cfg, ed::Job& j) {
-    const std::string route = ed::is_upload(j)
-        ? "/v1/evaluations/games/" + j.game_uuid + "/security/incident"
-        : "/v1/assignments/" + j.assignment_id + "/security/incident";
-    const Reply r = cfg.service->call("POST", route, j.incident, "application/json", {});
-    if (r.status == 200 || r.status == 201 || (r.status >= 400 && r.status < 500 && r.status != 429)) {
+/** Report THIS CLIENT'S incident of the job to the service, once (the
+ *  developer's on the game, the evaluator's on the assignment; the route was
+ *  fixed when the Client recorded it). A refusal the service will always give
+ *  (4xx but 429) is logged and not sent again. A job file's `incident` is
+ *  never sent (upload_verification.hpp). */
+inline void report_incident(const DriverConfig& cfg, const ed::Job& j) {
+    uv::Incident i;
+    if (!uv::read_incident(cfg.root, j.id, i) || i.incident.empty() || i.reported) return;
+    const Reply r = cfg.service->call("POST", i.route, i.incident, "application/json", {});
+    // 401 is never final here: this Client always signs an incident, so a
+    // refusal of its authorization or its machine proof (a binding, a clock)
+    // resolves, and the incident is sent again.
+    if (r.status == 200 || r.status == 201 || (r.status >= 400 && r.status < 500 && r.status != 429 && r.status != 401)) {
         if (r.status >= 400) log(cfg, j.id + " incident refused by the service (" + std::to_string(r.status) + "): " + body_message(r.body));
-        j.incident_reported = true;
-        save(cfg, j);
+        i.reported = true;
+        (void)uv::write_incident(cfg.root, j.id, i);
         log(cfg, j.id + " incident reported");
     }
 }
@@ -533,16 +566,25 @@ inline std::vector<std::int64_t> uploaded_of(const std::string& body) {
 }
 
 // ---- upload
+//
+// THE CLIENT OWNS THE VERDICT (owner brief 2026-11-02, "Client Security
+// Authority Phase 2" sections 4 to 9; client/upload_verification.hpp). A
+// `packaged` job is only the Admin host's statement that it built a package.
+// This driver verifies the exact package itself (`verifying`, verify_package
+// below: its own digest, its own extraction, its own scan) and uploads only
+// what its own sealed record vouches for: the session is opened with the
+// digest, size, content and parts THIS CLIENT computed, every part's bytes
+// are compared with the part it verified before they are sent, and anything
+// else (no record, a record of another build or path, a package whose size or
+// write time moved) is verified again or stops the upload. Nothing the job
+// says about a scan (`scan_outcome`, `state`, `incident`) is ever read as
+// authority. No Client verification, no upload.
 
-inline bool package_intact(const ed::Job& j) {
-    std::error_code ec;
-    const fs::path p = path_of(j.package_path);
-    const auto sz = fs::file_size(p, ec);
-    return !ec && static_cast<std::uint64_t>(sz) == j.package_bytes;
-}
+inline constexpr const char* kPackageChanged = "The package changed since it was built. Build it again.";
+inline constexpr const char* kUploadThreat = "Windows Security found a threat in this game, so it was not sent.";
 
-inline bool read_part(const ed::Job& j, std::int64_t n, std::string& out) {
-    const std::uint64_t len = ed::part_bytes(j.package_bytes, static_cast<std::uint64_t>(n));
+inline bool read_part(const ed::Job& j, std::uint64_t package_bytes, std::int64_t n, std::string& out) {
+    const std::uint64_t len = ed::part_bytes(package_bytes, static_cast<std::uint64_t>(n));
     const std::uint64_t off = static_cast<std::uint64_t>(n - 1) * ed::kPartBytes;
     FILE* f = nullptr;
     if (_wfopen_s(&f, path_of(j.package_path).wstring().c_str(), L"rb") != 0 || !f) return false;
@@ -553,12 +595,13 @@ inline bool read_part(const ed::Job& j, std::int64_t n, std::string& out) {
     return okd;
 }
 
-// Open (or resume) the session; false = deferred or failed (the job says).
-inline bool open_session(const DriverConfig& cfg, ed::Job& j) {
-    const std::string body = "{\"build_uuid\":\"" + j.build_uuid + "\",\"built_utc\":\"" + j.built_utc +
-        "\",\"file_count\":" + std::to_string(j.file_count) + ",\"content_bytes\":" + std::to_string(j.content_bytes) +
-        ",\"package_bytes\":" + std::to_string(j.package_bytes) + ",\"package_sha256\":\"" + j.package_sha256 +
-        "\",\"launch_exe\":" + ev::json::quote(j.launch_exe) + ",\"part_bytes\":" + std::to_string(ed::kPartBytes) + "}";
+// Open (or resume) the session with THIS CLIENT'S figures; false = deferred
+// or failed (the job says).
+inline bool open_session(const DriverConfig& cfg, ed::Job& j, const uv::Record& rec) {
+    const std::string body = "{\"build_uuid\":\"" + rec.build_uuid + "\",\"built_utc\":\"" + j.built_utc +
+        "\",\"file_count\":" + std::to_string(rec.file_count) + ",\"content_bytes\":" + std::to_string(rec.content_bytes) +
+        ",\"package_bytes\":" + std::to_string(rec.package.bytes) + ",\"package_sha256\":\"" + rec.package_sha256 +
+        "\",\"launch_exe\":" + ev::json::quote(rec.launch_exe) + ",\"part_bytes\":" + std::to_string(ed::kPartBytes) + "}";
     const Reply r = cfg.service->call("POST", "/v1/evaluations/games/" + j.game_uuid + "/uploads", body, "application/json", {});
     if (r.status == 200 || r.status == 201) {
         std::string sid, state;
@@ -568,7 +611,7 @@ inline bool open_session(const DriverConfig& cfg, ed::Job& j) {
         j.session_id = sid;
         j.parts_done = uploaded_of(r.body);
         j.bytes_done = 0;
-        for (const auto n : j.parts_done) j.bytes_done += ed::part_bytes(j.package_bytes, static_cast<std::uint64_t>(n));
+        for (const auto n : j.parts_done) j.bytes_done += ed::part_bytes(rec.package.bytes, static_cast<std::uint64_t>(n));
         j.state = state == "verified" ? "registering" : "uploading";
         j.error.clear();
         save(cfg, j);
@@ -590,8 +633,12 @@ inline bool open_session(const DriverConfig& cfg, ed::Job& j) {
 // Every part the service does not hold, in order. false = stopped early.
 // The session is READ BACK first: the service's list of parts, never this
 // record alone, decides what is sent (a part acknowledged after a crash is
-// not sent again; one the storage lost is).
-inline bool send_parts(const DriverConfig& cfg, ed::Job& j) {
+// not sent again; one the storage lost is). EVERY PART IS THE VERIFIED PART:
+// its SHA-256 is compared with the one this Client recorded when it verified
+// the package; a difference means the package changed since, and the upload
+// stops (the record goes; a new Build for Evaluation verifies again).
+inline bool send_parts(const DriverConfig& cfg, ed::Job& j, const uv::Record& rec) {
+    const std::uint64_t total_bytes = rec.package.bytes;
     {
         const Reply rs = cfg.service->call("GET", "/v1/evaluations/uploads/" + j.session_id, "", "", {});
         if (rs.status == 200) {
@@ -600,7 +647,7 @@ inline bool send_parts(const DriverConfig& cfg, ed::Job& j) {
             if (state == "verified") { j.state = "registering"; save(cfg, j); return true; }
             j.parts_done = uploaded_of(rs.body);
             j.bytes_done = 0;
-            for (const auto k : j.parts_done) j.bytes_done += ed::part_bytes(j.package_bytes, static_cast<std::uint64_t>(k));
+            for (const auto k : j.parts_done) j.bytes_done += ed::part_bytes(total_bytes, static_cast<std::uint64_t>(k));
             save(cfg, j);
         } else if (rs.status == 404) {
             j.session_id.clear(); j.parts_done.clear(); j.bytes_done = 0; j.state = "packaged";
@@ -612,22 +659,28 @@ inline bool send_parts(const DriverConfig& cfg, ed::Job& j) {
         }
     }
     std::int64_t integrity_retries = 0;
-    for (std::int64_t n = 1; n <= j.parts_total; ++n) {
+    const std::int64_t parts = static_cast<std::int64_t>(rec.part_sha256.size());
+    for (std::int64_t n = 1; n <= parts; ++n) {
         if (stopping(cfg)) return false;
         if (std::find(j.parts_done.begin(), j.parts_done.end(), n) != j.parts_done.end()) continue;
-        if (!package_intact(j)) { fail(cfg, j, "The package changed since it was built. Build it again."); return false; }
         std::string part;
-        if (!read_part(j, n, part)) { defer(cfg, j, "The package could not be read."); return false; }
+        if (!read_part(j, total_bytes, n, part)) { defer(cfg, j, "The package could not be read."); return false; }
         const std::string sha = sha256_hex(part);
         const std::string md5 = md5_hex(part);
         if (sha.empty() || md5.empty()) { defer(cfg, j, "The part could not be hashed."); return false; }
+        if (sha != rec.part_sha256[static_cast<size_t>(n - 1)]) {
+            uv::remove_record(cfg.root, j.id);
+            log(cfg, j.id + " part " + std::to_string(n) + " is not the part this Client verified; the upload stops");
+            fail(cfg, j, kPackageChanged);
+            return false;
+        }
         const Reply r = cfg.service->call("PUT", "/v1/evaluations/uploads/" + j.session_id + "/parts/" + std::to_string(n),
             part, "application/octet-stream", { { "x-virule-part-sha256", sha }, { "x-virule-part-md5", md5 } });
         if (r.status == 200) {
             j.parts_done = uploaded_of(r.body);
             if (std::find(j.parts_done.begin(), j.parts_done.end(), n) == j.parts_done.end()) j.parts_done.push_back(n);
             j.bytes_done = 0;
-            for (const auto k : j.parts_done) j.bytes_done += ed::part_bytes(j.package_bytes, static_cast<std::uint64_t>(k));
+            for (const auto k : j.parts_done) j.bytes_done += ed::part_bytes(total_bytes, static_cast<std::uint64_t>(k));
             j.attempts = 0;
             j.error.clear();
             save(cfg, j);
@@ -703,32 +756,6 @@ inline void complete_session(const DriverConfig& cfg, ed::Job& j) {
     defer(cfg, j, r.status == 0 ? "Couldn't reach our servers right now." : body_message(r.body));
 }
 
-inline void run_upload(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
-    if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
-    if (j.account_email != email) return;   // another account: untouched
-    if (j.state == "held") {
-        // A new Build for Evaluation of the game replaced it: retired, never
-        // carried (this driver is the held job's only writer).
-        ed::Job newest;
-        if (ed::newest_upload_for_game(cfg.root, j.game_id, newest) && newest.id != j.id) {
-            fail(cfg, j, "Replaced by a newer build.");
-            return;
-        }
-    }
-    if (!package_intact(j)) { fail(cfg, j, "The package changed since it was built. Build it again."); return; }
-    // A held upload asks again by opening its session: the service resumes
-    // the same one (its parts kept) or answers it verified.
-    if (j.state == "packaged" || j.state == "held" || j.session_id.empty()) {
-        if (!open_session(cfg, j)) return;
-    }
-    if (j.state == "uploading") {
-        if (!send_parts(cfg, j)) return;
-    }
-    if (j.state == "registering") complete_session(cfg, j);
-}
-
-// ---- install
-
 // Zip-slip guarded extraction of the verified package into `dst` (miniz,
 // wide-path IO, nothing buffered beyond one read).
 struct FileReader { FILE* in = nullptr; };
@@ -789,6 +816,251 @@ inline bool extract_zip(const fs::path& zip_path, const fs::path& dst, std::stri
     return okd;
 }
 
+
+// ------------------------------------------- the Client's own verification ----
+
+inline std::string upload_scan_sentence(const ms::Result& r) {
+    if (ms::is_incident(r.outcome)) return kUploadThreat;
+    return ms::unverified_sentence(r.outcome, r.why_unavailable, "Build");
+}
+
+// The package's contents as its own directory lists them: the bytes the
+// files hold and how many there are (the 20 GB cap is on contents).
+inline bool zip_contents(const fs::path& zip_path, std::uint64_t& bytes, std::uint64_t& files, std::string& why) {
+    bytes = 0;
+    files = 0;
+    std::error_code ec;
+    const auto size = fs::file_size(zip_path, ec);
+    if (ec) { why = kPackageChanged; return false; }
+    FileReader reader;
+    if (_wfopen_s(&reader.in, zip_path.wstring().c_str(), L"rb") != 0 || !reader.in) { why = "The package could not be opened."; return false; }
+    mz_zip_archive zip{};
+    zip.m_pRead = zip_read_cb;
+    zip.m_pIO_opaque = &reader;
+    if (!mz_zip_reader_init(&zip, size, 0)) { fclose(reader.in); why = "The package is not a valid archive. Build it again."; return false; }
+    bool okd = true;
+    const mz_uint n = mz_zip_reader_get_num_files(&zip);
+    for (mz_uint i = 0; i < n; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&zip, i, &st)) { okd = false; why = "The package could not be listed."; break; }
+        if (mz_zip_reader_is_file_a_directory(&zip, i)) continue;
+        bytes += static_cast<std::uint64_t>(st.m_uncomp_size);
+        ++files;
+    }
+    mz_zip_reader_end(&zip);
+    fclose(reader.in);
+    return okd;
+}
+
+inline std::uint64_t free_bytes_at(const fs::path& p) {
+    ULARGE_INTEGER avail{}, total{}, all{};
+    return GetDiskFreeSpaceExW(p.wstring().c_str(), &avail, &total, &all) ? avail.QuadPart : 0;
+}
+
+/** VERIFYING (owner brief 2026-11-02 sections 6 to 8): this Client reads the
+ *  exact package the job names, extracts it into a scratch folder beside it
+ *  (zip-slip guarded, as an install does), copies the original executable out
+ *  of the wrapper, and scans the package, everything in it and that original
+ *  with the one scanning engine and policy (malware_scan.hpp). Clean, and the
+ *  package still the size and write time it had: the sealed record is
+ *  written, and the job carries this Client's own figures. Anything else ends
+ *  the job with one sentence; a detection or removal is this Client's own
+ *  incident for the service. The scratch folders are always removed. True =
+ *  verified now. */
+inline bool verify_package(const DriverConfig& cfg, ed::Job& j) {
+    j.state = "verifying";
+    j.owner_pid = 0;
+    j.error.clear();
+    j.permille = 1000;
+    j.bytes_done = 0;
+    save(cfg, j);
+    uv::remove_record(cfg.root, j.id);
+    const auto keep = [&]() { return !stopping(cfg); };
+    if (!ev::is_hex32(j.build_uuid) || !ev::is_hex32(j.game_uuid) || j.package_path.empty() || j.launch_exe.empty()) {
+        fail(cfg, j, "The build is incomplete. Build it again.");
+        return false;
+    }
+    const fs::path pkg = path_of(j.package_path);
+    uv::Identity before;
+    if (!uv::identity_of(pkg, before)) { fail(cfg, j, kPackageChanged); return false; }
+    if (before.bytes > ed::kGameMaxBytes + ed::kPackageOverheadMaxBytes) { fail(cfg, j, ed::too_large_sentence(before.bytes)); return false; }
+    uv::Digests d;
+    if (!uv::digest_package(pkg, before.bytes, d, keep)) {
+        if (stopping(cfg)) return false;
+        defer(cfg, j, "The package could not be read.");
+        return false;
+    }
+    // The package on disk is the one the host packaged (its manifest's digest).
+    if (!j.package_sha256.empty() && d.sha256 != j.package_sha256) { fail(cfg, j, kPackageChanged); return false; }
+    std::uint64_t content = 0, files = 0;
+    std::string why;
+    if (!zip_contents(pkg, content, files, why)) { fail(cfg, j, why); return false; }
+    if (!ed::within_cap(content)) { fail(cfg, j, ed::too_large_sentence(content)); return false; }
+    const fs::path scratch = pkg.parent_path() / path_of(j.build_uuid + ".verify");
+    const fs::path originals = pkg.parent_path() / path_of(j.build_uuid + ".verify-originals");
+    std::error_code ec;
+    const auto cleanup = [&]() { std::error_code e2; fs::remove_all(scratch, e2); fs::remove_all(originals, e2); };
+    // Scratch folders a crashed verification left beside any package here
+    // (only this Client makes these names) go first.
+    for (fs::directory_iterator it(pkg.parent_path(), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::wstring n = it->path().filename().wstring();
+        const auto ends = [&](const std::wstring& suffix) { return n.size() > suffix.size() && n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0; };
+        std::error_code e3;
+        if (it->is_directory(e3) && (ends(L".verify") || ends(L".verify-originals"))) fs::remove_all(it->path(), e3);
+    }
+    ec.clear();
+    cleanup();
+    const std::uint64_t needed = content + 256ull * 1024ull * 1024ull;
+    const std::uint64_t free_now = free_bytes_at(pkg.parent_path());
+    if (free_now < needed) {
+        fail(cfg, j, "Not enough free space on the build drive: " + ed::format_gb(needed) + " needed, " + ed::format_gb(free_now) + " free.");
+        return false;
+    }
+    const std::string since = ms::detail::utc_now();
+    ms::Result r;
+    fs::create_directories(scratch, ec);
+    if (!extract_zip(pkg, scratch, why, keep)) {
+        if (stopping(cfg)) { cleanup(); return false; }
+        std::vector<ms::Threat> seen;
+        if (!antivirus_acted({scratch, pkg}, since, seen)) { cleanup(); fail(cfg, j, why); return false; }
+        r = removal_of(seen, why, "A game file was refused or removed by the antivirus while the package was verified.");
+    } else if (!fs::is_regular_file(scratch / path_of(j.launch_exe), ec) || ec) {
+        std::vector<ms::Threat> seen;
+        if (!antivirus_acted({scratch, pkg}, since, seen)) { cleanup(); fail(cfg, j, "The build has no " + j.launch_exe + ". Build it again."); return false; }
+        r = removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus while the package was verified.");
+    } else {
+        const ms::Extracted x = ms::extract_wrapped_originals(scratch, originals, keep);
+        if (!x.ok) {
+            if (stopping(cfg)) { cleanup(); return false; }
+            if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
+            else { r.outcome = ms::Outcome::error; r.detail = x.why; r.scanner = "Microsoft Defender Antivirus"; }
+        } else {
+            r = run_scan(cfg, { pkg, scratch, originals }, since, keep);
+        }
+    }
+    cleanup();
+    if (r.outcome == ms::Outcome::canceled && stopping(cfg)) return false;
+    j.scan_outcome = ms::outcome_name(r.outcome);
+    if (r.outcome != ms::Outcome::clean) {
+        if (ms::is_incident(r.outcome)) keep_incident(cfg, j, ms::incident_json(r, ed::random_hex32(), "scan_package", j.build_uuid, ""));
+        log(cfg, j.id + " verification " + j.scan_outcome + ": " + r.detail.substr(0, 400));
+        fail(cfg, j, upload_scan_sentence(r));
+        return false;
+    }
+    // The bytes verified are the bytes that stand: the same size and write
+    // time as when they were read (every part is compared again as it is sent).
+    uv::Identity after;
+    if (!uv::identity_of(pkg, after) || after.bytes != before.bytes || after.mtime != before.mtime) { fail(cfg, j, kPackageChanged); return false; }
+    uv::Record rec;
+    rec.job_id = j.id;
+    rec.game_uuid = j.game_uuid;
+    rec.build_uuid = j.build_uuid;
+    rec.package_path = j.package_path;
+    rec.package = before;
+    rec.package_sha256 = d.sha256;
+    rec.part_sha256 = d.parts;
+    rec.content_bytes = content;
+    rec.file_count = files;
+    rec.launch_exe = j.launch_exe;
+    rec.scanner = r.scanner;
+    rec.scan_path = r.path;
+    rec.engine_version = r.engine_version;
+    rec.signature_version = r.signature_version;
+    rec.verified_utc = utc_now();
+    if (!uv::write_record(cfg.root, rec)) { defer(cfg, j, "The verification could not be recorded."); return false; }
+    j.package_bytes = rec.package.bytes;
+    j.package_sha256 = rec.package_sha256;
+    j.content_bytes = content;
+    j.file_count = files;
+    j.parts_total = static_cast<std::int64_t>(rec.part_sha256.size());
+    j.bytes_total = j.package_bytes;
+    j.bytes_done = 0;
+    j.permille = 0;
+    j.state = "packaged";
+    save(cfg, j);
+    log(cfg, j.id + " verified by this Client (" + rec.scanner + "): " + rec.package_sha256);
+    return true;
+}
+
+/** THE HOST'S PRECHECK OR BUILD MET THE ANTIVIRUS (the job failed with a
+ *  detection or removal as its `scan_outcome`): what the job says is not
+ *  sent. This Client establishes it itself, once: Defender's own record of
+ *  acting on the game's folder or its evaluation build since the job began,
+ *  else its own scan of the game's folder. Found, it is this Client's
+ *  incident for the service (the developer's, operation `scan_source`, or
+ *  `scan_package` once a build was packaged); not found, nothing is reported. */
+inline void establish_host_detection(const DriverConfig& cfg, const ed::Job& j) {
+    uv::Incident held;
+    if (uv::read_incident(cfg.root, j.id, held)) return;   // already this Client's to say
+    // Once per job per process even if its marker cannot be written (never
+    // a scan of the game's folder at every pass).
+    static std::mutex m;
+    static std::set<std::string> looked;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        const std::u8string r = cfg.root.u8string();
+        if (!looked.insert(std::string(r.begin(), r.end()) + "|" + j.id).second) return;
+    }
+    std::vector<fs::path> where;
+    std::error_code ec;
+    if (!j.source_path.empty()) where.push_back(path_of(j.source_path));
+    if (!j.build_path.empty()) where.push_back(path_of(j.build_path));
+    const std::string operation = j.build_uuid.empty() ? "scan_source" : "scan_package";
+    ms::Result r;
+    bool found = false;
+    std::vector<ms::Threat> seen;
+    if (!where.empty() && antivirus_acted(where, j.created_utc, seen)) {
+        r = removal_of(seen, seen.front().path, "Defender acted on the game's files during the build.");
+        found = true;
+    } else if (!j.source_path.empty() && fs::is_directory(path_of(j.source_path), ec)) {
+        r = run_scan(cfg, { path_of(j.source_path) }, ms::detail::utc_now(), [&]() { return !stopping(cfg); });
+        if (r.outcome == ms::Outcome::canceled && stopping(cfg)) return;
+        found = ms::is_incident(r.outcome);
+    }
+    if (found) {
+        keep_incident(cfg, j, ms::incident_json(r, ed::random_hex32(), operation, operation == "scan_source" ? std::string() : j.build_uuid, ""));
+        log(cfg, j.id + " the build's antivirus finding was established by this Client (" + operation + ")");
+        return;
+    }
+    uv::Incident none;
+    none.examined = true;
+    (void)uv::write_incident(cfg.root, j.id, none);
+    log(cfg, j.id + " the build's antivirus finding could not be established by this Client; nothing is reported");
+}
+
+inline void run_upload(const DriverConfig& cfg, ed::Job& j, const std::string& email) {
+    if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
+    if (j.account_email != email) return;   // another account: untouched
+    if (j.state == "held") {
+        // A new Build for Evaluation of the game replaced it: retired, never
+        // carried (this driver is the held job's only writer).
+        ed::Job newest;
+        if (ed::newest_upload_for_game(cfg.root, j.game_id, newest) && newest.id != j.id) {
+            fail(cfg, j, "Replaced by a newer build.");
+            return;
+        }
+    }
+    // THE GATE: this Client's own sealed verification of this exact package,
+    // or it verifies now (a first upload, a restart mid-verification, a held
+    // upload whose package moved, a record that is not this Client's).
+    uv::Record rec;
+    std::string why;
+    if (!uv::vouches(cfg.root, j, rec, why)) {
+        if (j.state != "packaged" && j.state != "verifying") log(cfg, j.id + " verifying again before the upload: " + why);
+        if (!verify_package(cfg, j)) return;
+        if (!uv::vouches(cfg.root, j, rec, why)) { fail(cfg, j, kPackageChanged); return; }
+    }
+    // A held upload asks again by opening its session: the service resumes
+    // the same one (its parts kept) or answers it verified.
+    if (j.state == "packaged" || j.state == "held" || j.session_id.empty()) {
+        if (!open_session(cfg, j, rec)) return;
+    }
+    if (j.state == "uploading") {
+        if (!send_parts(cfg, j, rec)) return;
+    }
+    if (j.state == "registering") complete_session(cfg, j);
+}
+
 inline fs::path assignments_dir(const fs::path& root) { return root / L"evaluator" / L"assignments"; }
 inline fs::path ticket_path(const fs::path& root, const std::string& id) { return assignments_dir(root) / fs::path(id) / L"ticket.json"; }
 inline fs::path credential_path(const fs::path& root) { return root / L"security" / L"evaluator.cred"; }
@@ -842,17 +1114,13 @@ inline ChainOutcome ensure_launch_chain(const DriverConfig& cfg, const std::stri
     // that file at launch.
     const std::string machine = cfg.service->machine_key();
     if (machine.empty()) { r.retryable = false; r.why = "This computer has no VIRULE identity."; return r; }
-    // The credential held here, when it is this evaluator's for this machine, stays.
-    {
-        const std::string held = ev::read_document(credential_path(cfg.root));
-        std::string hev, hkey;
-        if (!held.empty() && ev::json::get_string(held, "evaluator_id", hev) && hev == evid &&
-            ev::json::get_string(held, "machine_key", hkey) && hkey == machine) {
-            r.ok = true;
-            return r;
-        }
-    }
-    const Reply c = cfg.service->call("POST", "/v1/assignments/credential", "{\"machine_key\":\"" + machine + "\"}", "application/json", {});
+    // THE KEY IS PROVED EVERY TIME (owner brief 2026-11-02, section 10): the
+    // credential request carries this computer's proof of possession and is
+    // always made, even when the credential held here matches, so a binding
+    // the service does not count as proved (one made before proofs existed)
+    // is proved before the wrapper's launch check needs it. The service
+    // answers a held credential unchanged.
+    const Reply c = cfg.service->call("POST", "/v1/assignments/credential", cfg.service->machine_bind_body("evaluator"), "application/json", {});
     if (c.status != 200 && c.status != 201) { r.why = c.status == 0 ? "Couldn't reach our servers right now." : body_message(c.body); return r; }
     std::string_view cred_raw;
     if (!ev::json::member(c.body, "credential", cred_raw)) { r.why = "The service answered without a credential."; return r; }
@@ -979,7 +1247,7 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
             else { r.outcome = ms::Outcome::error; r.detail = x.why; }
         } else {
-            r = ms::scan({dir, scan_dir}, since, keep_going, {});
+            r = run_scan(cfg, {dir, scan_dir}, since, keep_going);
         }
     } else if (plan.launch_changed) {
         const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
@@ -989,10 +1257,10 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
         } else {
             std::vector<fs::path> targets = vc::paths_of(dir, plan.targets);
             targets.push_back(scan_dir);
-            r = ms::scan(targets, since, keep_going, {});
+            r = run_scan(cfg, targets, since, keep_going);
         }
     } else {
-        r = ms::scan(vc::paths_of(dir, plan.targets), since, keep_going, {});
+        r = run_scan(cfg, vc::paths_of(dir, plan.targets), since, keep_going);
     }
     fs::remove_all(scan_dir, ec);
     j.scan_outcome = ms::outcome_name(r.outcome);
@@ -1003,8 +1271,9 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
         else log(cfg, j.id + " the verified content record could not be written");
     } else if (ms::is_incident(r.outcome)) {
         j.security_held = true;
-        j.incident = ms::incident_json(r, ed::random_hex32(), "launch", "", revision);
-        j.incident_reported = false;
+        // This Client's own incident, sealed in its own storage (the job
+        // file's `incident` is never sent): reported by the next pass.
+        keep_incident(cfg, j, ms::incident_json(r, ed::random_hex32(), "launch", "", revision));
         j.error = kInstallThreat;
     }
     save(cfg, j);
@@ -1303,6 +1572,16 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
                 fail(cfg, j, body_message(done.body));
                 return;
             }
+            // THE SERVICE NEVER STREAMED THE WHOLE PACKAGE to this assignment
+            // (2026-11-02, VIRULE_BACKEND distribution.ts `not_delivered`: a
+            // partial file older than the service's record): fetched again
+            // from the first byte, never resumed from this file.
+            if (done.status == 409 && body_code(done.body) == "not_delivered") {
+                fs::remove(temp, ec);
+                j.download_id.clear(); j.bytes_done = 0; j.state = "queued"; save(cfg, j);
+                log(cfg, j.id + " the service did not stream this package whole; downloading it again");
+                return;
+            }
             if (done.status == 409 && body_code(done.body) == "conflict") {
                 // The download row is over (a failure was recorded before);
                 // ask again and report with the new id next pass.
@@ -1361,10 +1640,15 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
     }
     for (ed::Job j : ed::list_jobs(cfg.root)) {
         if (stopping(cfg)) break;
-        // SECURITY (2026-10-30): an incident the service has not recorded yet
-        // is sent, a failed job's included (it is retried every pass until
-        // the service answers).
-        if (signed_in && !j.incident.empty() && !j.incident_reported) report_incident(cfg, j);
+        // SECURITY (2026-10-30; 2026-11-02): an incident THIS CLIENT produced
+        // that the service has not recorded yet is sent, a failed job's
+        // included (it is retried every pass until the service answers). A
+        // build the host's precheck or build stopped for the antivirus is
+        // established by this Client first, once (establish_host_detection).
+        if (ed::is_upload(j) && j.state == "failed" && (j.scan_outcome == "detected" || j.scan_outcome == "removed")) {
+            establish_host_detection(cfg, j);
+        }
+        if (signed_in) report_incident(cfg, j);
         // THE INSTALLED CONTENT IS VERIFIED before its next Play (the
         // launcher refuses until then; verified_content.hpp), never while it
         // runs: at once when asked (the launcher found unverified files, the
@@ -1398,7 +1682,9 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
         }
         if (ed::is_upload(j) && (j.state == "building" || j.state == "packaging" ||
                                  j.state == "scanning_source" || j.state == "scanning_package")) {
-            // The Admin host's stage. Stalled: start the host headless, rarely.
+            // The Admin host's stage (`scanning_package` only as a legacy state
+            // a host resumes as packaging). Stalled: start the host headless,
+            // rarely. `verifying` is this Client's own (run_upload).
             if (ed::process_alive(j.owner_pid)) continue;
             const auto it = last_resume.find(j.id);
             if (it != last_resume.end() && t - it->second < kResumeEverySeconds) {

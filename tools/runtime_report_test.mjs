@@ -16,7 +16,7 @@
 // observation never replaces a newer one.
 
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createPrivateKey, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -114,7 +114,10 @@ try {
   check("the Client's cycle produced one report", first.posts.length === 1 && /^[0-9a-f]{64}$/.test(first.key ?? ""), first);
   check("an unbound machine's report is refused (401)", (await send(ev, first.posts[0])).status === 401);
   check("...and nothing is kept", !row(A, first.key));
-  const bound = await ev.api("POST", "/v1/assignments/credential", { machine_key: first.key });
+  // The binding PROVES the key (2026-11-02, VIRULE_BACKEND machine_proof.ts):
+  // the harness holds the cycle's seed, as the Client holds dev_machine.cred.
+  const priv = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(seed, "hex")]), format: "der", type: "pkcs8" });
+  const bound = await ev.api("POST", "/v1/assignments/credential", await ev.bindBody("evaluator", { pubHex: first.key, priv }));
   check("the service binds the machine to the evaluator", bound.status === 201);
   const ok1 = await send(ev, first.posts[0]);
   check("the Client's running report is accepted", ok1.status === 200 && ok1.body?.ok === true, ok1.body);

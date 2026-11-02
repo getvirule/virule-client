@@ -22,19 +22,29 @@
 // <virule_root>\transfers\<job_id>\job.json, written atomically by whoever
 // owns the current stage: the Admin host builds and packages an upload job
 // and hands it over as `packaged`; the Client carries it from there
-// (uploading, registering, done) and owns an install job entirely. The
+// (verifying, uploading, registering, done) and owns an install job entirely. The
 // Admin only ever reads jobs (GetEvaluationDelivery, GetAssignmentInstalls)
 // and shows them on the one progress meter. One job per game at a time
 // (the newest `upload` job of a game is the game's delivery); one install
 // job per assignment.
 //
-// UPLOAD STATES   scanning_source -> building -> packaging -> scanning_package -> packaged
-//                              -> uploading -> registering -> done | failed
-//                 (2026-10-30, owner brief: LOCAL MALWARE SCANNING, malware_scan.hpp: the
-//                              original game is scanned before the build and the built
-//                              package before it is handed over; only a clean scan goes
-//                              on, anything else fails the job with `scan_outcome` set,
-//                              and a detection carries an `incident` the Client reports)
+// UPLOAD STATES   scanning_source -> building -> packaging -> packaged
+//                              -> verifying -> uploading -> registering -> done | failed
+//                 (2026-10-30, owner brief: LOCAL MALWARE SCANNING, malware_scan.hpp.
+//                              2026-11-02, owner brief "Client Security Authority Phase 2":
+//                              THE CLIENT OWNS THE VERDICT. `scanning_source` is the Admin
+//                              host's early, NON-AUTHORITATIVE precheck: it can only fail the
+//                              job (`scan_outcome` and `error` for display), it never declares
+//                              anything clean and writes no `incident`. `verifying` is the
+//                              Client's: it reads, extracts and scans the exact package
+//                              itself and keeps what it verified in its own sealed record
+//                              (virule-client src/client/upload_verification.hpp), never in
+//                              this job. No Client verification, no upload. A detection the
+//                              precheck saw is established by the Client from Defender's own
+//                              record or its own scan of `source_path` before it reports any
+//                              incident; nothing in this job is ever sent as one.
+//                              `scanning_package` (the host's former package scan) is only a
+//                              legacy state a host resumes as `packaging`.)
 //                 packaged | registering -> held -> packaged (2026-10-22: the service
 //                              refused the upload because none of the game's purchased
 //                              evaluations is still owed, or the game was never bought
@@ -159,6 +169,12 @@ struct Job {
     std::uint64_t content_bytes = 0;
     std::uint64_t package_bytes = 0;
     std::string package_sha256;
+    // The game's configured folder and its evaluation build root (2026-11-02):
+    // where the Client looks, in Defender's own record or with its own scan,
+    // when the host's precheck or build met the antivirus. Inputs only: no
+    // verdict is ever read from them.
+    std::string source_path;
+    std::string build_path;
     // ---- upload (the Client writes these)
     std::string session_id;
     std::int64_t parts_total = 0;
@@ -186,8 +202,9 @@ struct Job {
     // before scanning existed has none and is scanned before its next Play).
     std::string scan_outcome;
     std::string scan_revision_id;
-    // A detection or removal to report to the service (a JSON object as
-    // text; "" = none), and whether the service has recorded it.
+    // LEGACY (before 2026-11-02): a detection to report, as text. The Client
+    // no longer sends what a job file says: the incidents it reports are its
+    // own, sealed in its own storage (virule-client upload_verification.hpp).
     std::string incident;
     bool incident_reported = false;
     // The service holds this game, or this computer's scan blocked this
@@ -253,6 +270,8 @@ inline std::string job_json(const Job& j) {
     o += ",\"content_bytes\":" + std::to_string(j.content_bytes);
     o += ",\"package_bytes\":" + std::to_string(j.package_bytes);
     o += ",\"package_sha256\":" + quote(j.package_sha256);
+    o += ",\"source_path\":" + quote(j.source_path);
+    o += ",\"build_path\":" + quote(j.build_path);
     o += ",\"session_id\":" + quote(j.session_id);
     o += ",\"parts_total\":" + std::to_string(j.parts_total);
     o += ",\"parts_done\":" + parts_json(j.parts_done);
@@ -302,6 +321,8 @@ inline bool parse_job(std::string_view text, Job& j) {
     j.content_bytes = static_cast<std::uint64_t>(js::opt_int(text, "content_bytes"));
     j.package_bytes = static_cast<std::uint64_t>(js::opt_int(text, "package_bytes"));
     j.package_sha256 = js::opt_string(text, "package_sha256");
+    j.source_path = js::opt_string(text, "source_path");
+    j.build_path = js::opt_string(text, "build_path");
     j.session_id = js::opt_string(text, "session_id");
     j.parts_total = js::opt_int(text, "parts_total");
     {

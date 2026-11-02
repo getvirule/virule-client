@@ -78,6 +78,7 @@
 #include "shared/lifecycle_intent.hpp"
 #include "shared/logging.hpp"
 #include "shared/login_start.hpp"
+#include "shared/machine_proof.hpp"
 #include "shared/paths.hpp"
 #include "shared/protocol_reg.hpp"
 #include "shared/residency.hpp"
@@ -150,9 +151,49 @@ const unsigned long long g_boot_id = GetTickCount64() ^ ((unsigned long long)Get
 
 struct AccountTransferService final : vclient::transfers::Service {
     bool signed_in(std::string& email_out) override { return vclient::account::signed_in_email(email_out); }
+    // THE MACHINE PROOF (owner brief 2026-11-02; shared/machine_proof.hpp): a
+    // route only this Client's drivers make is signed here, centrally, over
+    // the exact body, by this computer's identity, freshly at every attempt
+    // (never stored with a queued request). A key the account has not proved
+    // (`machine_not_bound`: a first use, a re-issued identity, a staging
+    // reset) is proved once and the request asked once more.
     vclient::transfers::Reply call(const char* method, const std::string& path, const std::string& body,
                                    const std::string& content_type, const std::vector<vclient::transfers::Header>& headers) override {
+        namespace mp = vclient::machine_proof;
+        const std::string role = mp::role_of(method, path);
+        vclient::transfers::Reply r = send(method, path, body, content_type, headers, role);
+        // A key the account has not proved (a proven route, or the runtime
+        // report's own proof): proved once for the role, asked once more.
+        const std::string bind_role = mp::rebind_role(method, path);
+        if (!bind_role.empty() && mp::not_bound(r.status, r.body)) {
+            if (bind_machine(bind_role)) r = send(method, path, body, content_type, headers, role);
+            else vclient::log::client("machine proof: this computer's identity could not be proved for " + bind_role);
+        }
+        return r;
+    }
+    // The binding's proof of possession for `role` ("" when this computer
+    // has no identity or the session no device id yet).
+    std::string machine_bind_body(const std::string& role) override {
+        namespace mp = vclient::machine_proof;
+        std::string host, device;
+        const std::string key = vclient::machine_identity::public_key_hex();
+        if (key.size() != 64 || !vclient::account::machine_proof_context(host, device)) return "";
+        const std::string ts = vclient::transfers::utc_now();
+        const std::string sig = vclient::machine_identity::sign_hex(mp::bind_message(role, host, device, key, ts));
+        return sig.size() == 128 ? mp::bind_body(key, ts, sig) : std::string();
+    }
+    // Prove this computer's machine key for `role`.
+    bool bind_machine(const std::string& role) {
+        const std::string body = machine_bind_body(role);
+        if (body.empty()) return false;
+        const vclient::transfers::Reply r = send("POST", vclient::machine_proof::bind_route(role), body, "application/json", {}, "");
+        return r.status == 200 || r.status == 201;
+    }
+    vclient::transfers::Reply send(const char* method, const std::string& path, const std::string& body,
+                                   const std::string& content_type, const std::vector<vclient::transfers::Header>& headers,
+                                   const std::string& role) {
         namespace acct = vclient::account;
+        namespace mp = vclient::machine_proof;
         vclient::transfers::Reply r;
         const acct::Endpoint e = acct::api_endpoint();
         const std::wstring wmethod = acct::widen(method);
@@ -161,12 +202,34 @@ struct AccountTransferService final : vclient::transfers::Service {
             if (!acct::transfer_headers(method, path, h, attempt == 1)) { r.status = 0; return r; }
             if (!content_type.empty()) h += L"Content-Type: " + acct::widen(content_type) + L"\r\n";
             for (const auto& x : headers) h += acct::widen(x.name) + L": " + acct::widen(x.value) + L"\r\n";
+            if (!role.empty()) {
+                // A PROVEN ROUTE IS NEVER SENT WITHOUT ITS PROOF: no proof
+                // here (no identity yet, or the session's device id not known
+                // yet: it is asked for now) is "no answer", which every driver
+                // retries on its own ladder, never a refusal it would keep.
+                std::string host, device, ts, sig;
+                const std::string key = vclient::machine_identity::public_key_hex();
+                if (key.size() == 64 && acct::machine_proof_context(host, device)) {
+                    ts = vclient::transfers::utc_now();
+                    sig = vclient::machine_identity::sign_hex(
+                        mp::request_message(host, device, role, method, path, vclient::transfers::sha256_hex(body), ts));
+                }
+                if (sig.size() != 128) {
+                    vclient::log::client("machine proof: " + std::string(method) + " " + path + " waits (no proof of this computer yet)");
+                    if (key.size() == 64 && host.empty()) acct::confirm_async();
+                    r.status = 0;
+                    r.body.clear();
+                    return r;
+                }
+                h += L"x-virule-machine-key: " + acct::widen(key) + L"\r\nx-virule-machine-timestamp: " + acct::widen(ts) +
+                     L"\r\nx-virule-machine-signature: " + acct::widen(sig) + L"\r\n";
+            }
             vclient::http::Timeouts t;
             t.send_ms = 120000;
             t.receive_ms = 120000;
             (void)vclient::http::request(wmethod.c_str(), e.host.c_str(), e.port, e.secure, acct::widen(path),
                                          h, body, 256 * 1024, r.status, r.body, t);
-            if (r.status != 401) break;
+            if (r.status != 401 || mp::not_bound(r.status, r.body)) break;
         }
         return r;
     }
@@ -1459,6 +1522,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         // Staging-only harness seam (tools/account_live_staging_test.mjs):
         // the real staging service, the browser played by the harness.
         if (arg == L"--account-browser=capture") vclient::account::capture_browser() = true;
+        // Staging-only harness seam (tools/purchase_enforcement_test.mjs):
+        // a purchase-readiness blocker reported on top of the real answer
+        // (shared/evaluation_purchase_readiness.hpp). It can only refuse,
+        // never make a computer ready. Ignored in production.
+        if (vclient::env::kStaging && arg.rfind(L"--test-purchase-blocker=", 0) == 0) {
+            std::string name;
+            for (const wchar_t c : arg.substr(24)) name += static_cast<char>(c < 0x80 ? c : '?');
+            vclient::purchase_readiness::forced_blocker() = vclient::purchase_readiness::blocker_of(name);
+        }
         // Development seam for the account service (tools/account_flow_test.mjs):
         // LOOPBACK ONLY, so no argument can point a real sign-in elsewhere.
         if (arg.rfind(L"--account-endpoint=", 0) == 0) {
@@ -1475,6 +1547,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         arg1.rfind(L"--admin-manifest-url=", 0) == 0 ||
         arg1.rfind(L"--evidence-test-endpoint=", 0) == 0 ||
         arg1.rfind(L"--account-endpoint=", 0) == 0 ||
+        arg1.rfind(L"--test-purchase-blocker=", 0) == 0 ||
         arg1 == L"--account-browser=capture") {
         arg1.clear();
     }

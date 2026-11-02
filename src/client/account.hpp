@@ -56,6 +56,7 @@
 #include "shared/account_roles.hpp"
 #include "shared/account_store.hpp"
 #include "shared/environment.hpp"
+#include "shared/evaluation_purchase_readiness.hpp"
 #include "shared/http_client.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
@@ -1245,6 +1246,19 @@ inline bool transfer_headers(const char* method, const std::string& path, std::w
     return true;
 }
 
+// THE MACHINE PROOF'S CONTEXT (owner brief 2026-11-02; shared/machine_proof.hpp):
+// the API host this Client sends to and this installation's device
+// authorization, the QA link's convention (account_link_qa). False while
+// signed out or before the device id is known.
+inline bool machine_proof_context(std::string& host_out, std::string& device_out) {
+    std::lock_guard<std::mutex> lock(st().m);
+    ensure_loaded_locked(st());
+    if (!st().signed_in || st().session.device_id.empty()) return false;
+    device_out = st().session.device_id;
+    host_out = narrow(api_endpoint().host);
+    return true;
+}
+
 inline std::string api_call(const std::string& message) {
     namespace relay = vclient::account_relay;
     const relay::Request req = relay::parse(message);
@@ -1256,6 +1270,24 @@ inline std::string api_call(const std::string& message) {
         std::lock_guard<std::mutex> lock(st().m);
         ensure_loaded_locked(st());
         if (!st().signed_in) return relay::failure("signed_out");
+    }
+    // THE PURCHASE NEEDS THIS COMPUTER READY (owner decision 2026-11-02,
+    // shared/evaluation_purchase_readiness.hpp). Decided HERE, NOW, by the
+    // component that owns the authorization, before the device key is
+    // loaded, a token is had or refreshed, a DPoP proof is made or anything
+    // is sent: whoever asked (the Admin, a harness, any local program on
+    // this bridge) and whatever a screen showed. Refused: nothing reaches
+    // the service, so nothing is bought and the request's idempotency key
+    // is never spent; the same request succeeds once the computer is fixed.
+    if (relay::is_purchase(req)) {
+        namespace pr = vclient::purchase_readiness;
+        const pr::Readiness ready = pr::current();
+        if (!ready.ready()) {
+            log::client(std::string("account: evaluation purchase refused here: ") + pr::blocker_name(ready.blocker) +
+                        (ready.detail.empty() ? std::string() : " (" + ready.detail + ")"));
+            return relay::not_ready(virule::core::malware_scan::json_quote(pr::blocker_name(ready.blocker)),
+                                    virule::core::malware_scan::json_quote(ready.message));
+        }
     }
     store::DeviceKey key;
     if (!store::device_key(key)) return relay::failure("signed_out");

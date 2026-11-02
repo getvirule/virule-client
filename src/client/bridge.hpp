@@ -20,10 +20,25 @@
 //     virule.app origins (plus the explicit local development origins
 //     below) are accepted, so a foreign website can neither probe nor
 //     drive the bridge. A local no-Origin connection is a control
-//     connection: a local process could fake an Origin anyway, and a
-//     local process already has this user's power (it could launch
-//     virule:// or delete files itself), so origin checks defend against
-//     the WEB, not against local code.
+//     connection: a local process could fake an Origin anyway, so origin
+//     checks defend against the WEB, not against local code. Any local
+//     program can therefore REACH the control messages; that is never
+//     permission to skip a VIRULE rule. Being a local caller is enough only
+//     for what such a program could already do itself (launch virule://,
+//     run Setup or an update, delete its own files).
+//   - A PRIVILEGED VIRULE OPERATION ENFORCES ITS OWN INVARIANTS AT THE
+//     COMPONENT THAT OWNS ITS CREDENTIAL OR ACTION, whoever asked (owner
+//     decision 2026-11-02). There is no "trusted Admin" caller: the Admin
+//     reaches this bridge exactly as any local program does, and its own
+//     screen checks are presentation only. Example: an evaluation purchase
+//     through account_api is refused here, before this installation's
+//     account authorization is used, when this computer cannot verify games
+//     (client/account.hpp api_call, shared/evaluation_purchase_readiness.hpp).
+//   - The account session and device key are DPAPI user-scope protected:
+//     safe from copying and from other Windows users, NOT a hardware
+//     boundary against hostile code already running as this user. This
+//     bridge does not claim to stop such code; it guarantees that VIRULE
+//     offers no supported path around its own rules.
 //   - There is no generic command endpoint, no filesystem surface, no
 //     process-launch surface. The message set is closed and versioned.
 //   - Privileged operations carry their own authorization on top of the
@@ -91,7 +106,13 @@
 //                                                      launch and what is running,
 //                                                      client/launcher.hpp)
 //                    {"type":"account_api","method","path","body"}  (the evaluation relay:
-//                                                       /v1/evaluations and /v1/assignments only)
+//                                                       /v1/evaluations and /v1/assignments only;
+//                                                       a purchase is refused here when this
+//                                                       computer is not ready, 2026-11-02)
+//                    {"type":"evaluation_purchase_readiness"}  (2026-11-02: can this
+//                                                       computer buy an evaluation now; the
+//                                                       Client's own answer, which the Admin
+//                                                       only shows)
 //   client -> conn   hello {"virule_client":1,"v":1,"version":...}
 //                    {"type":"status","version","capabilities","pages","admin",
 //                     "enabled":{"dev_tools":bool,"evaluator":bool}}
@@ -118,6 +139,10 @@
 //                    {"type":"uninstall_started"} / {"type":"error"}
 //                    {"type":"assignment_open_started"}
 //                    {"type":"assignment_open_intent","assignment_id":"<id or empty>"}
+//                    {"type":"evaluation_purchase_readiness","ready":bool,
+//                     "reason":"supported"|"unsupported_windows"|"defender_off"|
+//                              "defender_out_of_date"|"antivirus_unsupported",
+//                     "message":"<the owner's sentence, empty when ready>"}
 //
 // admin_install / admin_open are page messages behind the same origin
 // policy. They are CLOSED operations, not a filesystem or process surface:
@@ -147,6 +172,7 @@
 
 #include "shared/account_roles.hpp"
 #include "shared/environment.hpp"
+#include "shared/evaluation_purchase_readiness.hpp"
 #include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
@@ -993,6 +1019,18 @@ inline void handle_client(SOCKET client) {
             } else {
                 if (!reply(0x1, answer)) return;
             }
+        } else if (!is_page && type == "evaluation_purchase_readiness") {
+            // THE ONE ANSWER (owner decision 2026-11-02,
+            // shared/evaluation_purchase_readiness.hpp): the Admin shows it
+            // and never decides it; api_call decides again at the purchase
+            // itself. LOCAL ONLY. The technical detail stays in this log.
+            namespace pr = vclient::purchase_readiness;
+            const pr::Readiness r = pr::current();
+            if (!r.ready()) {
+                log::client(std::string("bridge: evaluation purchase readiness: ") + pr::blocker_name(r.blocker) +
+                            (r.detail.empty() ? std::string() : " (" + r.detail + ")"));
+            }
+            if (!reply(0x1, pr::to_json(r))) return;
         } else if (!is_page && (type == "transfer_control" || type == "transfer_wake" || type == "transfer_status" ||
                                 type == "game_art" || type == "evaluation_changes" ||
                                 type == "game_launch" || type == "launcher_state")) {

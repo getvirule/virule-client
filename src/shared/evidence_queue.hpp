@@ -966,6 +966,97 @@ inline std::string request_state_json(const RequestState& s) {
         ",\"refused\":" + (s.refused ? "true" : "false") + "}\n";
 }
 
+// ---- THE CLIENT'S LOCAL EVIDENCE COMPLETENESS (owner brief 2026-11-02,
+// "Client Security Authority Phase 2" section 13). The service decides
+// eligibility from the packages it actually received, and refuses a listed
+// package it does not hold whole; what it cannot know is a session this
+// computer finalized and never sent. That is this Client's to enforce: a
+// report is never posted while a session finalized here (the wrapper's
+// ledger, or any package the evidence root holds for the assignment) has
+// no acknowledgment (a receipt here, or the service's progress listing it as
+// received), while the service is still receiving one, or while a session
+// is still open here (its checkpoint: recovery turns it into a package).
+// The report then names EVERY session finalized here (`packages`), whatever
+// the request file says, so the service checks each one is held whole. The
+// shared predicate is ee::writing_unlock, the one the Admin host and the
+// wrapper read, so the three cannot drift.
+
+// A report held for this computer's own sessions is looked at again this
+// soon (off the failure ladder: nothing failed).
+inline constexpr std::int64_t kLocalEvidenceRecheckSeconds = 30;
+
+inline std::filesystem::path assignment_state_dir(const ee::Root& r, const std::string& assignment_id) {
+    return r.dir.parent_path() / L"evaluator" / L"assignments" / std::filesystem::path(assignment_id);
+}
+
+/** Every session this computer finalized for the assignment: its ledger's
+ *  sessions and every package the evidence root holds for it (sorted, unique). */
+inline std::vector<std::string> finalized_here(const ee::Root& r, const std::string& assignment_id, ee::DeliveryState& delivery) {
+    std::vector<std::string> ids;
+    const std::string ledger = ee::read_document(assignment_state_dir(r, assignment_id) / L"ledger.json");
+    std::string_view raw;
+    std::vector<std::string_view> items;
+    if (!ledger.empty() && ee::json::member(ledger, "sessions", raw) && ee::json::items(raw, items)) {
+        for (const auto& it : items) {
+            std::string id;
+            if (ee::json::get_string(it, "session_id", id) && ee::is_hex32(id)) ids.push_back(id);
+        }
+    }
+    delivery = ee::assignment_delivery_state(r, assignment_id);
+    for (const auto* v : { &delivery.pending, &delivery.staging, &delivery.acknowledged, &delivery.simulated_acknowledged }) {
+        ids.insert(ids.end(), v->begin(), v->end());
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+}
+
+struct LocalCompleteness {
+    bool complete = false;
+    std::string why;                    // for the log, when not complete
+    std::vector<std::string> finalized; // what the report names
+};
+
+/** May this computer submit the assignment's report now? `simulated_counts`:
+ *  a receipt from the staging test transport stands for one. */
+inline LocalCompleteness local_completeness(const ee::Root& r, const std::string& assignment_id, bool simulated_counts) {
+    LocalCompleteness c;
+    ee::DeliveryState delivery;
+    c.finalized = finalized_here(r, assignment_id, delivery);
+    if (ee::exists_quiet(assignment_state_dir(r, assignment_id) / L"open_session.json")) {
+        c.why = "a session is still open on this computer";
+        return c;
+    }
+    const ee::ServiceProgress svc = ee::parse_service_progress(ee::read_document(ee::progress_path(r, assignment_id)));
+    const ee::Unlock u = ee::writing_unlock(true, c.finalized, delivery, svc, simulated_counts);
+    if (!u.unacknowledged.empty()) {
+        c.why = std::to_string(u.unacknowledged.size()) + " session(s) finalized here are not acknowledged yet";
+        return c;
+    }
+    if (u.service_receiving) {
+        c.why = "the service is still receiving a session";
+        return c;
+    }
+    c.complete = true;
+    return c;
+}
+
+/** `body` with its `packages` member set to `ids` (added when absent). "" if
+ *  `body` is not an object. */
+inline std::string with_packages(const std::string& body, const std::vector<std::string>& ids) {
+    if (body.size() < 2 || body.front() != '{' || body.back() != '}') return {};
+    std::string list = "[";
+    for (size_t i = 0; i < ids.size(); ++i) list += (i ? ",\"" : "\"") + ids[i] + "\"";
+    list += "]";
+    std::string_view raw;
+    if (ee::json::member(body, "packages", raw) && raw.data() >= body.data() && raw.data() + raw.size() <= body.data() + body.size()) {
+        const size_t at = static_cast<size_t>(raw.data() - body.data());
+        return body.substr(0, at) + list + body.substr(at + raw.size());
+    }
+    const bool empty_object = body.find_first_not_of(" \t\r\n", 1) == body.size() - 1;
+    return body.substr(0, body.size() - 1) + (empty_object ? "" : ",") + "\"packages\":" + list + "}";
+}
+
 inline RequestState load_request_state(const ee::Root& r, const std::string& assignment_id, const char* kind) {
     RequestState s;
     const std::string text = ee::read_document(ee::request_delivery_path(r, assignment_id, kind));
@@ -1050,7 +1141,24 @@ inline RequestResult run_requests(const ee::Root& r, Transport& transport, std::
             const Owner o = owner(it.assignment, request_evaluator(r, it.assignment, text));
             if (o == Owner::SignedOut || o == Owner::OtherAccount) { ++res.pending; ++res.waiting_account; continue; }
         }
-        const std::string body = ee::request_body(text);
+        std::string body = ee::request_body(text);
+        if (!early) {
+            // THE CLIENT'S LOCAL EVIDENCE COMPLETENESS (above): held, never
+            // refused and never on the failure ladder, until every session
+            // finalized here is acknowledged; then sent naming all of them.
+            const LocalCompleteness lc = local_completeness(r, it.assignment, std::string(transport.name()) != "service");
+            if (!lc.complete) {
+                st.last_error = "waiting for this computer's sessions: " + lc.why;
+                st.code = "local_evidence_pending";
+                st.next_attempt_utc = now + kLocalEvidenceRecheckSeconds;
+                (void)ee::write_file_atomic(ee::request_delivery_path(r, it.assignment, it.kind.c_str()), request_state_json(st));
+                ++res.pending;
+                if (res.next_due_utc == 0 || st.next_attempt_utc < res.next_due_utc) res.next_due_utc = st.next_attempt_utc;
+                if (log) log("evidence: " + it.assignment + " report held (" + lc.why + ")");
+                continue;
+            }
+            body = with_packages(body, lc.finalized);
+        }
         const std::string path = "/v1/assignments/" + it.assignment + (early ? "/early-completion" : "/report");
         ServiceReply reply;
         ++st.attempts;

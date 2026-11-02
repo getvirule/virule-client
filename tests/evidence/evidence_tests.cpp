@@ -737,6 +737,103 @@ static void test_requests() {
     CHECK(q.acknowledged == 1 && ee::exists_quiet(ee::report_receipt_path(r2, kOtherAssignment)));
 }
 
+// ---- 2026-11-02: THE CLIENT'S LOCAL EVIDENCE COMPLETENESS (owner brief
+// "Client Security Authority Phase 2" sections 13 and 23). The report request
+// is written by the Admin host; this Client posts it only once every session
+// finalized here is acknowledged, and names all of them itself.
+
+static void write_ledger(const ee::Root& r, const std::string& assignment, const std::vector<std::string>& sessions) {
+    const fs::path dir = ev::assignment_state_dir(r, assignment);
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::string s = "{\"assignment_id\":\"" + assignment + "\",\"sessions\":[";
+    for (size_t i = 0; i < sessions.size(); ++i) s += (i ? "," : "") + std::string("{\"session_id\":\"") + sessions[i] + "\"}";
+    CHECK(ee::write_file_atomic(dir / "ledger.json", s + "]}\n"));
+}
+
+static void receipt_for(const ee::Root& r, const std::string& assignment, const std::string& id, bool simulated = false) {
+    ee::Receipt rc;
+    rc.package_id = id;
+    rc.assignment_id = assignment;
+    rc.receipt_id = "svc-" + id.substr(0, 6);
+    rc.simulated = simulated;
+    CHECK(ee::write_receipt(r, rc));
+}
+
+struct ServiceNamedFake final : ev::Transport {
+    std::vector<std::string> paths, bodies;
+    const char* name() const override { return "service"; }
+    bool simulated() const override { return false; }
+    ev::Answer deliver(const ev::Offer&) override { ev::Answer a; a.kind = ev::Answer::Kind::Unavailable; return a; }
+    bool ready() override { return true; }
+    bool post_request(const std::string& path, const std::string& body, ev::ServiceReply& out) override {
+        paths.push_back(path);
+        bodies.push_back(body);
+        out = { 201, "{\"report\":{\"submitted_utc\":\"2026-11-02T00:05:00Z\",\"overall\":7}}" };
+        return true;
+    }
+};
+
+static void test_report_local_completeness() {
+    SECTION("the report: held while a session finalized here is unacknowledged; then it names every one");
+    const ee::Root r = fresh_root("local-completeness");
+    const std::string s1 = random_hex32(), s2 = random_hex32(), s3 = random_hex32();
+    write_ledger(r, kAssignment, { s1, s2 });
+    receipt_for(r, kAssignment, s1);
+    // The Admin's request names NO session at all (a manipulated, or simply
+    // older, request): it is not what decides.
+    const std::string sub = random_hex32();
+    CHECK(ee::write_file_atomic(ee::report_request_path(r, kAssignment),
+        std::string("{\"format\":\"") + ee::kReportFormat + "\",\"assignment_id\":\"" + kAssignment + "\",\"submission_id\":\"" + sub +
+        "\",\"created_utc\":\"2026-11-02T00:00:00Z\",\"body\":{\"submission_id\":\"" + sub + "\",\"overall\":7,\"packages\":[]}}\n"));
+    ServiceNamedFake t;
+    auto q = ev::run_requests(r, t, T0, true, nullptr);
+    CHECK(t.paths.empty() && q.pending == 1 && q.refused == 0);
+    const std::string state = read_all(ee::request_delivery_path(r, kAssignment, "report"));
+    CHECK(state.find("local_evidence_pending") != std::string::npos && state.find("\"refused\":false") != std::string::npos);
+    CHECK(q.next_due_utc == T0 + ev::kLocalEvidenceRecheckSeconds);
+    // A package of this assignment in the outbox (finalized, on its way) holds it too.
+    receipt_for(r, kAssignment, s2);
+    const std::string pending_pkg = make_package(r, kAssignment, 1);
+    q = ev::run_requests(r, t, T0 + 100, true, nullptr);
+    CHECK(t.paths.empty() && q.pending == 1);
+    receipt_for(r, kAssignment, pending_pkg);
+    // A session still OPEN here (its checkpoint) holds it.
+    {
+        std::error_code ec;
+        CHECK(ee::write_file_atomic(ev::assignment_state_dir(r, kAssignment) / "open_session.json", "{}"));
+        q = ev::run_requests(r, t, T0 + 200, true, nullptr);
+        CHECK(t.paths.empty());
+        fs::remove(ev::assignment_state_dir(r, kAssignment) / "open_session.json", ec);
+    }
+    // A SIMULATED receipt does not stand for one on the real service.
+    write_ledger(r, kAssignment, { s1, s2, s3 });
+    receipt_for(r, kAssignment, s3, true);
+    q = ev::run_requests(r, t, T0 + 300, true, nullptr);
+    CHECK(t.paths.empty());
+    // The service's progress listing it as received does.
+    CHECK(ee::write_file_atomic(ee::progress_path(r, kAssignment),
+        "{\"sessions\":3,\"receiving\":0,\"received\":[{\"session_id\":\"" + s3 + "\"}]}\n"));
+    // ...unless the service is still receiving a session.
+    CHECK(ee::write_file_atomic(ee::progress_path(r, kAssignment),
+        "{\"sessions\":3,\"receiving\":1,\"received\":[{\"session_id\":\"" + s3 + "\"}]}\n"));
+    q = ev::run_requests(r, t, T0 + 400, true, nullptr);
+    CHECK(t.paths.empty());
+    CHECK(ee::write_file_atomic(ee::progress_path(r, kAssignment),
+        "{\"sessions\":3,\"receiving\":0,\"received\":[{\"session_id\":\"" + s3 + "\"}]}\n"));
+    q = ev::run_requests(r, t, T0 + 500, true, nullptr);
+    CHECK(t.paths.size() == 1 && q.acknowledged == 1);
+    // Sent naming EVERY session finalized here, whatever the request said.
+    const std::string& b = t.bodies.front();
+    CHECK(b.find(s1) != std::string::npos && b.find(s2) != std::string::npos && b.find(s3) != std::string::npos &&
+          b.find(pending_pkg) != std::string::npos && b.find("\"packages\":[]") == std::string::npos);
+    CHECK(b.find("\"submission_id\":\"" + sub + "\"") != std::string::npos && b.find("\"overall\":7") != std::string::npos);
+    // with_packages: replaced in place, or added.
+    CHECK(ev::with_packages("{\"a\":1}", { s1 }) == "{\"a\":1,\"packages\":[\"" + s1 + "\"]}");
+    CHECK(ev::with_packages("{}", {}) == "{\"packages\":[]}");
+    CHECK(ev::with_packages("{\"packages\":[\"x\"],\"b\":2}", { s1, s2 }) == "{\"packages\":[\"" + s1 + "\",\"" + s2 + "\"],\"b\":2}");
+}
+
 // ---- 2026-10-22: the evaluator workflow completion ----
 
 static void test_other_account_waits() {
@@ -1026,6 +1123,7 @@ int main(int argc, char** argv) {
     test_wake_and_driver();
     test_service_transport();
     test_requests();
+    test_report_local_completeness();
     test_other_account_waits();
     test_per_file_progress();
     test_requests_wait_for_account();
