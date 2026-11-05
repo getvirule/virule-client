@@ -1872,8 +1872,10 @@ developer's tool, never present on an evaluator's computer by itself.
 THE SERVICE'S SECURITY STATE (`src/client/security_marks.hpp`): the runtime
 report's answer `security_hold` / `security_protected`, and the pre-Play
 ticket answer for the hold, are kept as two marker files beside the
-assignment's ticket. The runtime reporter never applies its offline
-absolute cut to a protected assignment. A Defender exclusion over a scanned
+assignment's ticket. Since 0.9.24 (owner brief 2026-11-05, "The security
+review" below) the service also answers `security_hold` while the
+ASSIGNMENT is paused under a security review (also while it is ready to
+resume), so nothing of it is launched before an explicit Resume. A Defender exclusion over a scanned
 folder is undetectable unelevated (reported). Stalled Admin-side stages
 include the two scanning states (`resume_headless`).
 
@@ -1990,6 +1992,56 @@ byte, which assignments, the cycle and its refusals; then
 service code in process: accepted for a bound machine and kept as observed,
 refused for an unbound machine, a tampered state, another evaluator; an
 older observation never replacing a newer one).
+
+## The security review (0.9.24, owner brief 2026-11-05; `src/client/runtime_report.hpp`, `assignment_cleanup.hpp` "security end", `evaluation_recovery.hpp`, `client/account.hpp` resume gate)
+
+Why: a security alert pauses execution, not the evaluator's work
+(`VIRULE/docs/specs/evaluation-security.md` decisions 24 to 38;
+`VIRULE_BACKEND/docs/EVALUATIONS.md` "The security review"). What this
+Client does:
+
+- UNDER REVIEW (the runtime answer's `security_hold`, `security_review`):
+  NOTHING IS DELETED. The game folder, its saves, the draft, the evidence
+  and the ticket stay; no `expired.json` is written. Launching stops: the
+  hold marker refuses Play (`launcher.hpp`), the service refuses the ticket
+  and every download, the wrapper's signed check answers `not_authorized`.
+  The wrapper's crash RECOVERY, which runs the wrapper from the game folder,
+  waits (`evaluation_recovery.hpp` `Verdict::Held`): held content is never
+  executed by this Client, also when this computer's own scan refused it or
+  the assignment ended for security. A session already running when the
+  hold lands is not closed (the next launch is refused).
+- THE OFFLINE CUT FOLLOWS THE STATED DEADLINE: every answer's `deadline_utc`
+  is kept (`evaluator\assignments\<id>\deadline_utc`); offline, the cut is
+  that deadline + 24 hours + the 15-minute margin (a deadline restored on a
+  Resume moves it), else acceptance + 7 days as before; never while the hold
+  marker says nothing may be launched (a frozen deadline never cuts).
+- RESUME GOES THROUGH THIS CLIENT'S OWN CHECK (`client/account.hpp`
+  `resume_gate`, set by `main.cpp`): the relay admits `POST
+  /v1/assignments/<id>/resume` for the Admin, but first looks whether THIS
+  computer's scan refused the build the Resume names (`revision_id`; a
+  detection is final per revision here, `transfers.hpp`
+  `revision_held_here`). If it did, the Resume is NEVER relayed: the Client
+  reports the refusal itself, under its machine proof (`POST
+  /v1/assignments/<id>/security/refusal`), the service releases the
+  assignment without fault, and the Admin is answered `{"status":0,
+  "error":"refused_here","reported","message"}` with the sentence (WORKING
+  WORDING). No bypass exists: a central clearance never overrides this
+  computer's antivirus.
+- THE SECURITY END (the runtime answer's `state` `released` or `terminated`,
+  never `expired`): its own mark, `security_end.json` (never expired.json,
+  never removed), then the cleanup, re-entrant every cycle: close the game,
+  recover an interrupted session ONLY for a released assignment whose
+  content is not held, remove the game folder with the expiry's guard (only
+  the job's folder directly inside the installs location, named by the
+  game's id) and the temp file; KEEP the unsubmitted draft (PENDING OWNER
+  DECISION for a terminated one), the ticket, the ledger, the outbox and the
+  receipts. The launcher refuses it (`ended`, `This evaluation has ended.`,
+  WORKING WORDING) and the transfer driver installs nothing for it.
+- Older Clients: 0.9.23 would cut a resumed assignment offline at acceptance
+  + 7 days only where `security_protected` is false (the service keeps it
+  true for any assignment ever reviewed), would ignore a security end, and
+  could not relay a Resume; VIRULE Desktop requires 0.9.24
+  (`client_requirement.hpp`).
 
 ## Expired assignment cleanup (0.9.21, 2026-10-28; `src/client/assignment_cleanup.hpp`)
 
