@@ -294,8 +294,9 @@ public:
 
     // The absolute deadline passed by more than the local margin (the
     // local clock), for an assignment whose acceptance is known.
-    // Never for an assignment the service PROTECTED after a security
-    // detection (client/security_marks.hpp): its expiry is administrative.
+    // (Before 0.9.24: never for an assignment the service PROTECTED after
+    // a security detection. Since 2026-11-05 a protected assignment that was
+    // resumed is cut from its restored deadline, as below.)
     //
     // 2026-11-05 (VIRULE_BACKEND security_review.ts): never while the service
     // last said nothing may be launched (`security_hold`: the game held, or
