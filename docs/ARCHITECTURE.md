@@ -2013,8 +2013,9 @@ Client does:
 - THE OFFLINE CUT FOLLOWS THE STATED DEADLINE: every answer's `deadline_utc`
   is kept (`evaluator\assignments\<id>\deadline_utc`); offline, the cut is
   that deadline + 24 hours + the 15-minute margin (a deadline restored on a
-  Resume moves it), else acceptance + 7 days as before; never while the hold
-  marker says nothing may be launched (a frozen deadline never cuts).
+  Resume moves it); with no stated deadline, acceptance + 7 days as before
+  and never for a protected assignment; never while the hold marker says
+  nothing may be launched (a frozen deadline never cuts).
 - RESUME GOES THROUGH THIS CLIENT'S OWN CHECK (`client/account.hpp`
   `resume_gate`, set by `main.cpp`): the relay admits `POST
   /v1/assignments/<id>/resume` for the Admin, but first looks whether THIS
