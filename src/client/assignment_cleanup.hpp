@@ -163,4 +163,117 @@ inline bool run(const Config& cfg, const std::string& id) {
     return done;
 }
 
+// ============================================================ security end
+//
+// AN ASSIGNMENT THAT ENDED FOR SECURITY (owner brief 2026-11-05; VIRULE_BACKEND
+// src/evaluations/security_review.ts). NEVER an expiry and NEVER expired.json:
+// the service answers the runtime report with `state` "released" (released
+// without fault: the resume reservation passed, or this computer refused the
+// cleared build) or "terminated" (the build was confirmed malicious). A
+// SECURITY REVIEW itself (the game held, the assignment paused) changes
+// nothing here: the game, its saves and the draft stay, and only launching
+// stops (client/security_marks.hpp).
+//
+//   1. THE MARK: evaluatorssignments\<id>\security_end.json
+//      {"version":1,"outcome":"released"|"terminated","marked_utc"}, written
+//      atomically and never removed. From then on the launcher refuses a
+//      launch and the transfer driver installs nothing for it.
+//   2. CLOSE THE GAME (every process of the assignment).
+//   3. FINALIZE THE EVIDENCE only for a RELEASED assignment whose content is
+//      not held (the wrapper's recovery runs the wrapper from the game
+//      folder): never for a TERMINATED one, and never while the game is held
+//      or this computer's own scan refused it. Held content is never
+//      executed by VIRULE.
+//   4. REMOVE THE GAME, with the expiry's own guard (only the job's folder,
+//      directly inside the installs location, named by the game's id), and
+//      the download's temp file.
+// KEPT: the unsubmitted draft (WORKING CHOICE, PENDING OWNER DECISION: a
+// security end is not the evaluator's doing, and the owner has not said the
+// draft goes with it), the ticket, the ledger, the evidence outbox and
+// receipts, so evidence still on its way is delivered.
+
+inline fs::path security_end_path(const fs::path& root, const std::string& id) { return assignment_dir(root, id) / L"security_end.json"; }
+
+/** The recorded outcome ("released", "terminated"), else "". */
+inline std::string security_outcome(const fs::path& root, const std::string& id) {
+    if (!ee::is_hex32(id)) return "";
+    const std::string doc = ee::read_document(security_end_path(root, id));
+    if (doc.empty()) return "";
+    const std::string o = ee::json::opt_string(doc, "outcome");
+    return (o == "released" || o == "terminated") ? o : "terminated";   // an unreadable mark still revokes
+}
+inline bool is_security_ended(const fs::path& root, const std::string& id) {
+    if (!ee::is_hex32(id)) return false;
+    std::error_code ec;
+    return fs::exists(security_end_path(root, id), ec);
+}
+/** Ended in any way that revokes it (expired or a security end). */
+inline bool is_ended(const fs::path& root, const std::string& id) { return is_expired(root, id) || is_security_ended(root, id); }
+
+/** Step 1, idempotent (the first outcome recorded stands). */
+inline bool mark_security_end(const fs::path& root, const std::string& id, const std::string& outcome, std::time_t now) {
+    if (!ee::is_hex32(id) || (outcome != "released" && outcome != "terminated")) return false;
+    if (is_security_ended(root, id)) return true;
+    std::error_code ec;
+    fs::create_directories(assignment_dir(root, id), ec);
+    return ee::write_file_atomic(security_end_path(root, id),
+        "{\"version\":1,\"outcome\":\"" + outcome + "\",\"marked_utc\":\"" + utc_of(now) + "\"}\n");
+}
+
+/** Every assignment marked as ended for security (the cleanup resumes them). */
+inline std::vector<std::string> security_ended(const fs::path& root) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(root / L"evaluator" / L"assignments", ec)) {
+        const std::string id = e.path().filename().string();
+        if (ee::is_hex32(id) && is_security_ended(root, id)) out.push_back(id);
+    }
+    return out;
+}
+
+/** Steps 2 to 4 for a security-ended assignment. `held` says whether the
+ *  game is held or this computer refused its content (recovery never runs
+ *  then). True when nothing is left to do. */
+inline bool run_security_end(const Config& cfg, const std::string& id, const std::function<bool(const ed::Job&)>& held) {
+    if (!is_security_ended(cfg.root, id)) return true;
+    const std::string outcome = security_outcome(cfg.root, id);
+    const auto say = [&](const std::string& t) { if (cfg.log) cfg.log("assignment " + id + " ended (" + outcome + "): " + t); };
+    bool done = true;
+    bool changed = false;
+    ed::Job j;
+    if (ed::install_for_assignment(cfg.root, id, j) && j.state != "removed") {
+        const bool all_closed = cfg.terminate ? cfg.terminate(id) : true;
+        if (!all_closed) say("a process could not be closed yet");
+        if (outcome == "released" && j.state == "installed" && cfg.recover && !(held && held(j))) cfg.recover(id);
+        if (cfg.busy && cfg.busy(id)) {
+            say("the game is still running; removal waits");
+            done = false;
+        } else {
+            std::error_code ec;
+            const fs::path dst = fs::path(std::u8string(j.install_dir.begin(), j.install_dir.end()));
+            const fs::path inst_root = fs::path(std::u8string(j.install_root.begin(), j.install_root.end()));
+            bool removed = true;
+            if (!dst.empty() && !inst_root.empty() && dst.parent_path() == inst_root && dst.filename().string() == j.game_uuid) {
+                fs::remove_all(dst, ec);
+                if (ec && fs::exists(dst)) { removed = false; say("the game folder could not be removed yet"); }
+            }
+            if (removed) {
+                if (!j.temp_path.empty()) fs::remove(fs::path(std::u8string(j.temp_path.begin(), j.temp_path.end())), ec);
+                ed::Job cur;
+                if (ed::install_for_assignment(cfg.root, id, cur)) j = cur;
+                j.state = "removed";
+                j.error.clear();
+                j.attempts = 0;
+                j.updated_utc = utc_of(std::time(nullptr));
+                if (ed::write_job(cfg.root, j)) { say("the game was removed"); changed = true; }
+                else done = false;
+            } else {
+                done = false;
+            }
+        }
+    }
+    if (changed && cfg.on_change) cfg.on_change();
+    return done;
+}
+
 } // namespace vclient::assignment_cleanup

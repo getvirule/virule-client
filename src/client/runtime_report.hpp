@@ -97,6 +97,12 @@ inline constexpr std::int64_t kLocalMarginSeconds = 15 * 60;
 // A report is sent this long after the absolute instant, so the service's
 // own check (it expires strictly after the instant) has passed.
 inline constexpr std::int64_t kAbsoluteAskSeconds = 60;
+// The absolute mark measured from the public deadline (the service's
+// ABSOLUTE_AFTER_DEADLINE_SECONDS, 168 h - 144 h): a RESUMED assignment's
+// deadline is restored past its acceptance (VIRULE_BACKEND
+// security_review.ts), so the cut follows the deadline the service last
+// stated (`deadline_utc`), never the acceptance alone.
+inline constexpr std::int64_t kAbsoluteAfterDeadlineSeconds = 24 * 3600;
 
 // The service's canonical UTC instant, `YYYY-MM-DDTHH:MM:SSZ`.
 inline std::string canonical_utc(std::time_t t) {
@@ -127,7 +133,15 @@ struct Target {
     std::string assignment_id;
     std::string evaluator_id;
     std::int64_t accepted = -1;   // the ticket's accepted_utc, epoch seconds (-1 unknown)
+    std::int64_t deadline = -1;   // the service's last stated deadline_utc (-1 never stated)
 };
+
+// THE DEADLINE THE SERVICE LAST STATED for an assignment (the runtime
+// answer's `deadline_utc`, 2026-11-05), kept beside its ticket so the
+// offline cut follows a deadline restored on Resume.
+inline fs::path deadline_path(const fs::path& root, const std::string& id) {
+    return root / L"evaluator" / L"assignments" / fs::path(id) / L"deadline_utc";
+}
 
 // The service's canonical instant as epoch seconds; -1 if malformed.
 inline std::int64_t parse_utc(const std::string& s) {
@@ -139,9 +153,24 @@ inline std::int64_t parse_utc(const std::string& s) {
     return t == (std::time_t)-1 ? -1 : (std::int64_t)t;
 }
 
-// The answer's `state` is "expired".
+// The answer's `state` is "expired" (a TRUE expiry only: the service never
+// answers it for a security end, 2026-11-05).
 inline bool says_expired(const std::string& body) {
     return body.find("\"state\":\"expired\"") != std::string::npos;
+}
+
+// The answer's `state` is a SECURITY END: "released" (released without
+// fault) or "terminated" (ended after a build was confirmed malicious);
+// "" otherwise (client/assignment_cleanup.hpp "security end").
+inline std::string says_security_end(const std::string& body) {
+    if (body.find("\"state\":\"terminated\"") != std::string::npos) return "terminated";
+    if (body.find("\"state\":\"released\"") != std::string::npos) return "released";
+    return "";
+}
+
+// The answer's `deadline_utc`, epoch seconds (-1 absent or malformed).
+inline std::int64_t says_deadline(const std::string& body) {
+    return parse_utc(ee::json::opt_string(body, "deadline_utc"));
 }
 
 // What the service answered: its HTTP status (0 = no answer) and body.
@@ -159,7 +188,10 @@ inline std::vector<Target> targets(const fs::path& root) {
         if (seen) continue;
         const std::string ticket = ee::read_document(root / L"evaluator" / L"assignments" / fs::path(j.assignment_id) / L"ticket.json");
         const std::string evaluator = ee::json::opt_string(ticket, "evaluator_id");
-        if (ee::is_hex32(evaluator)) out.push_back(Target{ j.assignment_id, evaluator, parse_utc(ee::json::opt_string(ticket, "accepted_utc")) });
+        if (ee::is_hex32(evaluator)) {
+            out.push_back(Target{ j.assignment_id, evaluator, parse_utc(ee::json::opt_string(ticket, "accepted_utc")),
+                                  parse_utc(ee::read_document(deadline_path(root, j.assignment_id)).substr(0, 20)) });
+        }
     }
     return out;
 }
@@ -176,6 +208,9 @@ struct Config {
     // The assignment truly expired: mark it and clean it up
     // (client/assignment_cleanup.hpp). `source` "service" or "local".
     std::function<void(const std::string& assignment_id, const std::string& source)> expired;
+    // The assignment ENDED FOR SECURITY (the service only): `outcome`
+    // "released" or "terminated" (client/assignment_cleanup.hpp "security end").
+    std::function<void(const std::string& assignment_id, const std::string& outcome)> security_ended;
     // Resume every cleanup a mark left unfinished (each cycle).
     std::function<void()> resume_cleanups;
     std::function<std::time_t()> now = [] { return std::time(nullptr); };
@@ -228,7 +263,18 @@ public:
                             !security_marks::set(cfg_.root, t.assignment_id, security_marks::kProtected, security_marks::says(a.body, "security_protected"))) {
                             say("runtime report: " + t.assignment_id + " security state could not be recorded");
                         }
-                        if (says_expired(a.body)) {
+                        // The deadline the service states now (restored on a Resume).
+                        const std::int64_t dl = says_deadline(a.body);
+                        if (dl > 0 && dl != t.deadline) {
+                            if (!ee::write_file_atomic(deadline_path(cfg_.root, t.assignment_id), canonical_utc((std::time_t)dl) + "\n")) {
+                                say("runtime report: " + t.assignment_id + " deadline could not be recorded");
+                            }
+                        }
+                        const std::string ended = says_security_end(a.body);
+                        if (!ended.empty()) {
+                            say("runtime report: " + t.assignment_id + " ended for security (" + ended + ")");
+                            if (cfg_.security_ended) cfg_.security_ended(t.assignment_id, ended);
+                        } else if (says_expired(a.body)) {
                             say("runtime report: " + t.assignment_id + " expired (service)");
                             if (cfg_.expired) cfg_.expired(t.assignment_id, "service");
                         }
@@ -250,9 +296,24 @@ public:
     // local clock), for an assignment whose acceptance is known.
     // Never for an assignment the service PROTECTED after a security
     // detection (client/security_marks.hpp): its expiry is administrative.
+    //
+    // 2026-11-05 (VIRULE_BACKEND security_review.ts): never while the service
+    // last said nothing may be launched (`security_hold`: the game held, or
+    // the assignment paused under a security review, whose deadline is
+    // frozen). Where the service stated a deadline, the cut is that deadline
+    // + 24 h (a deadline restored on Resume moves it); otherwise the original
+    // rule: acceptance + 7 days, never for a protected assignment.
     bool local_cut_due(const Target& t) const {
-        if (security_marks::has(cfg_.root, t.assignment_id, security_marks::kProtected)) return false;
-        return t.accepted > 0 && (std::int64_t)cfg_.now() > t.accepted + kAbsoluteSeconds + kLocalMarginSeconds;
+        if (security_marks::has(cfg_.root, t.assignment_id, security_marks::kHold)) return false;
+        const std::int64_t at = cut_instant(t);
+        return at > 0 && (std::int64_t)cfg_.now() > at + kLocalMarginSeconds;
+    }
+
+    // The absolute instant this computer cuts at (-1: never).
+    std::int64_t cut_instant(const Target& t) const {
+        if (t.deadline > 0) return t.deadline + kAbsoluteAfterDeadlineSeconds;
+        if (security_marks::has(cfg_.root, t.assignment_id, security_marks::kProtected)) return -1;
+        return t.accepted > 0 ? t.accepted + kAbsoluteSeconds : -1;
     }
 
     // Milliseconds until the next instant a report or the local cut is due
@@ -262,9 +323,9 @@ public:
         const std::int64_t now = (std::int64_t)cfg_.now();
         std::int64_t best = (std::int64_t)kIntervalMs / 1000;
         for (const auto& t : targets(cfg_.root)) {
-            if (t.accepted <= 0) continue;
-            for (const std::int64_t at : { t.accepted + kAbsoluteSeconds + kAbsoluteAskSeconds,
-                                           t.accepted + kAbsoluteSeconds + kLocalMarginSeconds + 1 }) {
+            const std::int64_t cut = cut_instant(t);
+            if (cut <= 0) continue;
+            for (const std::int64_t at : { cut + kAbsoluteAskSeconds, cut + kLocalMarginSeconds + 1 }) {
                 if (at > now && at - now < best) best = at - now;
             }
         }

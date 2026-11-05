@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -346,6 +347,129 @@ int main(int argc, char** argv) {
         check("the launcher refuses an expired assignment", refusal.find("\"code\":\"expired\"") != std::string::npos, refusal);
         std::error_code e3;
         fs::remove_all(r3, e3);
+    }
+
+    // ---- THE SECURITY REVIEW (owner brief 2026-11-05; VIRULE_BACKEND security_review.ts)
+    {
+        const fs::path r4 = sandbox();
+        const std::string X = hex32(r);
+        // Accepted 2026-10-19T12:00:00Z: acceptance + 7 days = 1793016000.
+        install(r4, X, "installed", EV, "install", "2026-10-19T12:00:00Z");
+        std::vector<std::pair<std::string, std::string>> expired, ended;
+        rr::Config c = cfg;
+        c.root = r4;
+        c.expired = [&](const std::string& id, const std::string& src) { expired.push_back({ id, src }); };
+        c.security_ended = [&](const std::string& id, const std::string& o) { ended.push_back({ id, o }); };
+        std::time_t clock = 1793016000 + 3600;   // past acceptance + 7 days
+        c.now = [&] { return clock; };
+        answer = 200;
+        answer_body = "{\"ok\":true,\"state\":\"active\",\"security_hold\":true,\"security_protected\":true,\"security_review\":\"review\",\"deadline_utc\":\"2026-10-25T12:00:00Z\"}";
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("REVIEW: the hold mark is kept, the stated deadline recorded, nothing expires or ends",
+              vclient::security_marks::has(r4, X, vclient::security_marks::kHold) && expired.empty() && ended.empty() &&
+              [&] { for (const auto& t : rr::targets(r4)) if (t.assignment_id == X) return t.deadline == 1793016000 - 86400; return false; }());
+        answer = 0;
+        clock = 1793016000 + 10 * 86400;
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("REVIEW, offline far past every mark: NO local cut (the deadline is frozen under the hold)", expired.empty());
+        // RESUMED: the service restores the deadline (2026-10-30T12:00:00Z = 1793016000 + 4 days).
+        answer = 200;
+        clock = 1793016000 + 3 * 86400;
+        answer_body = "{\"ok\":true,\"state\":\"active\",\"security_hold\":false,\"security_protected\":true,\"deadline_utc\":\"2026-10-30T12:00:00Z\"}";
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("RESUMED: the hold mark cleared, the RESTORED deadline recorded",
+              !vclient::security_marks::has(r4, X, vclient::security_marks::kHold) &&
+              [&] { for (const auto& t : rr::targets(r4)) if (t.assignment_id == X) return t.deadline == 1793016000 + 4 * 86400; return false; }());
+        answer = 0;
+        clock = 1793016000 + 4 * 86400 + 86400 + 15 * 60 - 10;   // just inside restored deadline + 24 h + the margin
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("RESUMED, offline past acceptance + 7 days: no cut before the RESTORED deadline + 24 h", expired.empty());
+        clock = 1793016000 + 4 * 86400 + 86400 + 15 * 60 + 1;
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("...and the local cut at the restored deadline + 24 h + the margin", expired.size() == 1 && expired[0].second == "local");
+        expired.clear();
+        answer = 200;
+        answer_body = "{\"ok\":true,\"state\":\"released\",\"security_hold\":false,\"security_protected\":true,\"deadline_utc\":\"2026-10-30T12:00:00Z\"}";
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("RELEASED WITHOUT FAULT: the security end, never the expiry cleanup", ended.size() == 1 && ended[0].second == "released" && expired.empty());
+        ended.clear();
+        answer_body = "{\"ok\":true,\"state\":\"terminated\",\"security_hold\":true,\"security_protected\":true,\"deadline_utc\":\"2026-10-30T12:00:00Z\"}";
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("TERMINATED: the security end (terminated), never the expiry cleanup", ended.size() == 1 && ended[0].second == "terminated" && expired.empty());
+        std::error_code e4;
+        fs::remove_all(r4, e4);
+    }
+
+    // ---- THE SECURITY END'S CLEANUP (client/assignment_cleanup.hpp "security end")
+    {
+        const fs::path r5 = sandbox();
+        const fs::path installs = r5 / L"installs";
+        auto installed = [&](const std::string& id, const std::string& game, const fs::path& dir) {
+            ed::Job j;
+            j.id = hex32(r); j.kind = "install"; j.state = "installed"; j.assignment_id = id; j.game_uuid = game;
+            j.install_root = std::string(reinterpret_cast<const char*>(installs.u8string().c_str()));
+            j.install_dir = std::string(reinterpret_cast<const char*>(dir.u8string().c_str()));
+            fs::create_directories(dir);
+            std::ofstream(dir / L"Game.exe", std::ios::binary) << "x";
+            std::ofstream(dir / L"save.dat", std::ios::binary) << "progress";
+            (void)ed::write_job(r5, j);
+            fs::create_directories(ac::assignment_dir(r5, id));
+            std::ofstream(ac::draft_path(r5, id), std::ios::binary) << "{\"logline\":\"unsent\"}";
+        };
+        int terminated = 0, recovered = 0;
+        ac::Config cc;
+        cc.root = r5;
+        cc.terminate = [&](const std::string&) { ++terminated; return true; };
+        cc.recover = [&](const std::string&) { ++recovered; };
+        cc.busy = [&](const std::string&) { return false; };
+        const std::function<bool(const ed::Job&)> never_held = [](const ed::Job&) { return false; };
+        const std::function<bool(const ed::Job&)> held = [](const ed::Job&) { return true; };
+        // UNDER REVIEW: nothing ends, nothing is removed.
+        const std::string Q = hex32(r), GQ = hex32(r);
+        installed(Q, GQ, installs / fs::path(GQ));
+        (void)vclient::security_marks::set(r5, Q, vclient::security_marks::kHold, true);
+        check("UNDER REVIEW: no security end, the cleanup does nothing, game, saves and draft stay",
+              ac::run_security_end(cc, Q, held) && terminated == 0 && fs::exists(installs / fs::path(GQ) / L"save.dat") && fs::exists(ac::draft_path(r5, Q)) &&
+              !ac::is_expired(r5, Q) && !ac::is_ended(r5, Q));
+        vclient::launcher::Config lc;
+        lc.root = r5;
+        vclient::launcher::Launcher la(lc);
+        const std::string rq = la.launch("{\"assignment_id\":\"" + Q + "\"}");
+        check("UNDER REVIEW: the launcher refuses (security_hold), and the game is still there", rq.find("\"code\":\"security_hold\"") != std::string::npos &&
+              fs::exists(installs / fs::path(GQ) / L"Game.exe"), rq);
+        // TERMINATED: closed, never recovered (held content is never run), removed, draft kept, no expired.json.
+        const std::string T = hex32(r), GT = hex32(r);
+        installed(T, GT, installs / fs::path(GT));
+        check("the security end is marked (terminated), never expired.json", ac::mark_security_end(r5, T, "terminated", 1793016000) &&
+              ac::security_outcome(r5, T) == "terminated" && !ac::is_expired(r5, T) && ac::security_ended(r5).size() == 1);
+        ed::Job tj;
+        const bool tdone = ac::run_security_end(cc, T, never_held);
+        (void)ed::install_for_assignment(r5, T, tj);
+        check("TERMINATED: the game closed, NEVER recovered, its folder removed, the job removed",
+              tdone && terminated == 1 && recovered == 0 && !fs::exists(installs / fs::path(GT)) && tj.state == "removed", tj.state);
+        check("TERMINATED: the unsubmitted draft and the evidence folder are kept", fs::exists(ac::draft_path(r5, T)));
+        const std::string rt = la.launch("{\"assignment_id\":\"" + T + "\"}");
+        check("TERMINATED: the launcher refuses it (ended)", rt.find("\"code\":\"ended\"") != std::string::npos, rt);
+        // RELEASED: recovered only when its content is not held.
+        const std::string L1 = hex32(r), G1 = hex32(r), L2 = hex32(r), G2 = hex32(r);
+        installed(L1, G1, installs / fs::path(G1));
+        installed(L2, G2, installs / fs::path(G2));
+        (void)ac::mark_security_end(r5, L1, "released", 1793016000);
+        (void)ac::mark_security_end(r5, L2, "released", 1793016000);
+        recovered = 0;
+        (void)ac::run_security_end(cc, L1, held);
+        check("RELEASED with held content: never recovered, removed", recovered == 0 && !fs::exists(installs / fs::path(G1)));
+        (void)ac::run_security_end(cc, L2, never_held);
+        check("RELEASED, content not held: the interrupted session is recovered first, then removed", recovered == 1 && !fs::exists(installs / fs::path(G2)));
+        // The guard: a folder outside the installs location is never deleted.
+        const std::string O = hex32(r), GO = hex32(r);
+        const fs::path elsewhere = r5 / L"not-installs" / fs::path(GO);
+        installed(O, GO, elsewhere);
+        (void)ac::mark_security_end(r5, O, "terminated", 1793016000);
+        (void)ac::run_security_end(cc, O, never_held);
+        check("TERMINATED: a folder outside the installs location is never deleted", fs::exists(elsewhere / L"Game.exe"));
+        std::error_code e5;
+        fs::remove_all(r5, e5);
     }
 
     std::error_code ec;

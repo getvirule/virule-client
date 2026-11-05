@@ -96,6 +96,10 @@ inline constexpr const char* kAlreadyRunning = "This game is already running.";
 inline constexpr const char* kNotStarted = "The game could not be started.";
 // The assignment truly expired (client/assignment_cleanup.hpp).
 inline constexpr const char* kExpired = "This assignment has expired.";
+// An assignment that ended for security (released without fault, or ended
+// after a security review; client/assignment_cleanup.hpp). WORKING WORDING,
+// PENDING OWNER REVIEW.
+inline constexpr const char* kEnded = "This evaluation has ended.";
 // LOCAL MALWARE SCANNING (owner briefs 2026-10-30; WORKING WORDING, PENDING
 // OWNER DECISION): the game is held after a detection (here or, as the
 // service says, anywhere), or its installed content is not verified yet
@@ -360,6 +364,8 @@ private:
     bool launchable(const std::string& assignment, const std::string& required, ed::Job& job, std::string& code, std::string& why) {
         // A truly expired assignment is never launched again.
         if (vclient::assignment_cleanup::is_expired(cfg_.root, assignment)) { code = "expired"; why = kExpired; return false; }
+        // Ended for security (2026-11-05): never launched again either.
+        if (vclient::assignment_cleanup::is_security_ended(cfg_.root, assignment)) { code = "ended"; why = kEnded; return false; }
         if (!ed::install_for_assignment(cfg_.root, assignment, job)) { code = "not_installed"; why = kNotInstalled; return false; }
         if (job.state != "installed") {
             const bool on_disk = !ed::installed_revision(job).empty();
@@ -415,7 +421,7 @@ private:
         // never a service answer in their place.
         {
             ed::Job local;
-            if (vclient::assignment_cleanup::is_expired(cfg_.root, assignment) ||
+            if (vclient::assignment_cleanup::is_ended(cfg_.root, assignment) ||
                 !ed::install_for_assignment(cfg_.root, assignment, local) || local.state != "installed") return true;
         }
         if (cfg_.service_check) {

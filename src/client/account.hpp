@@ -46,6 +46,7 @@
 // offline, and capabilities are re-confirmed on the next successful call.
 
 #include <atomic>
+#include <functional>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -1259,6 +1260,21 @@ inline bool machine_proof_context(std::string& host_out, std::string& device_out
     return true;
 }
 
+// THE RESUME GATE (owner brief 2026-11-05 sections 8 and 19; VIRULE_BACKEND
+// security_review.ts): before the evaluator's Resume is relayed, THIS
+// COMPUTER decides whether it can continue the assignment at all. Given the
+// assignment and the build the Admin names (`revision_id`, the game's
+// current hosted build the service will require), the gate answers "" to
+// relay the Resume, or the relay's whole answer when this computer's own
+// scan already refused that exact build (a central clearance never overrides
+// local enforcement): the Client then reports the refusal itself, under its
+// machine proof, and the service releases the assignment without fault.
+// Set once by main.cpp (it owns the transfer records and the proven calls).
+inline std::function<std::string(const std::string& assignment_id, const std::string& revision_id)>& resume_gate() {
+    static std::function<std::string(const std::string&, const std::string&)> g;
+    return g;
+}
+
 inline std::string api_call(const std::string& message) {
     namespace relay = vclient::account_relay;
     const relay::Request req = relay::parse(message);
@@ -1287,6 +1303,18 @@ inline std::string api_call(const std::string& message) {
                         (ready.detail.empty() ? std::string() : " (" + ready.detail + ")"));
             return relay::not_ready(virule::core::malware_scan::json_quote(pr::blocker_name(ready.blocker)),
                                     virule::core::malware_scan::json_quote(ready.message));
+        }
+    }
+    // THE RESUME: this computer's own check first (resume_gate above), for
+    // whoever asked; the build it checks is the one the service will hold the
+    // Resume to (it refuses any other as stale).
+    {
+        const std::string resuming = relay::resume_assignment(req);
+        if (!resuming.empty() && resume_gate()) {
+            std::string revision;
+            (void)json_scan::find_string_in(body, 0, body.size(), "revision_id", revision);
+            const std::string refusal = resume_gate()(resuming, revision);
+            if (!refusal.empty()) return refusal;
         }
     }
     store::DeviceKey key;

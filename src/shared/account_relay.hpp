@@ -103,7 +103,10 @@ inline bool admin_route_ok(const std::string& method, const std::string& path) {
         return false;
     }
     if (n == 1) return at(0) == "preferences" || at(0) == "support";
-    if (n == 2) return at(0) == "offers" && at(1) == "open";
+    // The evaluator's explicit Resume of an assignment ready to resume (owner
+    // brief 2026-11-05): relayed only after this computer's own check
+    // (client/account.hpp `api_call`, is_resume).
+    if (n == 2) return (at(0) == "offers" && at(1) == "open") || (is_id(at(0)) && at(1) == "resume");
     if (n == 3) {
         return at(0) == "offers" && is_id(at(1)) &&
                (at(2) == "close" || at(2) == "accept" || at(2) == "reject" || at(2) == "decline");
@@ -141,6 +144,16 @@ inline bool is_purchase(const Request& r) {
     return r.ok && r.method == "POST" && r.path == "/v1/evaluations/purchases";
 }
 
+/** POST /v1/assignments/<id>/resume: the assignment id, else "". */
+inline std::string resume_assignment(const Request& r) {
+    static const std::string kPrefix = "/v1/assignments/";
+    static const std::string kSuffix = "/resume";
+    if (!r.ok || r.method != "POST" || r.path.size() != kPrefix.size() + 32 + kSuffix.size()) return "";
+    if (r.path.compare(0, kPrefix.size(), kPrefix) != 0 || r.path.compare(kPrefix.size() + 32, kSuffix.size(), kSuffix) != 0) return "";
+    const std::string id = r.path.substr(kPrefix.size(), 32);
+    return is_id(id) ? id : "";
+}
+
 /** The service's body trimmed of surrounding whitespace when it is a JSON
  *  object, otherwise "null": nothing but an object is passed on. */
 inline std::string object_or_null(const std::string& body) {
@@ -170,6 +183,15 @@ inline std::string failure(const char* error) {
 inline std::string not_ready(const std::string& reason_json, const std::string& message_json) {
     return "{\"type\":\"account_api\",\"status\":0,\"error\":\"not_ready\",\"reason\":" + reason_json +
            ",\"message\":" + message_json + "}";
+}
+
+/** The relay's answer when THIS COMPUTER refuses to resume (its own scan
+ *  refused the build a person cleared; client/account.hpp): `status` is the
+ *  service's answer to the Client's own refusal report (0 when it could not
+ *  be sent), `message` fixed copy, never caller input. */
+inline std::string refused_here(unsigned long status, const std::string& message_json) {
+    return "{\"type\":\"account_api\",\"status\":0,\"error\":\"refused_here\",\"reported\":" +
+           std::string(status == 200 ? "true" : "false") + ",\"message\":" + message_json + "}";
 }
 
 /** The largest answer handed back (inside the bridge's local frame bound). */

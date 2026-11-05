@@ -470,6 +470,34 @@ vclient::assignment_cleanup::Config cleanup_config() {
     return c;
 }
 
+// Held content (the service's hold or review, or this computer's own scan
+// refused it): the wrapper in that folder is never run (recovery skipped).
+bool content_held(const virule::core::evaluation_distribution::Job& j) {
+    return j.security_held || vclient::security_marks::has(vclient::paths::virule_data_root(), j.assignment_id, vclient::security_marks::kHold);
+}
+
+// THE RESUME GATE (client/account.hpp resume_gate; owner brief 2026-11-05
+// sections 8 and 19): this computer's own scan refused the build the Resume
+// names (a detection is final per revision here: transfers.hpp
+// revision_held_here). No bypass: the Resume is NOT relayed; the Client
+// reports the refusal itself under its machine proof and the service
+// releases the assignment without fault. Otherwise "" (relay the Resume).
+std::string resume_gate(const std::string& assignment_id, const std::string& revision_id) {
+    namespace ac = vclient::account;
+    namespace relay = vclient::account_relay;
+    const auto root = vclient::paths::virule_data_root();
+    if (revision_id.size() != 32 || !vclient::transfers::detail::revision_held_here(root, assignment_id, revision_id)) return "";
+    const vclient::transfers::Reply r = g_transfer_service.call("POST", "/v1/assignments/" + assignment_id + "/security/refusal",
+        "{\"revision_id\":\"" + revision_id + "\"}", "application/json", {});
+    vclient::log::client("resume of " + assignment_id + " refused here: this computer's scan refused that build (service " +
+                         std::to_string(r.status) + ")");
+    vclient::evidence::note_change();
+    if (g_runtime_report) g_runtime_report->wake();
+    // WORKING WORDING, PENDING OWNER REVIEW (no em dash; names no threat).
+    return relay::refused_here(r.status, "\"This computer's security scan can't verify this game, so it can't be resumed here. "
+                                         "The evaluation was released and this doesn't count against you.\"");
+}
+
 void start_runtime_report() {
     namespace rr = vclient::runtime_report;
     using Owner = vclient::evidence::Owner;
@@ -504,10 +532,23 @@ void start_runtime_report() {
         vclient::evidence::note_change();
         (void)ac::run(cleanup_config(), id);
     };
+    // AN ASSIGNMENT THAT ENDED FOR SECURITY (the service only; owner brief
+    // 2026-11-05): its own mark (never expired.json), then its cleanup, which
+    // never executes held content and keeps the draft.
+    cfg.security_ended = [](const std::string& id, const std::string& outcome) {
+        namespace ac = vclient::assignment_cleanup;
+        if (!ac::mark_security_end(vclient::paths::virule_data_root(), id, outcome, std::time(nullptr))) {
+            vclient::log::client("assignment " + id + ": the security end could not be marked; asked again next cycle");
+            return;
+        }
+        vclient::evidence::note_change();
+        (void)ac::run_security_end(cleanup_config(), id, content_held);
+    };
     cfg.resume_cleanups = [] {
         namespace ac = vclient::assignment_cleanup;
         const auto c = cleanup_config();
         for (const auto& id : ac::marked(c.root)) (void)ac::run(c, id);
+        for (const auto& id : ac::security_ended(c.root)) (void)ac::run_security_end(c, id, content_held);
     };
     cfg.log = [](const std::string& t) { vclient::log::client(t); };
     cfg.stop_event = g_launcher_stop;
@@ -1335,6 +1376,8 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     // before anything else looks.
     start_launcher();
     start_runtime_report();
+    // The Resume is relayed only past this computer's own check (client/account.hpp).
+    vclient::account::resume_gate() = ::resume_gate;
 
     // Game distribution: Build for Evaluation's upload and the evaluator's
     // install are carried by this process (client/transfers.hpp), whether

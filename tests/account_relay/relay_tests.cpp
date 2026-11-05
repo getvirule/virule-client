@@ -138,6 +138,7 @@ int main() {
         const std::string A = "0123456789abcdef0123456789abcdef", D = "fedcba9876543210fedcba9876543210";
         const std::pair<std::string, std::string> proven[] = {
             { "/v1/assignments/" + A + "/security/incident", "evaluator" },
+            { "/v1/assignments/" + A + "/security/refusal", "evaluator" },
             { "/v1/assignments/" + A + "/download/" + D + "/complete", "evaluator" },
             { "/v1/assignments/" + A + "/download/" + D + "/failed", "evaluator" },
             { "/v1/assignments/" + A + "/report", "evaluator" },
@@ -175,6 +176,21 @@ int main() {
         check("the refusal that asks for a binding is recognized",
               mp::not_bound(401, R"({"error":{"code":"machine_not_bound","message":"x"}})") &&
               !mp::not_bound(401, R"({"error":{"code":"not_authorized","message":"x"}})") && !mp::not_bound(400, "machine_not_bound"));
+    }
+
+    // ---- THE RESUME (owner brief 2026-11-05): relayed for the Admin, after the
+    // Client's own check (client/account.hpp resume_gate).
+    {
+        const std::string A = "0123456789abcdef0123456789abcdef";
+        check("the Resume is an Admin route (POST only)", relay::admin_route_ok("POST", "/v1/assignments/" + A + "/resume") &&
+              !relay::admin_route_ok("GET", "/v1/assignments/" + A + "/resume"));
+        check("a malformed assignment id is not a Resume", !relay::admin_route_ok("POST", "/v1/assignments/xyz/resume"));
+        const relay::Request q = relay::parse("{\"type\":\"account_api\",\"method\":\"POST\",\"path\":\"/v1/assignments/" + A + "/resume\",\"body\":{\"revision_id\":\"" + A + "\"}}");
+        check("the Resume is recognized with its assignment (the gate runs on it)", q.ok && relay::resume_assignment(q) == A);
+        const relay::Request other = relay::parse("{\"type\":\"account_api\",\"method\":\"POST\",\"path\":\"/v1/assignments/offers/open\"}");
+        check("no other request is a Resume", other.ok && relay::resume_assignment(other).empty());
+        check("the local refusal's answer says so, with no HTTP status",
+              relay::refused_here(200, "\"x\"") == R"({"type":"account_api","status":0,"error":"refused_here","reported":true,"message":"x"})");
     }
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);

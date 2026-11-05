@@ -46,6 +46,7 @@
 #include <thread>
 #include <vector>
 
+#include "client/security_marks.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 
@@ -132,7 +133,7 @@ inline bool needs_recovery(const fs::path& root, const std::string& assignment_i
     return false;
 }
 
-enum class Verdict { NotInstalled, NotNeeded, Running, NoMarker, TooSoon, Start, Deferred };
+enum class Verdict { NotInstalled, NotNeeded, Running, NoMarker, TooSoon, Start, Deferred, Held };
 
 inline const char* verdict_name(Verdict v) {
     switch (v) {
@@ -143,6 +144,7 @@ inline const char* verdict_name(Verdict v) {
     case Verdict::TooSoon:      return "too_soon";
     case Verdict::Start:        return "start";
     case Verdict::Deferred:     return "deferred";
+    case Verdict::Held:         return "held";
     }
     return "?";
 }
@@ -199,6 +201,19 @@ public:
         std::error_code ec;
         if (!fs::is_regular_file(exe, ec) || ec) return Verdict::NotInstalled;
         if (!needs_recovery(cfg_.root, assignment_id, why)) return Verdict::NotNeeded;
+        // HELD CONTENT IS NEVER EXECUTED (owner brief 2026-11-05): the
+        // recovery runs the wrapper from the game folder, so it waits while
+        // the service holds the game or pauses the assignment
+        // (security_hold), while this computer's own scan refuses the
+        // content, and never runs for an assignment ended for security
+        // (security_end.json). The session's record stays where it is.
+        {
+            std::error_code mec;
+            if (job.security_held || security_marks::has(cfg_.root, assignment_id, security_marks::kHold) ||
+                fs::exists(cfg_.root / L"evaluator" / L"assignments" / fs::path(assignment_id) / L"security_end.json", mec)) {
+                return Verdict::Held;
+            }
+        }
         if (cfg_.busy && cfg_.busy(assignment_id)) return Verdict::Running;
         if (!marker_cached(exe)) return Verdict::NoMarker;
         const std::int64_t t = now();

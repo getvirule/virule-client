@@ -61,7 +61,9 @@ inline std::string role_of(const std::string& method, const std::string& path) {
     std::string s[6];
     int n = 0;
     if (detail::segments(path, "/v1/assignments", s, n)) {
-        if (n == 3 && is_hex_id(s[0]) && s[1] == "security" && s[2] == "incident") return "evaluator";
+        // A security incident, and (2026-11-05) this computer's refusal of a
+        // build a person cleared (VIRULE_BACKEND security_review.ts).
+        if (n == 3 && is_hex_id(s[0]) && s[1] == "security" && (s[2] == "incident" || s[2] == "refusal")) return "evaluator";
         if (n == 4 && is_hex_id(s[0]) && s[1] == "download" && is_hex_id(s[2]) && (s[3] == "complete" || s[3] == "failed")) return "evaluator";
         if (n == 2 && is_hex_id(s[0]) && (s[1] == "report" || s[1] == "early-completion")) return "evaluator";
         if (n == 3 && is_hex_id(s[0]) && s[1] == "evidence" && is_hex_id(s[2])) return "evaluator";

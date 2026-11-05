@@ -1285,11 +1285,13 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
     // A TRULY EXPIRED ASSIGNMENT installs and updates nothing again (owner
     // brief 2026-10-28; client/assignment_cleanup.hpp): what is there is
     // removed instead.
-    if (vclient::assignment_cleanup::is_expired(cfg.root, j.assignment_id)) {
+    // An assignment ENDED FOR SECURITY (2026-11-05, client/assignment_cleanup.hpp
+    // "security end") is the same: nothing is installed again.
+    if (vclient::assignment_cleanup::is_ended(cfg.root, j.assignment_id)) {
         j.state = "removing";
         j.next_attempt_utc = 0;
         save(cfg, j);
-        log(cfg, j.id + ": the assignment expired; removing instead of installing");
+        log(cfg, j.id + ": the assignment ended; removing instead of installing");
         return;
     }
     if (j.account_email.empty()) { j.account_email = email; save(cfg, j); }
