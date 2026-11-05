@@ -205,12 +205,20 @@ public:
         // recovery runs the wrapper from the game folder, so it waits while
         // the service holds the game or pauses the assignment
         // (security_hold), while this computer's own scan refuses the
-        // content, and never runs for an assignment ended for security
-        // (security_end.json). The session's record stays where it is.
+        // content, and never runs for an assignment TERMINATED for security
+        // (security_end.json outcome "terminated", or a mark it cannot read).
+        // A RELEASED one whose content is not held is recovered before its
+        // removal (client/assignment_cleanup.hpp "security end"). The
+        // session's record stays where it is.
         {
+            const fs::path mark = cfg_.root / L"evaluator" / L"assignments" / fs::path(assignment_id) / L"security_end.json";
             std::error_code mec;
-            if (job.security_held || security_marks::has(cfg_.root, assignment_id, security_marks::kHold) ||
-                fs::exists(cfg_.root / L"evaluator" / L"assignments" / fs::path(assignment_id) / L"security_end.json", mec)) {
+            bool terminated = false;
+            if (fs::exists(mark, mec)) {
+                const std::string doc = ee::read_document(mark);
+                terminated = ee::json::opt_string(doc, "outcome") != "released";
+            }
+            if (job.security_held || security_marks::has(cfg_.root, assignment_id, security_marks::kHold) || terminated) {
                 return Verdict::Held;
             }
         }

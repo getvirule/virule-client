@@ -1023,6 +1023,23 @@ static void test_recovery_rules() {
     CHECK(r.check(a_new) == rv::Verdict::TooSoon && started.size() == 1);
     clock += 301;
     CHECK(r.check(a_new) == rv::Verdict::Start && started.size() == 2);
+    // HELD CONTENT IS NEVER RUN (owner brief 2026-11-05): the service's hold
+    // or review (the hold marker), and an assignment TERMINATED for security,
+    // never start the wrapper; a RELEASED one whose content is not held does.
+    {
+        const fs::path adir = root / L"evaluator" / L"assignments" / fs::path(a_new);
+        clock += 301;
+        ev::write_file_atomic(adir / L"security_hold", "1\n");
+        CHECK(r.check(a_new) == rv::Verdict::Held && started.size() == 2);
+        fs::remove(adir / L"security_hold");
+        ev::write_file_atomic(adir / L"security_end.json", "{\"version\":1,\"outcome\":\"terminated\",\"marked_utc\":\"2026-11-05T00:00:00Z\"}\n");
+        CHECK(r.check(a_new) == rv::Verdict::Held && started.size() == 2);
+        ev::write_file_atomic(adir / L"security_end.json", "garbled");
+        CHECK(r.check(a_new) == rv::Verdict::Held && started.size() == 2);   // an unreadable mark revokes like terminated
+        ev::write_file_atomic(adir / L"security_end.json", "{\"version\":1,\"outcome\":\"released\",\"marked_utc\":\"2026-11-05T00:00:00Z\"}\n");
+        CHECK(r.check(a_new) == rv::Verdict::Start && started.size() == 3);
+        fs::remove(adir / L"security_end.json");
+    }
     // An open checkpoint alone is a reason.
     write_ledger(root, a_new, {});
     ev::write_file_atomic(root / L"evaluator" / L"assignments" / fs::path(a_new) / L"open_session.json", "{}\n");
