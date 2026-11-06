@@ -1523,6 +1523,499 @@ static void test_upload_gate_real_defender() {
     fs::remove_all(root);
 }
 
+// ---- 2026-11-06 (owner brief, the corrective pass after the external
+// malware-analysis research): WHAT THE CLIENT ESTABLISHES OF A FLAGGED FILE.
+// Digests come from the bytes VIRULE itself wrote or copied, in the same pass;
+// a file the antivirus took before VIRULE read it has none; Defender's Threat
+// ID is passed on only when valid. Every scan here is a stand-in naming
+// files; nothing is malware and nothing leaves this computer.
+static void put32(std::string& s, std::uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); }
+static void put64(std::string& s, std::uint64_t v) { s.append(reinterpret_cast<const char*>(&v), 8); }
+/** A VIRULE wrapper as the Admin builds it: a stub, a VRULPK1 archive holding
+ *  the original executable raw, and the 24-byte VRULEND1 footer. */
+static std::string wrapper_bytes(const std::string& stub, const std::string& member, const std::string& original) {
+    std::string table;
+    put32(table, static_cast<std::uint32_t>(member.size()));
+    table += member;
+    put64(table, 0);
+    put64(table, original.size());
+    std::string payload("VRULPK1\0", 8);
+    put32(payload, 1);
+    payload += table;
+    payload += original;
+    std::string footer("VRULEND1", 8);
+    put64(footer, payload.size());
+    put64(footer, 24);
+    return stub + payload + footer;
+}
+static std::string lower_utf8(const fs::path& p) {
+    std::wstring w = p.wstring();
+    for (auto& c : w) c = static_cast<wchar_t>(towlower(c));
+    return utf8(fs::path(w));
+}
+
+static void test_finding_identity() {
+    SECTION("finding identity: digests of the bytes VIRULE wrote, never after the antivirus took them (owner brief 2026-11-06)");
+    namespace ms = virule::core::malware_scan;
+    namespace fi = vclient::finding_identity;
+    namespace vd = vclient::verified_digests;
+    namespace uv = vclient::upload_verification;
+    namespace vc = virule::core::verified_content;
+    const fs::path root = temp_root("identity");
+    const std::string dll = random_bytes_str(5000, 61), original = "MZ original game " + random_bytes_str(3000, 62);
+    const std::string exe = wrapper_bytes("MZ virule stub " + random_bytes_str(700, 63), "__virule__/orig/Game.exe", original);
+    const std::string data_zip = random_bytes_str(900, 64);
+    const fs::path pkg = root / "pkg.zip";
+    write_zip(pkg, { { "Game.exe", exe }, { "bin/game.dll", dll }, { "bin/data.zip", data_zip } });
+
+    // 1. THE EXTRACTOR hashes each entry as it writes it.
+    const fs::path dir = root / "x";
+    std::vector<fi::WrittenEntry> written;
+    std::string why;
+    CHECK(tr::detail::extract_zip(pkg, dir, why, {}, &written));
+    CHECK(written.size() == 3);
+    bool hashed_all = written.size() == 3;
+    for (const auto& w : written) {
+        const std::string& want = w.name == "Game.exe" ? exe : w.name == "bin/game.dll" ? dll : data_zip;
+        hashed_all = hashed_all && w.sha256 == tr::sha256_hex(want) && w.bytes == want.size() && w.size_after == want.size();
+    }
+    CHECK(hashed_all);   // each digest is the digest of exactly the entry's bytes
+
+    // 2. THE WRAPPED ORIGINAL is hashed as it is copied out.
+    const fs::path copies = root / "copies";
+    const ms::Extracted x = ms::extract_wrapped_originals(dir, copies, {});
+    CHECK(x.ok && x.originals.size() == 1);
+    if (x.originals.size() == 1) {
+        const auto& o = x.originals[0];
+        CHECK(o.member == "__virule__/orig/Game.exe" && o.bytes == original.size() && o.sha256 == tr::sha256_hex(original));
+        CHECK(fs::equivalent(o.wrapper, dir / "Game.exe") && slurp(o.copy) == original);
+    }
+
+    // 3. THE INDEX and every reported shape (attach).
+    fi::Index idx;
+    idx.package = fi::key_of(pkg);
+    fi::add_package(idx, written);
+    fi::add_originals(idx, x.originals, dir);
+    const fs::path dllPath = dir / "bin" / "game.dll";
+    const fs::path local = dir / "save.dat";
+    std::ofstream(local, std::ios::binary) << "a save the game wrote";
+    const fs::path takenLocal = dir / "dropped.tmp";   // the antivirus took it: never read
+    ms::Result r;
+    r.outcome = ms::Outcome::removed;
+    r.scanner = "Test scanner";
+    r.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(dllPath), "Quarantine", "2147519003" });
+    r.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(pkg) + "; file:_" + utf8(pkg) + "->bin/game.dll", "Quarantine" });
+    r.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(dir / "bin" / "data.zip") + "; file:_" + utf8(dir / "bin" / "data.zip") + "->inner.exe", "Quarantine" });
+    r.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(x.originals.empty() ? fs::path() : x.originals[0].copy), "Quarantine" });
+    r.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(local), "Quarantine" });
+    r.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(takenLocal), "Quarantine" });
+    r.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(pkg) + "; file:_" + utf8(pkg) + "->bin/data.zip->inner.exe", "Quarantine" });
+    r.missing.push_back(lower_utf8(dllPath));          // Defender's "removed from disk" entry, as the inventory states it
+    r.missing.push_back(utf8(takenLocal));
+    r.missing.push_back("Game.exe");                      // a refused launch file: a bare entry name
+    r.missing.push_back("A game file could not be written.");
+    fi::attach(r, idx);
+    const auto& t = r.threats;
+    CHECK(t[0].identity.stated && t[0].identity.origin == "package" && t[0].identity.entry == "bin/game.dll" &&
+          t[0].identity.sha256 == tr::sha256_hex(dll) && t[0].identity.bytes == dll.size());
+    CHECK(r.missing_identity.size() == 4 && r.missing_identity[0].sha256 == t[0].identity.sha256);   // the removal entry: the same content
+    CHECK(t[1].identity.origin == "package" && t[1].identity.entry == "bin/game.dll" && t[1].identity.sha256.empty());   // inside the package zip: named, no digest
+    CHECK(t[2].identity.origin == "package" && t[2].identity.entry == "bin/data.zip" && t[2].identity.sha256.empty());   // never a container's digest
+    CHECK(t[3].identity.origin == "wrapped_original" && t[3].identity.entry == "Game.exe" &&
+          t[3].identity.member == "__virule__/orig/Game.exe" && t[3].identity.sha256 == tr::sha256_hex(original));
+    CHECK(t[4].identity.origin == "local" && t[4].identity.sha256 == tr::sha256_hex(std::string("a save the game wrote")));   // still there: hashed now
+    CHECK(t[5].identity.origin == "local" && t[5].identity.sha256.empty());   // taken by the antivirus: nothing fabricated
+    CHECK(t[6].identity.origin == "package" && t[6].identity.sha256.empty());   // nested content: not identified
+    CHECK(r.missing_identity[1].origin == "local" && r.missing_identity[1].sha256.empty());
+    CHECK(r.missing_identity[2].origin == "package" && r.missing_identity[2].entry == "Game.exe" && r.missing_identity[2].sha256.empty());
+    CHECK(r.missing_identity[3].origin == "unknown" && r.missing_identity[3].sha256.empty());
+    // A CONTAINER NAMED WITH A LITERAL TRAILING SPACE is not the package VIRULE
+    // wrote: the package's own entry digest is never given to it (the same
+    // shape without the spaces gets it: t[1] above).
+    {
+        ms::Result r8;
+        r8.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(pkg) + " ; file:_" + utf8(pkg) + " ->bin/game.dll", "Quarantine" });
+        r8.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(pkg) + "; file:_" + utf8(pkg) + "->bin/game.dll ", "Quarantine" });
+        r8.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(pkg) + "; file:_" + utf8(dir / "other.zip") + "->bin/game.dll", "Quarantine" });
+        fi::attach(r8, idx);
+        CHECK(r8.threats[0].identity.sha256.empty());   // the container's name carries a literal space
+        CHECK(r8.threats[1].identity.sha256.empty() && r8.threats[1].identity.entry == "bin/game.dll ");   // an inner name is looked up exactly
+        CHECK(r8.threats[2].identity.sha256.empty());   // the two container names must be the same text
+    }
+
+    // 4. A FILE CHANGED SINCE IT WAS WRITTEN loses its digest (the index is
+    // built right before the scan, from files still exactly as written).
+    {
+        std::ofstream(dllPath, std::ios::binary | std::ios::app) << "tampered";
+        fi::Index later;
+        fi::add_package(later, written);
+        ms::Result r2;
+        r2.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(dllPath), "Quarantine" });
+        r2.missing.push_back(utf8(dllPath));
+        fi::attach(r2, later);
+        CHECK(r2.threats[0].identity.origin == "package" && r2.threats[0].identity.sha256.empty());
+    }
+    // 5. A FILE MORE THAN ONE ENTRY WROTE has no digest (which entry's bytes
+    // the antivirus saw cannot be established): the same name twice, a case
+    // variant, and a name Windows maps onto the same file (a trailing dot);
+    // a name carried twice identifies neither entry by name, and nothing in
+    // VIRULE's own extraction folder is hashed after the fact.
+    {
+        const fs::path dup = root / "dup.zip";
+        write_zip(dup, { { "a.dll", "first" }, { "a.dll", "second" }, { "B.dll", "upper" }, { "b.dll", "lower" },
+                         { "c.dll", "plain" }, { "c.dll.", "dotted" }, { "d.dll", "alone" } });
+        std::vector<fi::WrittenEntry> w2;
+        CHECK(tr::detail::extract_zip(dup, root / "dup", why, {}, &w2) && w2.size() == 7);
+        fi::Index i2;
+        i2.package = fi::key_of(dup);
+        fi::own(i2, root / "dup");
+        fi::add_package(i2, w2);
+        ms::Result r3;
+        r3.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(dup) + "; file:_" + utf8(dup) + "->a.dll", "Quarantine" });
+        for (const char* f : { "a.dll", "b.dll", "c.dll", "d.dll" }) r3.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "dup" / f), "Quarantine" });
+        fi::attach(r3, i2);
+        CHECK(r3.threats[0].identity.sha256.empty() && i2.ambiguous.count("a.dll") == 1);
+        CHECK(r3.threats[1].identity.sha256.empty() && r3.threats[2].identity.sha256.empty() && r3.threats[3].identity.sha256.empty());
+        CHECK(r3.threats[4].identity.sha256 == tr::sha256_hex(std::string("alone")));   // written once: its digest stands
+        // The alias written AFTER the first file was taken (real-time
+        // protection on close, simulated by removing it before the alias's
+        // entry): the extractor sees no file there, yet both names are one
+        // file, so neither keeps a digest.
+        const fs::path alias = root / "alias.zip";
+        write_zip(alias, { { "c.dll", "plain" }, { "x.dll", "other" }, { "c.dll.", "dotted" } });
+        std::vector<fi::WrittenEntry> w3;
+        int entries = 0;
+        CHECK(tr::detail::extract_zip(alias, root / "alias", why, [&]() {
+            if (++entries == 3) { std::error_code rec; fs::remove(root / "alias" / "c.dll", rec); }
+            return true;
+        }, &w3) && w3.size() == 3 && !w3[0].sha256.empty() && !w3[2].sha256.empty());   // neither write saw the other
+        fi::Index i3;
+        i3.package = fi::key_of(alias);
+        fi::own(i3, root / "alias");
+        fi::add_package(i3, w3);
+        ms::Result r5;
+        r5.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "alias" / "c.dll"), "Quarantine" });
+        r5.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "alias" / "x.dll"), "Quarantine" });
+        r5.missing.push_back(lower_utf8(root / "alias" / "c.dll"));
+        fi::attach(r5, i3);
+        CHECK(r5.threats[0].identity.sha256.empty() && r5.missing_identity[0].sha256.empty());
+        CHECK(r5.threats[1].identity.sha256 == tr::sha256_hex(std::string("other")));
+        CHECK(fi::key_of(root / "a" / "c.dll. ") == fi::key_of(root / "A" / "C.DLL"));
+        // A REPORTED name with a literal trailing dot or space (a file or
+        // folder the game created so, beside an installed file VIRULE placed)
+        // never borrows the placed file's recorded digest, and is never read.
+        const fs::path inst = root / "inst";
+        fs::create_directories(inst / "bin");   // a real installed folder (its case behavior is established)
+        vd::Record placed;
+        placed.revision_id = "rev";
+        placed.files["bin/game.dll"] = vd::Digest{ 10, 20, tr::sha256_hex(std::string("placed")), "bin/game.dll" };
+        vc::Inventory walk;
+        walk["bin/game.dll"] = vc::Seen{ 10, 20 };
+        fi::Index i4;
+        fi::add_installed(i4, placed, "rev", inst, walk);
+        ms::Result r6;
+        r6.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(inst / "bin" / "game.dll"), "Quarantine" });
+        r6.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(inst) + "\\bin \\game.dll", "Quarantine" });
+        r6.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(inst) + "\\bin\\game.dll.", "Quarantine" });
+        r6.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(inst) + "\\bin\\game.dll ; file:_x->y", "Quarantine" });
+        fi::attach(r6, i4);
+        CHECK(r6.threats[0].identity.sha256 == tr::sha256_hex(std::string("placed")));   // the placed file itself
+        // THE FOLDER CASE RULE (owner decision 2026-11-06), through the probe
+        // seam (no folder's flag is ever changed): a fingerprint is trusted
+        // only when every folder on the file's path is established as
+        // case-insensitive. A case-sensitive folder, or one whose case
+        // behavior cannot be established, gives no trusted digest: not the
+        // placed file's recorded one, and nothing hashed now.
+        {
+            const fs::path local = inst / "saves" / "slot.sav";
+            fs::create_directories(local.parent_path());
+            std::ofstream(local, std::ios::binary) << "a save";
+            const auto run = [&](std::function<int(const fs::path&)> probe) {
+                fi::Index ic = i4;
+                ic.case_probe = std::move(probe);
+                ms::Result rc;
+                rc.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(inst / "bin" / "game.dll"), "Quarantine" });
+                rc.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(local), "Quarantine" });
+                rc.missing.push_back(lower_utf8(inst / "bin" / "game.dll"));
+                fi::attach(rc, ic);
+                return rc;
+            };
+            const fs::path binDir = inst / "bin";
+            const auto ok = run([](const fs::path&) { return 0; });
+            CHECK(ok.threats[0].identity.sha256 == tr::sha256_hex(std::string("placed")) && ok.missing_identity[0].sha256 == ok.threats[0].identity.sha256 &&
+                  ok.threats[1].identity.sha256 == tr::sha256_hex(std::string("a save")));   // all established: trusted
+            const auto sensitive = run([&](const fs::path& d) { return fi::exact_key_of(d) == fi::exact_key_of(inst) ? 1 : 0; });
+            CHECK(sensitive.threats[0].identity.sha256.empty() && sensitive.missing_identity[0].sha256.empty() &&
+                  sensitive.threats[0].identity.origin == "package" && sensitive.threats[1].identity.sha256.empty());   // a case-sensitive install folder
+            const auto unknown = run([&](const fs::path& d) { return fi::exact_key_of(d) == fi::exact_key_of(binDir) ? -1 : 0; });
+            CHECK(unknown.threats[0].identity.sha256.empty() && unknown.missing_identity[0].sha256.empty() &&
+                  unknown.threats[1].identity.sha256 == tr::sha256_hex(std::string("a save")));   // only what lies under the unestablished folder
+            const auto above = run([&](const fs::path& d) { return fi::exact_key_of(d) == fi::exact_key_of(root) ? 1 : 0; });
+            CHECK(above.threats[0].identity.sha256.empty() && above.threats[1].identity.sha256.empty());   // a case-sensitive folder above the install folder
+            // Windows' own answer for this computer's temporary folder: not case-sensitive.
+            CHECK(fi::detail::dir_case_sensitivity(inst) == 0 && fi::detail::dir_case_sensitivity(root / "no such folder") == -1);
+        }
+        CHECK(r6.threats[1].identity.origin == "local" && r6.threats[1].identity.sha256.empty());
+        CHECK(r6.threats[2].identity.origin == "local" && r6.threats[2].identity.sha256.empty());
+        CHECK(r6.threats[3].identity.sha256.empty());
+        ms::Result r7;
+        r7.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(inst / "bin" / "game.dll") + " ", "Quarantine" });
+        fi::attach(r7, i4);
+        CHECK(r7.threats[0].identity.origin == "local" && r7.threats[0].identity.sha256.empty());   // a literal trailing space at the end
+        // A ';' IS PART OF A NAME, never a separator (except in Defender's exact
+        // container form): `data;1\x.dll` is not the indexed file `data`.
+        const fs::path semi = root / "semi.zip";
+        write_zip(semi, { { "data", "indexed" } });
+        std::vector<fi::WrittenEntry> w5;
+        CHECK(tr::detail::extract_zip(semi, root / "semi", why, {}, &w5) && w5.size() == 1);
+        fi::Index i5;
+        i5.package = fi::key_of(semi);
+        fi::own(i5, root / "semi");
+        fi::add_package(i5, w5);
+        ms::Result r9;
+        r9.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "semi") + "\\data;1\\x.dll", "Quarantine" });
+        r9.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "semi" / "data"), "Quarantine" });
+        r9.missing.push_back(lower_utf8(root / "semi") + "\\data;1\\x.dll");
+        fi::attach(r9, i5);
+        CHECK(r9.threats[0].identity.sha256.empty() && r9.missing_identity[0].sha256.empty());
+        CHECK(r9.threats[1].identity.sha256 == tr::sha256_hex(std::string("indexed")));   // the file itself keeps it
+        // A PARTIAL EXTRACTION (the list ends where a write failed): content
+        // inside the package named `a.dll ` never borrows `a.dll`'s digest.
+        const fs::path part = root / "part.zip";
+        write_zip(part, { { "a.dll", "first" } });
+        std::vector<fi::WrittenEntry> w6;
+        CHECK(tr::detail::extract_zip(part, root / "part", why, {}, &w6) && w6.size() == 1);
+        fi::Index i6;
+        i6.package = fi::key_of(part);
+        fi::add_package(i6, w6);
+        ms::Result r10;
+        r10.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(part) + "; file:_" + utf8(part) + "->a.dll ", "Quarantine" });
+        r10.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(part) + "; file:_" + utf8(part) + "->a.dll", "Quarantine" });
+        fi::attach(r10, i6);
+        CHECK(r10.threats[0].identity.sha256.empty() && r10.threats[1].identity.sha256.empty() && r10.threats[1].identity.entry == "a.dll");
+        // A REAL PARTIAL EXTRACTION, a second `a.dll` never reached: content
+        // inside the package named `a.dll` never gets the written one's digest.
+        const fs::path part2 = root / "part2.zip";
+        write_zip(part2, { { "a.dll", "first" }, { "x:y", "refused name" }, { "a.dll", "second" } });
+        std::vector<fi::WrittenEntry> w7;
+        CHECK(!tr::detail::extract_zip(part2, root / "part2", why, {}, &w7) && w7.size() == 1);   // stops at the unsafe name
+        fi::Index i7;
+        i7.package = fi::key_of(part2);
+        fi::add_package(i7, w7);
+        ms::Result r11;
+        r11.threats.push_back({ "Simulated:Test/Detection", "containerfile:_" + utf8(part2) + "; file:_" + utf8(part2) + "->a.dll", "Quarantine" });
+        r11.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(root / "part2" / "a.dll"), "Quarantine" });
+        fi::attach(r11, i7);
+        CHECK(r11.threats[0].identity.sha256.empty());
+        CHECK(r11.threats[1].identity.sha256 == tr::sha256_hex(std::string("first")));   // the file VIRULE wrote keeps its own
+    }
+
+    // 6. THE INCIDENT carries the identity and a valid Threat ID only.
+    {
+        const std::string body = ms::incident_json(r, ed::random_hex32(), "install", "", ed::random_hex32());
+        CHECK(body.find("\"sha256\":\"" + tr::sha256_hex(dll) + "\",\"bytes\":" + std::to_string(dll.size())) != std::string::npos);
+        CHECK(body.find("\"origin\":\"wrapped_original\"") != std::string::npos && body.find("\"member\":\"__virule__/orig/Game.exe\"") != std::string::npos);
+        CHECK(body.find("\"threat_id\":\"2147519003\"") != std::string::npos && body.find("\"origin\":\"unknown\"") != std::string::npos);
+        ms::Result legacy;
+        legacy.outcome = ms::Outcome::detected;
+        legacy.threats.push_back({ "Simulated:Test/Detection", "file:_C:\\x.dll", "Quarantine", "12a" });
+        const std::string lb = ms::incident_json(legacy, ed::random_hex32(), "scan_source", "", "");
+        CHECK(lb.find("origin") == std::string::npos && lb.find("threat_id") == std::string::npos && lb.find("sha256") == std::string::npos);
+    }
+    // 6b. THE BODY IS BOUNDED: 50 entries at every field's worst (long paths
+    // of backslashes, long entries and members, control characters) stay
+    // inside the service's incident body limit (512 KiB), each field cut as the
+    // service keeps it, never inside a character.
+    {
+        ms::Result big;
+        big.outcome = ms::Outcome::removed;
+        big.scanner = std::string(500, 'S');
+        ms::Identity id;
+        id.stated = true;
+        id.origin = "wrapped_original";
+        id.entry = std::string(3000, '\\');
+        id.member = "__virule__/orig/" + std::string(5000, '"');
+        id.sha256 = tr::sha256_hex(std::string("x"));
+        id.bytes = 1;
+        for (int i = 0; i < 30; ++i) {
+            ms::Threat t{ std::string(900, 'N') + "\x01", "file:_C:" + std::string(40000, '\\'), std::string(300, 'A'), "2147519003", id };
+            big.threats.push_back(t);
+            big.missing.push_back("c:" + std::string(40000, '\\'));
+            big.missing_identity.push_back(id);
+        }
+        const std::string body = ms::incident_json(big, ed::random_hex32(), "install", "", ed::random_hex32());
+        CHECK(body.size() < 512u * 1024u);
+        CHECK(body.find('\x01') == std::string::npos && body.find(std::string(1025, 'N')) == std::string::npos);
+        CHECK(ms::bounded(std::string("ab\xC3\xA9", 4), 3) == "ab");   // never half a character
+    }
+    // 7. DEFENDER'S EVENT: the Threat ID when valid, never malformed data.
+    {
+        const ms::Threat a = ms::detail::threat_from_event_xml(
+            L"<Event><EventData><Data Name='Threat ID'>2147519003</Data><Data Name='Threat Name'>Virus:DOS/EICAR_Test_File</Data>"
+            L"<Data Name='Path'>file:_C:\\x\\a.exe</Data><Data Name='Action Name'>Quarantine</Data></EventData></Event>");
+        CHECK(a.threat_id == "2147519003" && a.name == "Virus:DOS/EICAR_Test_File" && a.path == "file:_C:\\x\\a.exe" && a.action == "Quarantine");
+        const ms::Threat b = ms::detail::threat_from_event_xml(L"<Data Name=\"Threat ID\">21475;DROP</Data><Data Name=\"Threat Name\">X</Data>");
+        CHECK(b.threat_id.empty() && b.name == "X");
+        const ms::Threat c = ms::detail::threat_from_event_xml(L"<Data Name='Threat Name'>Y</Data>");
+        CHECK(c.threat_id.empty() && c.name == "Y");
+        CHECK(ms::detail::threat_from_event_xml(L"<Data Name='Threat ID'>123456789012345678901</Data>").threat_id.empty());   // 21 digits
+    }
+
+    // 8. THE VERIFIED DIGESTS RECORD: round trip, foreign or damaged = nothing.
+    {
+        vd::Record rec;
+        rec.revision_id = ed::random_hex32();
+        rec.files["bin/game.dll"] = vd::Digest{ 5000, 133, tr::sha256_hex(dll), "bin/Game.DLL" };
+        rec.files["odd\tname"] = vd::Digest{ 1, 2, tr::sha256_hex(std::string("x")), "odd\tname" };
+        const fs::path p = root / "digests.txt";
+        CHECK(vd::write_record(p, rec));
+        vd::Record back;
+        CHECK(vd::read_record(p, back) && back.revision_id == rec.revision_id && back.files.size() == 2 &&
+              back.files["bin/game.dll"].entry == "bin/Game.DLL" && back.files["odd\tname"].mtime == 2);
+        std::ofstream(p, std::ios::binary | std::ios::app) << "zz\t1\n";
+        CHECK(!vd::read_record(p, back));
+        // At placement: only files still exactly as the scan began with them.
+        vc::Inventory delivered;
+        CHECK(vc::inventory(dir, delivered));
+        const vd::Record placed = tr::detail::digests_of_placed("rev", dir, written, delivered);
+        CHECK(placed.files.count("game.exe") == 1 && placed.files.count("bin/data.zip") == 1 && placed.files.count("bin/game.dll") == 0);   // game.dll was changed above
+        // A CASE-SENSITIVE install folder: `A.dll` and `a.dll` are two files,
+        // neither a rewrite of the other, both with a digest, and one key in
+        // the record. Neither is recorded (the multi-write rule).
+        const fs::path cs = root / "cs";
+        fs::create_directories(cs);
+        std::ofstream(cs / "a.dll", std::ios::binary) << "lower";
+        vc::Inventory csDelivered;
+        CHECK(vc::inventory(cs, csDelivered) && csDelivered.count("a.dll") == 1);
+        std::vector<fi::WrittenEntry> csWritten(2);
+        for (int n = 0; n < 2; ++n) {
+            csWritten[n].name = n == 0 ? "A.dll" : "a.dll";
+            csWritten[n].target = cs / csWritten[n].name;
+            csWritten[n].bytes = csDelivered["a.dll"].size;
+            csWritten[n].sha256 = tr::sha256_hex(std::string(n == 0 ? "upper" : "lower"));
+            csWritten[n].size_after = csDelivered["a.dll"].size;
+            csWritten[n].mtime_after = csDelivered["a.dll"].mtime;
+        }
+        CHECK(tr::detail::digests_of_placed("rev", cs, csWritten, csDelivered).files.count("a.dll") == 0);
+    }
+    // 8b. THE USUAL QUARANTINE PATH: real-time protection takes a file VIRULE
+    // wrote whole BEFORE the scan (here: removed), and the wrapped original's
+    // scan copy too. Defender evaluated the bytes VIRULE wrote, so their
+    // digests stand; the removal entry carries the same one.
+    {
+        const fs::path dir2 = root / "x2";
+        std::vector<fi::WrittenEntry> w2;
+        CHECK(tr::detail::extract_zip(pkg, dir2, why, {}, &w2) && w2.size() == 3);
+        const ms::Extracted x2 = ms::extract_wrapped_originals(dir2, root / "copies2", {});
+        CHECK(x2.ok && x2.originals.size() == 1);
+        std::error_code ec;
+        fs::remove(dir2 / "bin" / "game.dll", ec);
+        if (!x2.originals.empty()) fs::remove(x2.originals[0].copy, ec);
+        fi::Index i2;
+        i2.package = fi::key_of(pkg);
+        fi::add_package(i2, w2);
+        fi::add_originals(i2, x2.originals, dir2);
+        ms::Result r4;
+        r4.outcome = ms::Outcome::removed;
+        r4.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(dir2 / "bin" / "game.dll"), "Quarantine" });
+        if (!x2.originals.empty()) r4.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(x2.originals[0].copy), "Quarantine" });
+        r4.missing.push_back(lower_utf8(dir2 / "bin" / "game.dll"));
+        fi::attach(r4, i2);
+        CHECK(r4.threats[0].identity.sha256 == tr::sha256_hex(dll) && r4.missing_identity[0].sha256 == tr::sha256_hex(dll));
+        CHECK(r4.threats.size() == 2 && r4.threats[1].identity.origin == "wrapped_original" && r4.threats[1].identity.sha256 == tr::sha256_hex(original));
+    }
+
+    // 9. THE DEVELOPER'S VERIFICATION: a stand-in scan names an extracted file
+    // and Defender's removal entry; the incident states the entry's digest.
+    {
+        UploadService svc;
+        tr::DriverConfig cfg;
+        cfg.root = root;
+        cfg.service = &svc;
+        cfg.log = [](const std::string&) {};
+        const std::string content = random_bytes_str(4000, 65);
+        cfg.scan = [&](const std::vector<fs::path>& targets, const std::string&, const std::function<bool()>&) {
+            ms::Result s;
+            s.scanner = "Test scanner";
+            s.path = "defender";
+            s.outcome = ms::Outcome::removed;
+            const fs::path f = targets.size() > 1 ? targets[1] / "Game.exe" : fs::path();
+            s.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(f), "Quarantine", "2147519003" });
+            s.missing.push_back(lower_utf8(f));
+            return s;
+        };
+        ed::Job j = packaged_job(root, content);
+        drive_once(cfg);
+        uv::Incident inc;
+        CHECK(uv::read_incident(root, j.id, inc));
+        const std::string want = "\"sha256\":\"" + tr::sha256_hex(content) + "\"";
+        const size_t first = inc.incident.find(want);
+        CHECK(first != std::string::npos && inc.incident.find(want, first + 1) != std::string::npos);   // the detection AND its removal entry
+        CHECK(inc.incident.find("\"origin\":\"package\",\"entry\":\"Game.exe\"") != std::string::npos);
+    }
+
+    // 10. THE EVALUATOR'S PRE-PLAY CHECK: an installed file still exactly as
+    // recorded at placement keeps its recorded digest once the antivirus takes
+    // it; a file the game wrote is hashed only while it is still there.
+    {
+        UploadService svc;
+        tr::DriverConfig cfg;
+        cfg.root = root;
+        cfg.service = &svc;
+        cfg.log = [](const std::string&) {};
+        const fs::path games = root / "installs";
+        const std::string assignment = ed::random_hex32(), revision = ed::random_hex32(), game = ed::random_hex32();
+        const fs::path gdir = games / game;
+        fs::create_directories(gdir);
+        const std::string installed = "installed game file " + random_bytes_str(2000, 66);
+        std::ofstream(gdir / "Game.exe", std::ios::binary) << installed;
+        std::ofstream(gdir / "save.dat", std::ios::binary) << "the game's own save";
+        ed::Job j;
+        j.id = ed::random_hex32();
+        j.kind = "install";
+        j.state = "installed";
+        j.account_email = "dev@example.com";
+        j.assignment_id = assignment;
+        j.game_uuid = game;
+        j.revision_id = revision;
+        j.installed_revision_id = revision;
+        j.launch_exe = "Game.exe";
+        j.install_root = utf8(games);
+        j.install_dir = utf8(gdir);
+        j.created_utc = tr::utc_now();
+        ed::write_job(root, j);
+        vc::Inventory now;
+        CHECK(vc::inventory(gdir, now) && now.count("game.exe") == 1);
+        vd::Record rec;
+        rec.revision_id = revision;
+        rec.files["game.exe"] = vd::Digest{ now["game.exe"].size, now["game.exe"].mtime, tr::sha256_hex(installed), "Game.exe" };
+        CHECK(vd::write_record(vd::record_path(root, j.id), rec));
+        cfg.scan = [&](const std::vector<fs::path>&, const std::string&, const std::function<bool()>&) {
+            ms::Result s;
+            s.scanner = "Test scanner";
+            s.path = "defender";
+            s.outcome = ms::Outcome::removed;
+            // The antivirus takes Game.exe (as Defender's default quarantine would).
+            std::error_code ec;
+            fs::remove(gdir / "Game.exe", ec);
+            s.threats.push_back({ "Simulated:Test/Detection", "file:_" + utf8(gdir / "Game.exe"), "Quarantine" });
+            s.threats.push_back({ "Simulated:Other/Detection", "file:_" + utf8(gdir / "save.dat"), "Quarantine" });
+            s.missing.push_back(lower_utf8(gdir / "Game.exe"));
+            return s;
+        };
+        drive_once(cfg);
+        uv::Incident inc;
+        CHECK(uv::read_incident(root, j.id, inc));
+        const std::string want = "\"sha256\":\"" + tr::sha256_hex(installed) + "\"";
+        const size_t first = inc.incident.find(want);
+        CHECK(first != std::string::npos && inc.incident.find(want, first + 1) != std::string::npos);
+        CHECK(inc.incident.find("\"sha256\":\"" + tr::sha256_hex(std::string("the game's own save")) + "\"") != std::string::npos &&
+              inc.incident.find("\"origin\":\"local\"") != std::string::npos);
+        CHECK(inc.incident.find("\"launch\"") != std::string::npos);
+    }
+    fs::remove_all(root);
+}
+
 int main(int argc, char** argv) {
     // The recovery-only mode as an installed wrapper with the marker runs
     // it (test_recovery_rules starts a copy of this exe as Game.exe).
@@ -1549,6 +2042,7 @@ int main(int argc, char** argv) {
     test_assignment_open();
     test_upload_gate();
     test_reverify_after_resume();
+    test_finding_identity();
     test_upload_gate_real_defender();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

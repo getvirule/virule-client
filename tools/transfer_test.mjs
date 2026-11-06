@@ -486,6 +486,26 @@ try {
   check("the install records what its clean scan verified: the revision and the delivered launch file",
     !!rec1 && rec1.format === "virule-verified-content.v1" && rec1.revision === zipRevision && rec1.files.get("game.exe")?.size === 200010 &&
     readJob(JI).scan_revision_id === zipRevision && readJob(JI).scan_outcome === "clean", { rec1, job: readJob(JI) });
+  // THE VERIFIED DIGESTS RECORD (owner brief 2026-11-06; verified_digests.hpp):
+  // beside verified.txt (which shipped wrappers read, unchanged), the digest
+  // the extractor computed of each delivered file, for a later detection of
+  // an unchanged installed file.
+  const digestsOf = () => {
+    try {
+      const lines = fs.readFileSync(path.join(VROOT, "transfers", JI, "verified_digests.txt"), "utf8").split("\n");
+      const files = new Map(lines.slice(2).filter(Boolean).map((l) => {
+        const [key, size, mtime, sha, entry] = l.split("\t");
+        return [Buffer.from(key, "hex").toString("utf8"), { size: Number(size), mtime, sha, entry: Buffer.from(entry, "hex").toString("utf8") }];
+      }));
+      return { format: lines[0], revision: lines[1], files };
+    } catch { return null; }
+  };
+  const dig1 = digestsOf();
+  const exeBytes = fs.readFileSync(path.join(installDir, "Game.exe"));
+  check("the install records each delivered file's digest, of the bytes it wrote (the launch file: its SHA-256, size, write time, exact entry)",
+    !!dig1 && dig1.format === "virule-verified-digests.v1" && dig1.revision === zipRevision && dig1.files.get("game.exe")?.sha === sha256(exeBytes) &&
+    dig1.files.get("game.exe")?.entry === "Game.exe" && dig1.files.get("game.exe")?.size === exeBytes.length &&
+    dig1.files.get("game.exe")?.mtime === rec1.files.get("game.exe")?.mtime, dig1);
   // Files the game wrote after it ran (a save) and a changed data file are
   // NOT verified until they are scanned: the driver verifies them at its
   // first pass (and whenever the launcher or a game's exit asks), and the

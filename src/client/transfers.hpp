@@ -94,6 +94,8 @@
 #include "client/security_marks.hpp"
 #include "client/assignment_cleanup.hpp"
 #include "client/upload_verification.hpp"
+#include "client/finding_identity.hpp"
+#include "client/verified_digests.hpp"
 #include "shared/json_scan.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
@@ -121,6 +123,8 @@ namespace js = vclient::json_scan;
 namespace fs = std::filesystem;
 namespace ms = virule::core::malware_scan;
 namespace vc = virule::core::verified_content;
+namespace fi = vclient::finding_identity;
+namespace vd = vclient::verified_digests;
 
 using Log = std::function<void(const std::string&)>;
 
@@ -538,10 +542,13 @@ inline bool antivirus_acted(const std::vector<fs::path>& paths, const std::strin
 
 /** A scan that is not clean ends the install: VIRULE's own temporary files
  *  go (the antivirus already holds what it took), an incident is kept for
- *  the service, and the job fails with one sentence. */
-inline void scan_failed(const DriverConfig& cfg, ed::Job& j, const ms::Result& r, const std::string& operation,
-                        const fs::path& temp, const fs::path& staging) {
+ *  the service, and the job fails with one sentence. An incident first gets
+ *  what this Client established of each flagged file (`idx`,
+ *  finding_identity.hpp), while the files are still where they were. */
+inline void scan_failed(const DriverConfig& cfg, ed::Job& j, ms::Result r, const std::string& operation,
+                        const fs::path& temp, const fs::path& staging, const fi::Index& idx) {
     std::error_code ec;
+    if (ms::is_incident(r.outcome)) fi::attach(r, idx, [&]() { return !stopping(cfg); });
     if (!staging.empty()) fs::remove_all(staging, ec);
     j.scan_outcome = ms::outcome_name(r.outcome);
     if (ms::is_incident(r.outcome)) {
@@ -556,6 +563,39 @@ inline void scan_failed(const DriverConfig& cfg, ed::Job& j, const ms::Result& r
     }
     log(cfg, j.id + " scan " + j.scan_outcome + " (" + operation + "): " + r.detail.substr(0, 400));
     fail(cfg, j, scan_sentence(r));
+}
+
+/** An identity index that knows only the package zip itself (a download:
+ *  nothing of it was extracted, so no entry's digest is known). */
+inline fi::Index package_only(const fs::path& package) {
+    fi::Index idx;
+    idx.package = fi::key_of(package);
+    return idx;
+}
+
+/** THE VERIFIED DIGESTS RECORD of a placed build (verified_digests.hpp): every
+ *  delivered file the extractor wrote with a digest, as it stood when the
+ *  scan began (`delivered`), keyed as the verified content record keys it.
+ *  The rename into place keeps sizes and write times. */
+inline vd::Record digests_of_placed(const std::string& revision_id, const fs::path& staging,
+                                    const std::vector<fi::WrittenEntry>& written, const vc::Inventory& delivered) {
+    vd::Record rec;
+    rec.revision_id = revision_id;
+    // THE MULTI-WRITE RULE, as the index applies it (finding_identity.hpp
+    // add_package): a file more than one entry wrote (counted by the folded
+    // key, so case variants and trailing dots or spaces collide even in a
+    // case-sensitive folder) keeps no recorded digest.
+    std::map<std::wstring, int> writes;
+    for (const auto& w : written) ++writes[fi::key_of(w.target)];
+    for (const auto& w : written) {
+        const std::string key = vc::detail::key_of(w.target.lexically_relative(staging));
+        if (writes[fi::key_of(w.target)] > 1) { rec.files.erase(key); continue; }
+        if (!ms::detail::is_sha256_hex(w.sha256)) continue;
+        const auto d = delivered.find(key);
+        if (d == delivered.end() || d->second.size != w.size_after || d->second.mtime != w.mtime_after) { rec.files.erase(key); continue; }
+        rec.files[key] = vd::Digest{ w.size_after, w.mtime_after, w.sha256, w.name };
+    }
+    return rec;
 }
 
 /** The removal Defender recorded (or a refused file), as a scan result. */
@@ -832,8 +872,15 @@ inline size_t zip_read_cb(void* opaque, mz_uint64 ofs, void* buf, size_t n) {
     if (_fseeki64(r->in, static_cast<__int64>(ofs), SEEK_SET) != 0) return 0;
     return fread(buf, 1, n, r->in);
 }
+// One entry being written: the bytes go to the file and, in the same pass, to
+// its SHA-256 (owner brief 2026-11-06: the digest of exactly what was written,
+// never a second read).
+struct EntrySink { FILE* out = nullptr; ms::detail::Sha256* digest = nullptr; };
 inline size_t zip_write_cb(void* opaque, mz_uint64, const void* buf, size_t n) {
-    return fwrite(buf, 1, n, static_cast<FILE*>(opaque));
+    auto* s = static_cast<EntrySink*>(opaque);
+    const size_t wrote = fwrite(buf, 1, n, s->out);
+    if (s->digest && wrote > 0) s->digest->update(buf, wrote);
+    return wrote;
 }
 inline bool safe_entry(const std::string& name, fs::path& rel_out) {
     if (name.empty() || name.size() > 1024) return false;
@@ -852,7 +899,11 @@ inline bool safe_entry(const std::string& name, fs::path& rel_out) {
     rel_out = rel;
     return true;
 }
-inline bool extract_zip(const fs::path& zip_path, const fs::path& dst, std::string& why, const std::function<bool()>& keep_going) {
+/** `written` (optional): every file entry as the extractor wrote it, in
+ *  order, with the SHA-256 of the bytes written (finding_identity.hpp); an
+ *  entry whose write did not complete is listed with no digest. */
+inline bool extract_zip(const fs::path& zip_path, const fs::path& dst, std::string& why, const std::function<bool()>& keep_going,
+                        std::vector<vclient::finding_identity::WrittenEntry>* written = nullptr) {
     std::error_code ec;
     const auto size = fs::file_size(zip_path, ec);
     if (ec) { why = "The package could not be read."; return false; }
@@ -873,10 +924,51 @@ inline bool extract_zip(const fs::path& zip_path, const fs::path& dst, std::stri
         const fs::path target = dst / rel;
         if (mz_zip_reader_is_file_a_directory(&zip, i)) { fs::create_directories(target, ec); continue; }
         fs::create_directories(target.parent_path(), ec);
+        vclient::finding_identity::WrittenEntry w;
+        w.name = st.m_filename;
+        w.target = target;
+        w.bytes = static_cast<std::uint64_t>(st.m_uncomp_size);
+        // A FILE ALREADY THERE was written by an earlier entry (the folder was
+        // emptied first): a duplicate name, a case variant or a name Windows
+        // maps onto the same file. Which entry's bytes the antivirus saw
+        // cannot be established, so neither keeps a digest.
+        std::error_code xec;
+        const bool rewrite = fs::exists(target, xec) || xec;
+        if (rewrite && written) {
+            for (auto& prev : *written) {
+                std::error_code qec;
+                if (fs::equivalent(prev.target, target, qec) || qec) prev.sha256.clear();
+            }
+        }
         FILE* out = nullptr;
-        if (_wfopen_s(&out, target.wstring().c_str(), L"wb") != 0 || !out) { okd = false; why = "A game file could not be written."; break; }
-        const bool got = mz_zip_reader_extract_to_callback(&zip, i, zip_write_cb, out, 0);
+        if (_wfopen_s(&out, target.wstring().c_str(), L"wb") != 0 || !out) {
+            if (written) written->push_back(w);   // known entry, nothing established
+            okd = false; why = "A game file could not be written."; break;
+        }
+        ms::detail::Sha256 digest;
+        EntrySink sink{ out, &digest };
+        // miniz checks the entry's CRC-32 before it reports success.
+        const bool got = mz_zip_reader_extract_to_callback(&zip, i, zip_write_cb, &sink, 0);
         const bool closed = fclose(out) == 0;
+        if (got && closed && !rewrite) {
+            w.sha256 = digest.hex();
+            std::error_code sec, gec;
+            const auto size_now = fs::file_size(target, sec);
+            if (!sec) {
+                w.size_after = static_cast<std::uint64_t>(size_now);
+                w.mtime_after = static_cast<std::int64_t>(fs::last_write_time(target, sec).time_since_epoch().count());
+                if (sec || w.size_after != w.bytes) w.sha256.clear();   // not provably the bytes written
+            } else if (!fs::exists(target, gec) && !gec) {
+                // Written whole, then taken at once (real-time protection on
+                // close): the digest of the complete bytes stands for what
+                // the antivirus evaluated (finding_identity.hpp `stands`).
+                w.size_after = w.bytes;
+                w.mtime_after = 0;
+            } else {
+                w.sha256.clear();
+            }
+        }
+        if (written) written->push_back(w);
         if (!got || !closed) { okd = false; why = "A game file could not be written."; break; }
     }
     mz_zip_reader_end(&zip);
@@ -987,17 +1079,28 @@ inline bool verify_package(const DriverConfig& cfg, ed::Job& j) {
     const std::string since = ms::detail::utc_now();
     ms::Result r;
     fs::create_directories(scratch, ec);
-    if (!extract_zip(pkg, scratch, why, keep)) {
+    // WHAT THIS CLIENT WROTE, with the digests it computed while writing
+    // (finding_identity.hpp): the package's entries, then the originals.
+    std::vector<fi::WrittenEntry> written;
+    fi::Index idx;
+    idx.package = fi::key_of(pkg);
+    fi::own(idx, scratch);
+    fi::own(idx, originals);
+    if (!extract_zip(pkg, scratch, why, keep, &written)) {
         if (stopping(cfg)) { cleanup(); return false; }
         std::vector<ms::Threat> seen;
         if (!antivirus_acted({scratch, pkg}, since, seen)) { cleanup(); fail(cfg, j, why); return false; }
+        fi::add_package(idx, written);
         r = removal_of(seen, why, "A game file was refused or removed by the antivirus while the package was verified.");
     } else if (!fs::is_regular_file(scratch / path_of(j.launch_exe), ec) || ec) {
         std::vector<ms::Threat> seen;
         if (!antivirus_acted({scratch, pkg}, since, seen)) { cleanup(); fail(cfg, j, "The build has no " + j.launch_exe + ". Build it again."); return false; }
+        fi::add_package(idx, written);
         r = removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus while the package was verified.");
     } else {
         const ms::Extracted x = ms::extract_wrapped_originals(scratch, originals, keep);
+        fi::add_package(idx, written);
+        fi::add_originals(idx, x.originals, scratch);
         if (!x.ok) {
             if (stopping(cfg)) { cleanup(); return false; }
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
@@ -1006,6 +1109,8 @@ inline bool verify_package(const DriverConfig& cfg, ed::Job& j) {
             r = run_scan(cfg, { pkg, scratch, originals }, since, keep);
         }
     }
+    // The identity of each flagged file, while the scratch copies still stand.
+    if (ms::is_incident(r.outcome)) fi::attach(r, idx, keep);
     cleanup();
     if (r.outcome == ms::Outcome::canceled && stopping(cfg)) return false;
     j.scan_outcome = ms::outcome_name(r.outcome);
@@ -1086,6 +1191,10 @@ inline void establish_host_detection(const DriverConfig& cfg, const ed::Job& j) 
         found = ms::is_incident(r.outcome);
     }
     if (found) {
+        // The developer's own folder: nothing of it was written by this
+        // Client, so a flagged file still there, unchanged, is hashed now
+        // (origin local); one the antivirus took has no digest.
+        fi::attach(r, fi::Index{}, [&]() { return !stopping(cfg); });
         keep_incident(cfg, j, ms::incident_json(r, ed::random_hex32(), operation, operation == "scan_source" ? std::string() : j.build_uuid, ""));
         log(cfg, j.id + " the build's antivirus finding was established by this Client (" + operation + ")");
         return;
@@ -1308,9 +1417,20 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
     fs::remove_all(scan_dir, ec);
     const std::string since = ms::detail::utc_now();
     const auto keep_going = [&]() { return !stopping(cfg) && !game_busy(cfg, j.assignment_id); };
+    // WHAT IS KNOWN OF THE INSTALLED FILES (finding_identity.hpp): the
+    // delivered files' digests recorded at placement, for every file still
+    // exactly as recorded in the walk taken before this scan (`u.now`), so a
+    // file the antivirus takes now keeps its identity.
+    fi::Index idx;
+    fi::own(idx, scan_dir);   // the scan copies are VIRULE's own; the installed folder is not
+    {
+        vd::Record digests;
+        if (vd::read_record(vd::record_path(cfg.root, j.id), digests)) fi::add_installed(idx, digests, revision, dir, u.now);
+    }
     ms::Result r;
     if (whole) {
         const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+        fi::add_originals(idx, x.originals, dir);
         if (!x.ok) {
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
             else { r.outcome = ms::Outcome::error; r.detail = x.why; }
@@ -1319,6 +1439,7 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
         }
     } else if (plan.launch_changed) {
         const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+        fi::add_originals(idx, x.originals, dir);
         if (!x.ok) {
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
             else { r.outcome = ms::Outcome::error; r.detail = x.why; }
@@ -1330,6 +1451,9 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
     } else {
         r = run_scan(cfg, vc::paths_of(dir, plan.targets), since, keep_going);
     }
+    // The identity of each flagged file, before the scan copies go: a file the
+    // game or the computer wrote is hashed only if still there, unchanged.
+    if (ms::is_incident(r.outcome)) fi::attach(r, idx, [&]() { return !stopping(cfg); });
     fs::remove_all(scan_dir, ec);
     j.scan_outcome = ms::outcome_name(r.outcome);
     if (r.outcome == ms::Outcome::clean) {
@@ -1429,7 +1553,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             if (ms::detail::blocked_by_antivirus_errno()) {
                 std::vector<ms::Threat> seen;
                 (void)antivirus_acted({temp}, j.created_utc, seen);
-                scan_failed(cfg, j, removal_of(seen, j.temp_path, "Windows refused the downloaded package."), "download", temp, {});
+                scan_failed(cfg, j, removal_of(seen, j.temp_path, "Windows refused the downloaded package."), "download", temp, {}, package_only(temp));
                 return;
             }
             defer(cfg, j, "The download could not be written.");
@@ -1474,7 +1598,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         {
             std::vector<ms::Threat> seen;
             if (antivirus_acted({temp}, j.created_utc, seen)) {
-                scan_failed(cfg, j, removal_of(seen, j.temp_path, "The downloaded package was removed or refused by the antivirus."), "download", temp, {});
+                scan_failed(cfg, j, removal_of(seen, j.temp_path, "The downloaded package was removed or refused by the antivirus."), "download", temp, {}, package_only(temp));
                 return;
             }
         }
@@ -1508,12 +1632,21 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         fs::create_directories(staging, ec);
         std::string why;
         const std::string extract_since = ms::detail::utc_now();
-        if (!extract_zip(temp, staging, why, [&]() { return !stopping(cfg); })) {
+        std::vector<fi::WrittenEntry> written;
+        const auto extracted_index = [&]() {
+            fi::Index idx = package_only(temp);
+            fi::own(idx, staging);
+            fi::own(idx, path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".scan"));
+            fi::add_package(idx, written);
+            return idx;
+        };
+        if (!extract_zip(temp, staging, why, [&]() { return !stopping(cfg); }, &written)) {
             if (stopping(cfg)) { fs::remove_all(staging, ec); return; }
             // The antivirus refused or took a file while it was written out.
             std::vector<ms::Threat> seen;
             if (antivirus_acted({staging, temp}, extract_since, seen)) {
-                scan_failed(cfg, j, removal_of(seen, why, "A game file was refused or removed by the antivirus while it was extracted."), "install", temp, staging);
+                scan_failed(cfg, j, removal_of(seen, why, "A game file was refused or removed by the antivirus while it was extracted."), "install", temp, staging,
+                            extracted_index());
                 return;
             }
             fs::remove_all(staging, ec);
@@ -1523,7 +1656,8 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         if (!fs::is_regular_file(staging / path_of(j.launch_exe), ec) || ec) {
             std::vector<ms::Threat> seen;
             if (antivirus_acted({staging, temp}, extract_since, seen)) {
-                scan_failed(cfg, j, removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus."), "install", temp, staging);
+                scan_failed(cfg, j, removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus."), "install", temp, staging,
+                            extracted_index());
                 return;
             }
             fs::remove_all(staging, ec);
@@ -1542,6 +1676,10 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             const fs::path scan_dir = path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".scan");
             fs::remove_all(scan_dir, ec);
             const ms::Extracted x = ms::extract_wrapped_originals(staging, scan_dir, [&]() { return !stopping(cfg); });
+            // WHAT THIS CLIENT WROTE, with the digests it computed while it
+            // wrote them, as it stands right before the scan.
+            fi::Index idx = extracted_index();
+            fi::add_originals(idx, x.originals, staging);
             ms::Result r;
             if (!x.ok) {
                 if (stopping(cfg)) { fs::remove_all(scan_dir, ec); fs::remove_all(staging, ec); return; }
@@ -1550,9 +1688,9 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             } else {
                 r = ms::scan({staging, scan_dir}, extract_since, [&]() { return !stopping(cfg); }, {});
             }
+            if (r.outcome == ms::Outcome::canceled && stopping(cfg)) { fs::remove_all(scan_dir, ec); fs::remove_all(staging, ec); return; }
+            if (r.outcome != ms::Outcome::clean) { scan_failed(cfg, j, r, "install", temp, staging, idx); fs::remove_all(scan_dir, ec); return; }
             fs::remove_all(scan_dir, ec);
-            if (r.outcome == ms::Outcome::canceled && stopping(cfg)) { fs::remove_all(staging, ec); return; }
-            if (r.outcome != ms::Outcome::clean) { scan_failed(cfg, j, r, "install", temp, staging); return; }
             // Recorded with the revision only once it is PLACED (below), so a
             // failed update never leaves the installed one looking unscanned.
             j.scan_outcome = "clean";
@@ -1631,6 +1769,12 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
                 }
             }
             if (!vc::write_record(vc::record_path(cfg.root, j.id), placed)) log(cfg, j.id + " the verified content record could not be written");
+            // THE DIGESTS of the delivered files, for a later detection of an
+            // unchanged installed file (finding_identity.hpp). Evidence of
+            // identity only: nothing is skipped or authorized by it.
+            if (!vd::write_record(vd::record_path(cfg.root, j.id), digests_of_placed(j.revision_id, staging, written, delivered))) {
+                log(cfg, j.id + " the verified digests record could not be written");
+            }
         }
         const Reply done = cfg.service->call("POST", "/v1/assignments/" + j.assignment_id + "/download/" + j.download_id + "/complete",
             "{\"sha256\":\"" + j.package_sha256 + "\",\"bytes\":" + std::to_string(j.package_bytes) + "}", "application/json", {});

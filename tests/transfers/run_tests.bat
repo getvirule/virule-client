@@ -12,7 +12,11 @@ if not exist "%VCVARS%" ( echo vcvars64.bat not found: %VCVARS% & exit /b 1 )
 call "%VCVARS%" >nul 2>&1
 set "HERE=%~dp0"
 set "ROOT=%HERE%..\.."
-set "OUT=%ROOT%\build\tests\transfers"
+rem The harness links the malware scanner, so it is built and run OUTSIDE the
+rem repository, in a disposable folder that ships nothing
+rem (VIRULE\docs\specs\antivirus-reputation.md: the in-tree build of this
+rem harness was the machine-learning detection of 2026-10-30 and 2026-11-05).
+set "OUT=%TEMP%\virule-tests\transfers"
 if not exist "%OUT%" mkdir "%OUT%"
 cl /nologo /std:c++20 /EHsc /W4 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%\src" /I"%ROOT%\third_party" /I"%ROOT%\third_party\virule_core\include" "%HERE%transfers_tests.cpp" "%ROOT%\third_party\miniz\miniz.c" /Fo"%OUT%\\" /Fe"%OUT%\transfers_tests.exe" || exit /b 1
 "%OUT%\transfers_tests.exe" || exit /b 1

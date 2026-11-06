@@ -1740,7 +1740,8 @@ the launcher asks (Play found unverified files) and when a game's last
 process exits (`on_stopped` in `main.cpp`), at the driver's first pass, and
 for a game never scanned (installed before scanning existed) at most every
 30 minutes; never while the game runs. A detection there holds the revision
-here and reports an incident. Size and write time are compared, not hashes:
+here and reports an incident (with what is known of each flagged file:
+"Finding identity" below). Size and write time are compared, not hashes:
 any ordinary change is caught, a person deliberately restoring a file's
 size and time on their own computer is not (reported, not solvable on an
 evaluator-controlled computer).
@@ -1758,6 +1759,90 @@ once (`establish_host_detection`): Defender's own record of acting on the
 job's `source_path` or `build_path` since the job began, else its own scan
 of the game's folder; found, its own incident (`scan_source`, or
 `scan_package` once a build was packaged); not found, nothing is sent.
+
+### Finding identity (0.9.27, owner brief 2026-11-06; `src/client/finding_identity.hpp`, `verified_digests.hpp`)
+
+Every incident this Client keeps states, on EVERY threat entry (each named
+detection and each `removed from disk` entry), what it established of the
+flagged file (`malware_scan.hpp` `Identity`; the service's half:
+`VIRULE_BACKEND/docs/EVALUATIONS.md` "Security incidents and holds", "The
+security review"): `origin` (`package`, `wrapped_original`, `local`,
+`unknown`; `local` is any file VIRULE cannot tie to the package: one it did
+not deliver, or an installed file with no digest record), the package
+`entry`, the wrapped original's `member`, the
+content's `sha256` and `bytes`, and Defender's Threat ID when its event
+states a valid one (supplementary, never the identity). THE DIGESTS ARE
+COMPUTED WHILE THIS CLIENT HOLDS THE BYTES, never after the antivirus took
+the file, and never with an extra read of content it already reads:
+
+- THE EXTRACTOR (`extract_zip`, install and developer verification) hashes
+  each entry in the same pass that writes it (after miniz's CRC check and the
+  file's close), recording the exact entry name and the file's size and write
+  time as written. An entry whose write did not complete is known by name,
+  with no digest.
+- THE WRAPPED ORIGINAL (`extract_wrapped_originals`, in the vendored
+  `malware_scan.hpp`) is hashed block by block as it is copied out of the
+  VRULPK1 archive into the scan folder.
+- THE INDEX (`finding_identity.hpp`) is built right before each scan. A
+  digest stands for a file still exactly as written (size and write time),
+  or GONE: real-time protection took a file VIRULE wrote whole, before or
+  during the scan (the usual quarantine path), so what it evaluated was the
+  bytes VIRULE wrote. A file present but changed loses its digest, and so
+  does one taken while it was being written (no complete digest exists) and
+  a file more than one package entry wrote (a duplicate name, a case variant, or a name Windows maps onto the same file) has no digest (the extractor sees the file already there, and the index
+  keys of VIRULE's own writes drop trailing dots and spaces, as Windows drops
+  them from the names VIRULE opens, so the count holds even when the first
+  file was taken before the alias was written; which entry's bytes were
+  evaluated cannot be established). A REPORTED path is parsed STRICTLY:
+  nothing is trimmed, `;` is part of a name except in Defender's exact
+  container form (`containerfile:_X; file:_X->inner`, the two X the same
+  text), and an inner name is looked up exactly; a path that does not parse,
+  or has a literal trailing dot or space in any component (a file or folder
+  the game created so), never takes an index digest and is never read. In VIRULE's own folders (the
+  extraction, the scan copies) a path the index does not know is never hashed
+  after the fact.
+- THE INCIDENT BODY IS BOUNDED: every field is cut as the service keeps it
+  (`malware_scan.hpp` `bounded`: name 200, path 1024, action 100, entry and
+  member 1024 UTF-8 bytes, control characters as spaces), so 50 entries stay
+  far inside the service's 512 KiB limit and an incident is never refused for
+  its size. Content INSIDE any container, the package zip included
+  (`containerfile:_...->inner`), gets no digest: only the package entry's
+  name is stated (the extracted copy of that entry is flagged with its own
+  digest; a name inside the zip identifies its bytes only if the whole
+  package was read). A bare entry name (a refused launch file) gets no digest
+  (which bytes were refused is not known).
+- INSTALLED CONTENT: at placement the VERIFIED DIGESTS RECORD
+  (`<root>\transfers\<job>\verified_digests.txt`, `verified_digests.hpp`)
+  keeps each delivered file's digest with its size and write time as the
+  scan of the delivered build began, its exact entry, and the revision. At a
+  pre-Play verification (`verify_installed`), a file still exactly as
+  recorded in the walk taken before that scan keeps its recorded digest even
+  once the antivirus takes it (the decision-39 whole rescan after a Resume is
+  the case that matters). `verified.txt` is UNCHANGED: every shipped wrapper
+  reads it (`wrapper_launch_check`), so the digests live in a file only this
+  Client reads; neither authorizes, skips or launches anything. The same
+  boundary as `verified.txt` applies (above: a person or process restoring a
+  file's size and time on the evaluator's own computer is not solvable): a
+  recorded digest is trusted on size and write time.
+- A FILE THIS CLIENT DID NOT WRITE (a save, a log, a file the game wrote, the
+  developer's own folder) is hashed AT DETECTION only while it is still on
+  disk and the scan did not report it gone or changed (`missing`); one the
+  antivirus took is `local` with no digest. Nothing is fabricated.
+- A download-stage finding (the package zip itself) states `package` with
+  no digest: nothing of it was extracted.
+- THE FOLDER CASE RULE (owner decision 2026-11-06, VIRULE
+  `docs/specs/evaluation-security.md` decision 62): index keys fold case, so
+  a digest (from the index, or hashed now) is given only when every folder
+  from the file's parent up to the volume's root is established as
+  case-insensitive (`detail::CaseCheck`: Windows' per-folder flag, read
+  only; FAT, FAT32 and exFAT never case-sensitive; anything that cannot be
+  read is not established). A case-sensitive or unestablished folder gives
+  no trusted fingerprint and the review reopens; nothing on the file system
+  is changed.
+
+Nothing of any file leaves this computer: the digest and the context, in
+the incident, to the VIRULE service only. An older Client's incidents carry
+no identity and are accepted as they were.
 
 ## Developer verification and the upload gate (owner brief 2026-11-02, "Client Security Authority Phase 2"; ON STAGING since 2026-11-02 in Client 0.9.23; `src/client/transfers.hpp`, `upload_verification.hpp`, `client_seal.hpp`)
 
