@@ -104,10 +104,13 @@ inline bool admin_route_ok(const std::string& method, const std::string& path) {
     }
     if (n == 1) return at(0) == "preferences" || at(0) == "support";
     // The evaluator's explicit Resume of an assignment ready to resume (owner
-    // brief 2026-11-05): relayed only after this computer's own check
-    // (client/account.hpp `api_call`, is_resume).
+    // brief 2026-11-05): relayed, then this computer verifies the cleared
+    // build again before anything of it runs (client/account.hpp `api_call`,
+    // on_resumed; owner decision 2026-11-05: its CURRENT verification decides).
     if (n == 2) return (at(0) == "offers" && at(1) == "open") || (is_id(at(0)) && at(1) == "resume");
     if (n == 3) {
+        // The evaluator's OK of the one-time security end notice (2026-11-05).
+        if (is_id(at(0)) && at(1) == "security" && at(2) == "seen") return true;
         return at(0) == "offers" && is_id(at(1)) &&
                (at(2) == "close" || at(2) == "accept" || at(2) == "reject" || at(2) == "decline");
     }
@@ -185,10 +188,11 @@ inline std::string not_ready(const std::string& reason_json, const std::string& 
            ",\"message\":" + message_json + "}";
 }
 
-/** The relay's answer when THIS COMPUTER refuses to resume (its own scan
- *  refused the build a person cleared; client/account.hpp): `status` is the
- *  service's answer to the Client's own refusal report (0 when it could not
- *  be sent), `message` fixed copy, never caller input. */
+/** The relay's answer when THIS COMPUTER refused to resume (Client 0.9.24
+ *  only, its permanent per-revision refusal; since 0.9.25 the Client never
+ *  answers it: the Resume is relayed and the cleared build verified again,
+ *  owner decision 2026-11-05). Kept as the documented shape a VIRULE Desktop
+ *  still understands. */
 inline std::string refused_here(unsigned long status, const std::string& message_json) {
     return "{\"type\":\"account_api\",\"status\":0,\"error\":\"refused_here\",\"reported\":" +
            std::string(status == 200 ? "true" : "false") + ",\"message\":" + message_json + "}";

@@ -400,6 +400,140 @@ int main(int argc, char** argv) {
         fs::remove_all(r4, e4);
     }
 
+    // ---- A SECURITY REVIEW BEGINS WHILE THE GAME RUNS (owner decision 2026-11-05)
+    {
+        const fs::path r6 = sandbox();
+        const std::string P = hex32(r), Q = hex32(r);
+        install(r6, P, "installed", EV, "install", "2026-10-25T12:00:00Z");
+        install(r6, Q, "installed", EV, "install", "2026-10-25T12:00:00Z");
+        std::vector<std::string> stopped;
+        bool p_running = true;
+        rr::Config c = cfg;
+        c.root = r6;
+        c.running = [&](const std::string& id) { return id == P && p_running; };
+        c.security_stop = [&](const std::string& id) { stopped.push_back(id); };
+        c.now = [] { return static_cast<std::time_t>(1793016000); };
+        answer = 200;
+        answer_body = "{\"ok\":true,\"state\":\"active\",\"security_hold\":false,\"deadline_utc\":\"2026-10-31T12:00:00Z\"}";
+        {
+            rr::Reporter rep(c);
+            rep.cycle();
+            check("no hold: a running game is left alone", stopped.empty());
+            check("while a game runs, the report comes every 5 minutes (not 30)", rep.next_wait_ms() == rr::kRunningIntervalMs, std::to_string(rep.next_wait_ms()));
+        }
+        answer_body = "{\"ok\":true,\"state\":\"active\",\"security_hold\":true,\"security_review\":\"review\",\"deadline_utc\":\"2026-10-31T12:00:00Z\"}";
+        { rr::Reporter rep(c); rep.cycle(); }
+        check("THE HOLD ARRIVES while the game runs: ITS game is closed (security_stop), the one not running is not",
+              stopped.size() == 1 && stopped[0] == P);
+        check("...and the hold marker refuses the next launch", vclient::security_marks::has(r6, P, vclient::security_marks::kHold));
+        check("...nothing of the installation is removed by the stop (the job stays installed)", [&] {
+            for (const auto& t : rr::targets(r6)) if (t.assignment_id == P) return true;
+            return false; }());
+        stopped.clear();
+        p_running = false;
+        {
+            rr::Reporter rep(c);
+            rep.cycle();
+            check("closed: no further stop, and the report goes back to every 30 minutes", stopped.empty() && rep.next_wait_ms() == rr::kIntervalMs,
+                  std::to_string(rep.next_wait_ms()));
+        }
+        std::error_code e6;
+        fs::remove_all(r6, e6);
+    }
+
+    // ---- THE LAUNCHER CLOSES THE RUNNING GAME (client/launcher.hpp
+    // stop_for_security): a real process in the game's folder, graceful first,
+    // then the guarded terminate; nothing of the folder is deleted.
+    {
+        const fs::path r7 = sandbox();
+        auto game = [&](const std::string& id, const wchar_t* system_exe, const std::wstring& args, PROCESS_INFORMATION& pi) {
+            const fs::path dir = r7 / L"installs" / fs::path(id);
+            fs::create_directories(dir);
+            std::error_code ec;
+            wchar_t sys[MAX_PATH];
+            GetSystemDirectoryW(sys, MAX_PATH);
+            fs::copy_file(fs::path(sys) / system_exe, dir / L"Game.exe", fs::copy_options::overwrite_existing, ec);
+            std::ofstream(dir / L"save.dat", std::ios::binary) << "a saved game";
+            ed::Job j;
+            j.id = hex32(r); j.kind = "install"; j.state = "installed"; j.assignment_id = id; j.account_email = "ev@example.test";
+            const auto u = dir.u8string();
+            j.install_dir = std::string(u.begin(), u.end());
+            j.launch_exe = "Game.exe";
+            (void)ed::write_job(r7, j);
+            std::wstring cmd = L"\"" + (dir / L"Game.exe").wstring() + L"\" " + args;
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_SHOWMINNOACTIVE;
+            const bool ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi) != 0;
+            return ok ? dir : fs::path();
+        };
+        vclient::launcher::Config lc;
+        lc.root = r7;
+        vclient::launcher::Launcher la(lc);
+        // A windowed game: asked to close, it closes itself (exit code 0).
+        const std::string G = hex32(r);
+        PROCESS_INFORMATION pg{};
+        const fs::path gdir = game(G, L"notepad.exe", L"", pg);
+        if (gdir.empty()) {
+            check("(a windowed test process could not be started here)", true);
+        } else {
+            (void)WaitForInputIdle(pg.hProcess, 5000);
+            Sleep(500);
+            const bool closed = la.stop_for_security(G);
+            DWORD code = 99;
+            const bool exited = WaitForSingleObject(pg.hProcess, 2000) == WAIT_OBJECT_0 && GetExitCodeProcess(pg.hProcess, &code);
+            check("A WINDOWED GAME: asked to close, it closed itself (graceful, exit 0), nothing of it runs", closed && exited && code == 0, std::to_string(code));
+            check("...its folder, its executable and its saved game remain", fs::exists(gdir / L"Game.exe") && fs::exists(gdir / L"save.dat"));
+            CloseHandle(pg.hThread); CloseHandle(pg.hProcess);
+        }
+        // A game that ignores the close (no window): terminated after the grace.
+        const std::string H = hex32(r);
+        PROCESS_INFORMATION ph{};
+        const fs::path hdir = game(H, L"PING.EXE", L"-n 120 127.0.0.1", ph);
+        check("(a windowless test process started)", !hdir.empty());
+        if (!hdir.empty()) {
+            Sleep(500);
+            const ULONGLONG t0 = GetTickCount64();
+            const bool closed = la.stop_for_security(H);
+            DWORD code = 99;
+            const bool exited = WaitForSingleObject(ph.hProcess, 2000) == WAIT_OBJECT_0 && GetExitCodeProcess(ph.hProcess, &code);
+            check("A GAME THAT DOES NOT CLOSE: terminated by the guarded ownership after the grace period",
+                  closed && exited && code == 1 && GetTickCount64() - t0 >= vclient::launcher::kSecurityCloseGraceMs - 500, std::to_string(code));
+            check("...its folder and its saved game remain", fs::exists(hdir / L"Game.exe") && fs::exists(hdir / L"save.dat"));
+            CloseHandle(ph.hThread); CloseHandle(ph.hProcess);
+        }
+        check("an assignment with nothing running: stop answers at once, nothing closed", la.stop_for_security(hex32(r)));
+        // A RESUMED assignment whose re-verification is still pending: never Play on the old scan.
+        {
+            const std::string V = hex32(r), REV = hex32(r);
+            ed::Job j;
+            j.id = hex32(r); j.kind = "install"; j.state = "installed"; j.assignment_id = V; j.account_email = "ev@example.test";
+            j.revision_id = REV; j.installed_revision_id = REV; j.scan_revision_id = REV; j.scan_outcome = "clean";
+            const fs::path vdir = r7 / L"installs" / fs::path(V);
+            fs::create_directories(vdir);
+            std::ofstream(vdir / L"Game.exe", std::ios::binary) << "not a program";
+            const auto u = vdir.u8string();
+            j.install_dir = std::string(u.begin(), u.end()); j.launch_exe = "Game.exe";
+            (void)ed::write_job(r7, j);
+            // Its scan record vouches for the folder as it is (verified clean earlier).
+            namespace vc = virule::core::verified_content;
+            (void)vc::write_record(vc::record_path(r7, j.id), vc::after_clean_scan(vdir, nullptr, REV, vc::unverified(vdir, nullptr, REV).now, {}));
+            check("(the old scan vouches for the folder)", vc::verified_now(r7, j.id, vdir, REV));
+            fs::create_directories(vclient::security_marks::reverify_dir(r7));
+            std::ofstream(vclient::security_marks::reverify_dir(r7) / fs::path(V), std::ios::binary) << REV << "\n";
+            const std::string pending = la.launch("{\"assignment_id\":\"" + V + "\"}");
+            check("RESUMED, re-verification pending: the launch is refused as Verifying (never on the old scan)",
+                  pending.find("\"code\":\"not_scanned\"") != std::string::npos, pending);
+            std::error_code ec;
+            fs::remove(vclient::security_marks::reverify_dir(r7) / fs::path(V), ec);
+            const std::string after = la.launch("{\"assignment_id\":\"" + V + "\"}");
+            check("...without the pending request the same job is not refused as Verifying (the old scan vouches for it)", after.find("\"code\":\"not_scanned\"") == std::string::npos, after);
+        }
+        std::error_code e7;
+        fs::remove_all(r7, e7);
+    }
+
     // ---- THE SECURITY END'S CLEANUP (client/assignment_cleanup.hpp "security end")
     {
         const fs::path r5 = sandbox();

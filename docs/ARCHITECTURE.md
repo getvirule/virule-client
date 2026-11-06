@@ -1959,7 +1959,9 @@ signed out or another account, nothing is sent).
 
 WHEN: at start (after the launcher's first scan, so a game already running
 reads running), at every change the launcher notes (its change hook wakes
-the thread; a burst settles for two seconds), and every 30 minutes. The
+the thread; a burst settles for two seconds), every 30 minutes, and every
+5 minutes while one of the games runs (0.9.25: an answer saying
+`security_hold` for a running game closes it, below). The
 state is SAMPLED as each report is signed, never queued: a failed post is
 simply a new observation at the next wake or interval, so a stale sample
 can never arrive after a launch.
@@ -1993,10 +1995,10 @@ service code in process: accepted for a bound machine and kept as observed,
 refused for an unbound machine, a tampered state, another evaluator; an
 older observation never replacing a newer one).
 
-## The security review (0.9.24, owner brief 2026-11-05; `src/client/runtime_report.hpp`, `assignment_cleanup.hpp` "security end", `evaluation_recovery.hpp`, `client/account.hpp` resume gate)
+## The security review (0.9.24 and 0.9.25, owner decisions 2026-11-05; `src/client/runtime_report.hpp`, `launcher.hpp` `stop_for_security`, `assignment_cleanup.hpp` "security end", `evaluation_recovery.hpp`, `client/account.hpp` `on_resumed`, `transfers.hpp` `request_reverification`)
 
 Why: a security alert pauses execution, not the evaluator's work
-(`VIRULE/docs/specs/evaluation-security.md` decisions 24 to 38;
+(`VIRULE/docs/specs/evaluation-security.md` decisions 24 to 49;
 `VIRULE_BACKEND/docs/EVALUATIONS.md` "The security review"). What this
 Client does:
 
@@ -2008,41 +2010,81 @@ Client does:
   The wrapper's crash RECOVERY, which runs the wrapper from the game folder,
   waits (`evaluation_recovery.hpp` `Verdict::Held`): held content is never
   executed by this Client, also when this computer's own scan refused it or
-  the assignment ended for security. A session already running when the
-  hold lands is not closed (the next launch is refused).
+  the assignment ended for security.
+- A RUNNING GAME IS CLOSED WHEN ITS REVIEW BECOMES KNOWN (0.9.25, owner
+  decision 2026-11-05): a runtime answer saying `security_hold` while the
+  game runs calls `cfg.security_stop`, `launcher.hpp` `stop_for_security`:
+  every top-level window of the assignment's processes (the ones this Client
+  started or found in the game's own folder, `terminate`'s ownership) is
+  sent WM_CLOSE, the user's own close, so the game and the wrapper end the
+  session the ordinary way and the wrapper writes its evidence; whatever is
+  left after `kSecurityCloseGraceMs` (10 s) is terminated. Nothing is
+  deleted: the folder, the saves, the draft and the evidence stay; a session
+  cut short keeps its checkpoint for the recovery (deferred while held, as
+  above). Reports come every 5 minutes while a game runs, so a running game
+  learns of a review within about 5 minutes; Play is refused at once.
 - THE OFFLINE CUT FOLLOWS THE STATED DEADLINE: every answer's `deadline_utc`
   is kept (`evaluator\assignments\<id>\deadline_utc`); offline, the cut is
   that deadline + 24 hours + the 15-minute margin (a deadline restored on a
   Resume moves it); with no stated deadline, acceptance + 7 days as before
   and never for a protected assignment; never while the hold marker says
   nothing may be launched (a frozen deadline never cuts).
-- RESUME GOES THROUGH THIS CLIENT'S OWN CHECK (`client/account.hpp`
-  `resume_gate`, set by `main.cpp`): the relay admits `POST
-  /v1/assignments/<id>/resume` for the Admin, but first looks whether THIS
-  computer's scan refused the build the Resume names (`revision_id`; a
-  detection is final per revision here, `transfers.hpp`
-  `revision_held_here`). If it did, the Resume is NEVER relayed: the Client
-  reports the refusal itself, under its machine proof (`POST
-  /v1/assignments/<id>/security/refusal`), the service releases the
-  assignment without fault, and the Admin is answered `{"status":0,
-  "error":"refused_here","reported","message"}` with the sentence (WORKING
-  WORDING). No bypass exists: a central clearance never overrides this
-  computer's antivirus.
+- RESUME DEPENDS ON THIS COMPUTER'S CURRENT VERIFICATION (0.9.25, owner
+  decision 2026-11-05; until 0.9.24 an earlier refusal here refused the
+  Resume for good, `resume_gate`, removed): the relay admits `POST
+  /v1/assignments/<id>/resume` for the Admin and relays it; on the
+  service's 200, `client/account.hpp` `on_resumed` (set by `main.cpp`) asks
+  the transfer driver to verify the cleared revision again
+  (`transfers.hpp` `request_reverification`), DURABLY (a file,
+  `evaluator\reverify\<assignment>`, removed only once applied, so a Client
+  that exits in between applies it at its next start), on EVERY computer:
+  the installed copy's scan record is dropped and its whole scan asked at
+  once (Play refuses until it is clean; the launcher already refuses as
+  Verifying from the moment the request is written,
+  `security_marks::reverify_pending`, so nothing runs on the old scan in
+  between), and this computer's earlier refusal
+  of exactly that revision is set aside (`security_held` cleared, a failed
+  install queued again), so a copy the antivirus took is downloaded again
+  and scanned before it is placed. Nothing of it runs before a clean result. A current refusal is an
+  ordinary incident: the service releases the assignment without fault for
+  the same adjudicated finding, or opens a new review for a new one.
+  Another revision's or assignment's refusal is untouched. No bypass
+  exists: a central clearance never overrides this computer's antivirus.
+  The relay also admits `POST /v1/assignments/<id>/security/seen`, the
+  evaluator's OK of the one-time security end notice.
 - THE SECURITY END (the runtime answer's `state` `released` or `terminated`,
   never `expired`): its own mark, `security_end.json` (never expired.json,
   never removed), then the cleanup, re-entrant every cycle: close the game,
   recover an interrupted session ONLY for a released assignment whose
   content is not held, remove the game folder with the expiry's guard (only
   the job's folder directly inside the installs location, named by the
-  game's id) and the temp file; KEEP the unsubmitted draft (PENDING OWNER
-  DECISION for a terminated one), the ticket, the ledger, the outbox and the
+  game's id) and the temp file; KEEP the unsubmitted draft (owner decision
+  2026-11-05 for a terminated one too: kept while any hold applies, never
+  delivered), the ticket, the ledger, the outbox and the
   receipts. The launcher refuses it (`ended`, `This evaluation has ended.`,
   WORKING WORDING) and the transfer driver installs nothing for it.
 - Older Clients: 0.9.23 would cut a resumed assignment offline at acceptance
   + 7 days only where `security_protected` is false (the service keeps it
   true for any assignment ever reviewed), would ignore a security end, and
-  could not relay a Resume; VIRULE Desktop requires 0.9.24
-  (`client_requirement.hpp`).
+  could not relay a Resume; 0.9.24 refuses a Resume for good after an
+  earlier detection here, cannot relay the notice's OK and leaves a running
+  game running; VIRULE Desktop requires 0.9.25 (`client_requirement.hpp`).
+- Tests: `tests/account_relay` (the Resume and `security/seen` routes),
+  `tests/transfers` (the reverification, unit), `tests/runtime_report` (the
+  stop on a hold, the 5-minute cadence, and `stop_for_security` against real
+  Windows processes: a windowed one closes itself, one that ignores the close
+  is terminated, the folder and a saved game stay). PRE-PRODUCTION TEST GAP:
+  the end-to-end stage of `tests/transfers` (`tools/transfer_test.mjs`
+  starting the unsigned `transfers_tests.exe`) is refused intermittently by
+  Microsoft Defender, `Trojan:Win32/Bearfoos.A!ml` (ThreatID 2147731250, a
+  machine-learning verdict on the unsigned test program; detections
+  2026-10-30 13:41, 2026-11-05 15:52, 18:04 and 18:05, the program
+  quarantined). The same stage passed 43 of 43 at 2026-11-05 about 17:40 with
+  a static-CRT build that Defender quarantined minutes later, so neither
+  build is a fix. No exclusion, no disabled protection, nothing whitelisted
+  (security posture outranks a green test); the unit stage runs before the
+  quarantine and passes. Resolving it needs a signed or otherwise reputable
+  test program, outside this change.
 
 ## Expired assignment cleanup (0.9.21, 2026-10-28; `src/client/assignment_cleanup.hpp`)
 

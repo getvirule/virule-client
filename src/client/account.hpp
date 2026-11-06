@@ -1260,18 +1260,16 @@ inline bool machine_proof_context(std::string& host_out, std::string& device_out
     return true;
 }
 
-// THE RESUME GATE (owner brief 2026-11-05 sections 8 and 19; VIRULE_BACKEND
-// security_review.ts): before the evaluator's Resume is relayed, THIS
-// COMPUTER decides whether it can continue the assignment at all. Given the
-// assignment and the build the Admin names (`revision_id`, the game's
-// current hosted build the service will require), the gate answers "" to
-// relay the Resume, or the relay's whole answer when this computer's own
-// scan already refused that exact build (a central clearance never overrides
-// local enforcement): the Client then reports the refusal itself, under its
-// machine proof, and the service releases the assignment without fault.
-// Set once by main.cpp (it owns the transfer records and the proven calls).
-inline std::function<std::string(const std::string& assignment_id, const std::string& revision_id)>& resume_gate() {
-    static std::function<std::string(const std::string&, const std::string&)> g;
+// RESUMED (owner decision 2026-11-05; VIRULE_BACKEND security_review.ts):
+// after the service accepted the evaluator's Resume (200) of an assignment a
+// person cleared, THIS COMPUTER's current verification of the exact cleared
+// build (`revision_id`, the build the service held the Resume to) decides:
+// main.cpp sets aside this computer's earlier refusal of that revision and
+// verifies it again from the start before anything of it runs. Until 0.9.25
+// an earlier refusal here refused the Resume for good (no longer: no
+// historical veto). Set once by main.cpp (it owns the transfer records).
+inline std::function<void(const std::string& assignment_id, const std::string& revision_id)>& on_resumed() {
+    static std::function<void(const std::string&, const std::string&)> g;
     return g;
 }
 
@@ -1305,18 +1303,11 @@ inline std::string api_call(const std::string& message) {
                                     virule::core::malware_scan::json_quote(ready.message));
         }
     }
-    // THE RESUME: this computer's own check first (resume_gate above), for
-    // whoever asked; the build it checks is the one the service will hold the
-    // Resume to (it refuses any other as stale).
-    {
-        const std::string resuming = relay::resume_assignment(req);
-        if (!resuming.empty() && resume_gate()) {
-            std::string revision;
-            (void)json_scan::find_string_in(body, 0, body.size(), "revision_id", revision);
-            const std::string refusal = resume_gate()(resuming, revision);
-            if (!refusal.empty()) return refusal;
-        }
-    }
+    // THE RESUME (on_resumed above): the build it names is the one the
+    // service holds the Resume to (it refuses any other as stale).
+    const std::string resuming = relay::resume_assignment(req);
+    std::string resuming_revision;
+    if (!resuming.empty()) (void)json_scan::find_string_in(body, 0, body.size(), "revision_id", resuming_revision);
     store::DeviceKey key;
     if (!store::device_key(key)) return relay::failure("signed_out");
     const wchar_t* wm = method == "GET" ? L"GET" : L"POST";
@@ -1338,6 +1329,9 @@ inline std::string api_call(const std::string& message) {
         st().offline = true;
         return relay::failure("offline");
     }
+    // RESUMED: this computer verifies the cleared build again now, before
+    // anything of it can run (whoever asked; the hook never relaxes a check).
+    if (!resuming.empty() && r.status == 200 && on_resumed()) on_resumed()(resuming, resuming_revision);
     const std::string out = relay::answer(r.status, r.body);
     return out.size() > relay::kMaxAnswerBytes ? relay::failure("too_large") : out;
 }

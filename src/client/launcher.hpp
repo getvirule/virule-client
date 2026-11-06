@@ -114,6 +114,9 @@ inline constexpr const char* kOffline = "Couldn't reach our servers right now.";
 
 // How often processes this Client did not start are looked for.
 inline constexpr DWORD kDiscoverMs = 5000;
+// A security review began while the game runs (stop_for_security): how long
+// its windows have to close themselves before what is left is terminated.
+inline constexpr DWORD kSecurityCloseGraceMs = 10000;
 
 struct Config {
     fs::path root;                                            // %LOCALAPPDATA%\VIRULE (or a sandbox)
@@ -167,6 +170,20 @@ inline std::wstring image_of(HANDLE h) {
 }
 
 inline bool alive(HANDLE h) { return h && WaitForSingleObject(h, 0) == WAIT_TIMEOUT; }
+
+/** WM_CLOSE to every top-level window owned by one of `pids` (the user's own
+ *  close; posted, never waited on). Returns how many were asked. */
+inline int ask_to_close(const std::set<DWORD>& pids) {
+    struct Ctx { const std::set<DWORD>* pids; int asked; } ctx{ &pids, 0 };
+    EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid && c->pids->count(pid) && GetWindow(w, GW_OWNER) == nullptr && PostMessageW(w, WM_CLOSE, 0, 0)) ++c->asked;
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.asked;
+}
 
 } // namespace detail
 
@@ -293,6 +310,50 @@ public:
         return !busy_locked(assignment_id);
     }
 
+    // A SECURITY REVIEW BEGAN WHILE THE GAME RUNS (owner decision 2026-11-05;
+    // client/runtime_report.hpp, the service's `security_hold`). Suspicious
+    // code must not go on executing under VIRULE once the hold is known.
+    // Launches are already refused (the hold marker, the service, the
+    // wrapper's own check). Here, in order:
+    //   1. GRACEFUL: every top-level window of the assignment's processes
+    //      (the ones this Client started or found in the game's own folder:
+    //      the same ownership as `terminate`) is asked to close (WM_CLOSE,
+    //      the user's own close), so the game and the wrapper end their
+    //      session the ordinary way and the wrapper writes its evidence;
+    //   2. after kSecurityCloseGraceMs, whatever is left of them is
+    //      terminated (`terminate`: the guarded ownership, nothing else).
+    // Nothing is deleted: the installed files, the game's saves, the report
+    // draft and the evidence stay (a session cut short keeps its checkpoint;
+    // evaluation_recovery.hpp finishes it later, never by running held
+    // content). True when nothing of the assignment is left running.
+    bool stop_for_security(const std::string& assignment_id) {
+        if (!ev::is_hex32(assignment_id)) return true;
+        std::set<DWORD> pids;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            adopt_locked();
+            for (const auto& t : tracked_) if (t.assignment == assignment_id && detail::alive(t.process)) pids.insert(t.pid);
+        }
+        if (!pids.empty()) {
+            const int asked = detail::ask_to_close(pids);
+            say("launcher: security review of " + assignment_id + ": asked " + std::to_string(asked) + " window(s) of " +
+                std::to_string(pids.size()) + " process(es) to close");
+            const ULONGLONG until = GetTickCount64() + kSecurityCloseGraceMs;
+            while (GetTickCount64() < until) {
+                if (cfg_.stop_event && WaitForSingleObject(cfg_.stop_event, 250) == WAIT_OBJECT_0) break;
+                if (!cfg_.stop_event) Sleep(250);
+                reap();
+                std::lock_guard<std::mutex> lock(m_);
+                bool left = false;
+                for (const auto& t : tracked_) if (t.assignment == assignment_id && detail::alive(t.process)) left = true;
+                if (!left) break;
+            }
+        }
+        const bool closed = terminate(assignment_id);
+        say(std::string("launcher: security review of ") + assignment_id + (closed ? ": nothing of it runs" : ": a process could not be closed yet"));
+        return closed;
+    }
+
     // The bridge's launcher_state: every assignment this computer has an
     // install job for, and whether its game is running.
     std::string state_json() {
@@ -382,7 +443,10 @@ private:
         if (job.security_held || security_marks::has(cfg_.root, assignment, security_marks::kHold)) {
             code = "security_hold"; why = kSecurityHold; return false;
         }
-        if (job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) {
+        // Resumed after a clearance and not verified again yet (the request is
+        // pending; transfers.hpp request_reverification): Verifying, never Play.
+        if (security_marks::reverify_pending(cfg_.root, assignment) ||
+            job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) {
             not_verified(job, code, why);
             return false;
         }
@@ -442,7 +506,8 @@ private:
         }
         ed::Job job;
         if (!ed::install_for_assignment(cfg_.root, assignment, job) || job.state != "installed") return true;   // launchable() says why
-        if (job.security_held || job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) return true;
+        if (job.security_held || security_marks::reverify_pending(cfg_.root, assignment) ||
+            job.scan_revision_id.empty() || job.scan_revision_id != ed::installed_revision(job)) return true;
         if (!vc::verified_now(cfg_.root, job.id, path_of(job.install_dir), ed::installed_revision(job))) {
             if (cfg_.request_verification) cfg_.request_verification(assignment);
             say("launch: the installed content of " + assignment + " changed since its last scan; verifying first");

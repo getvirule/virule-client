@@ -1192,6 +1192,62 @@ static void drive_once(tr::DriverConfig& cfg) {
     (void)tr::run_pass(cfg, last);
 }
 
+// ---- 2026-11-05 (owner decision): RESUMED AFTER A CLEARANCE, the cleared
+// revision is verified again here; an earlier refusal is no permanent veto.
+static void test_reverify_after_resume() {
+    SECTION("resumed after a clearance: the cleared revision is verified again here (durable request; no historical veto)");
+    const fs::path root = temp_root("reverify");
+    UploadService svc;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string&) {};
+    const std::string A = ed::random_hex32(), B = ed::random_hex32(), C2 = ed::random_hex32(), R = ed::random_hex32(), R2 = ed::random_hex32();
+    auto held = [&](const std::string& assignment, const std::string& revision) {
+        ed::Job j;
+        j.id = ed::random_hex32(); j.kind = "install"; j.state = "failed"; j.account_email = "dev@example.com";
+        j.assignment_id = assignment; j.revision_id = revision; j.security_held = true; j.scan_outcome = "detected";
+        j.scan_revision_id = revision; j.error = tr::detail::kInstallThreat; j.created_utc = tr::utc_now();
+        ed::write_job(root, j);
+        return j;
+    };
+    const ed::Job a = held(A, R), other_rev = held(A, R2), other_asg = held(B, R);
+    // A computer that NEVER refused: an installed, verified copy of the cleared revision.
+    ed::Job clean;
+    clean.id = ed::random_hex32(); clean.kind = "install"; clean.state = "installed"; clean.account_email = "dev@example.com";
+    clean.assignment_id = C2; clean.revision_id = R; clean.installed_revision_id = R; clean.scan_revision_id = R; clean.scan_outcome = "clean";
+    clean.install_dir = utf8(root / "absent-folder"); clean.created_utc = tr::utc_now();
+    ed::write_job(root, clean);
+    for (const auto& id : { a.id, clean.id }) {
+        fs::create_directories(tr::vc::record_path(root, id).parent_path());
+        std::ofstream(tr::vc::record_path(root, id)) << "{}";
+    }
+    CHECK(tr::detail::revision_held_here(root, A, R));
+    drive_once(cfg);
+    ed::Job got;
+    CHECK(ed::read_job(root, a.id, got) && got.security_held);   // nothing asked: nothing changes
+    CHECK(tr::request_reverification(root, A, R) && tr::request_reverification(root, C2, R));
+    CHECK(fs::exists(tr::reverify_dir(root) / A));                // DURABLE: on disk before the driver ran
+    // (a Client that exits here keeps the request: nothing in memory carries it)
+    drive_once(cfg);
+    CHECK(ed::read_job(root, a.id, got) && !got.security_held && got.scan_revision_id.empty() && got.scan_outcome != "detected");
+    CHECK(!fs::exists(tr::vc::record_path(root, a.id)));          // verified again from the start
+    CHECK(!tr::detail::revision_held_here(root, A, R));
+    CHECK(ed::read_job(root, clean.id, got) && got.state == "installed" && got.scan_revision_id.empty() &&
+          !fs::exists(tr::vc::record_path(root, clean.id)));      // EVERY computer: the installed copy is verified whole again
+    CHECK(ed::read_job(root, other_rev.id, got) && got.security_held);   // another revision's refusal stays
+    CHECK(ed::read_job(root, other_asg.id, got) && got.security_held);   // another assignment's stays
+    CHECK(!fs::exists(tr::reverify_dir(root) / A) && !fs::exists(tr::reverify_dir(root) / C2));   // applied, then removed
+    CHECK(!tr::request_reverification(root, "short", R));         // malformed: refused
+    // The pure rule.
+    ed::Job j = held(A, R);
+    CHECK(tr::detail::set_aside_refusal(j, A, R) && j.state == "queued" && j.attempts == 0 && !j.security_held);
+    ed::Job k = held(A, R);
+    CHECK(!tr::detail::set_aside_refusal(k, A, R2) && k.security_held);
+    k.kind = "upload";
+    CHECK(!tr::detail::set_aside_refusal(k, A, R));
+}
+
 static void test_upload_gate() {
     SECTION("the upload gate: no Client verification, no upload");
     namespace uv = vclient::upload_verification;
@@ -1492,6 +1548,7 @@ int main(int argc, char** argv) {
     test_recovery_rules();
     test_assignment_open();
     test_upload_gate();
+    test_reverify_after_resume();
     test_upload_gate_real_defender();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

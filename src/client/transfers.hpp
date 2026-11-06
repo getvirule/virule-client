@@ -84,12 +84,14 @@
 #include <ctime>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "client/security_marks.hpp"
 #include "client/assignment_cleanup.hpp"
 #include "client/upload_verification.hpp"
 #include "shared/json_scan.hpp"
@@ -283,6 +285,69 @@ inline bool is_paused(const std::string& assignment_id) {
     return controls().paused.count(assignment_id) > 0;
 }
 
+// RESUMED AFTER A SECURITY CLEARANCE (owner decision 2026-11-05: Resume
+// depends on this computer's CURRENT verification of the exact cleared
+// revision; an earlier refusal here is no permanent veto). The service
+// restored the assignment; on EVERY computer the cleared revision is verified
+// again from the start: an installed copy is scanned WHOLE before any Play
+// (its scan record is dropped and the scan is asked at once), and a copy
+// this computer refused (`security_held` for that revision) is set aside, so
+// a copy the antivirus took is downloaded again and scanned before it is
+// placed. Nothing runs before a clean result. A current refusal is an
+// incident like any other: the service then releases this evaluator without
+// fault (the same adjudicated finding) or opens a new review (a new
+// finding). Another revision's refusal is untouched.
+//
+// DURABLE: the request is a file (`reverify\<assignment>`, the revision),
+// written before this returns and removed only after the driver applied it,
+// so a Client that exits between the service's answer and the next pass
+// applies it at its next start (else the resumed assignment would stay
+// refused here with no Resume left to press). The caller wakes the driver.
+inline fs::path reverify_dir(const fs::path& root) { return vclient::security_marks::reverify_dir(root); }
+inline bool request_reverification(const fs::path& root, const std::string& assignment_id, const std::string& revision_id) {
+    if (!ev::is_hex32(assignment_id) || !ev::is_hex32(revision_id)) return false;
+    std::error_code ec;
+    fs::create_directories(reverify_dir(root), ec);
+    return ev::write_file_atomic(reverify_dir(root) / fs::path(assignment_id), revision_id + "\n");
+}
+
+namespace detail {
+/** One job, for request_reverification: true when it changed (to be saved).
+ *  An install job of that assignment for that revision: its scan record is
+ *  dropped (verified whole again); this computer's refusal of exactly that
+ *  revision is set aside (a failed install queued again). */
+inline bool set_aside_refusal(ed::Job& j, const std::string& assignment_id, const std::string& revision_id) {
+    if (!ed::is_install(j) || j.assignment_id != assignment_id) return false;
+    const bool held = j.security_held && j.revision_id == revision_id;
+    const bool installed = ed::installed_revision(j) == revision_id || j.revision_id == revision_id;
+    if (!held && !installed) return false;
+    if (j.security_held && !held) return false;   // another revision's refusal stays
+    j.security_held = false;
+    j.scan_revision_id.clear();
+    if (j.scan_outcome == "detected" || j.scan_outcome == "removed") j.scan_outcome.clear();
+    if (held) {
+        j.error.clear();
+        if (j.state == "failed") { j.state = "queued"; j.attempts = 0; j.next_attempt_utc = 0; j.bytes_done = 0; }
+    }
+    return true;
+}
+
+/** The pending durable requests: assignment -> revision. */
+inline std::map<std::string, std::string> pending_reverifications(const fs::path& root) {
+    std::map<std::string, std::string> out;
+    std::error_code ec;
+    for (fs::directory_iterator it(reverify_dir(root), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (!ev::is_hex32(name)) continue;
+        std::string rev;
+        { std::ifstream f(it->path(), std::ios::binary); std::getline(f, rev); }
+        while (!rev.empty() && (rev.back() == '\r' || rev.back() == ' ')) rev.pop_back();
+        if (ev::is_hex32(rev)) out[name] = rev;
+    }
+    return out;
+}
+} // namespace detail
+
 struct DriverConfig;
 // The driver's configuration, for the one control that needs the service
 // ("verify", below); set by main.cpp when the driver starts. Null = no
@@ -449,7 +514,8 @@ inline void keep_incident(const DriverConfig& cfg, const ed::Job& j, const std::
 // the path) is a security outcome, never a retry. A file that merely went
 // missing or changed with NO such evidence is not one: a download is retried
 // (defer) and a scan reads `incomplete`. A detection holds that revision on this computer
-// for good (`security_held`), fails the job, tells the service the download
+// (`security_held`; set aside only by a Resume after a person cleared that
+// exact revision, request_reverification), fails the job, tells the service the download
 // was refused, and reports an INCIDENT the service records (which holds the
 // game for every evaluator). Nothing here ever runs the game's files.
 
@@ -500,7 +566,9 @@ inline ms::Result removal_of(const std::vector<ms::Threat>& seen, const std::str
 }
 
 /** Another job of this assignment held this revision (this computer's own
- *  detection): it is never downloaded or installed here again. */
+ *  detection): it is not downloaded or installed here again, until the
+ *  evaluator resumes the assignment after a person cleared exactly that
+ *  revision (request_reverification: verified again from the start). */
 inline bool revision_held_here(const fs::path& root, const std::string& assignment_id, const std::string& revision_id) {
     for (const ed::Job& o : ed::list_jobs(root)) {
         if (ed::is_install(o) && o.assignment_id == assignment_id && o.security_held && o.revision_id == revision_id) return true;
@@ -1639,6 +1707,23 @@ inline PassResult run_pass(const DriverConfig& cfg, std::map<std::string, std::i
         if (!signed_in || !cfg.after_install || !ed::is_install(j) || j.state != "installed") continue;
         if (!synced.insert(j.assignment_id).second) continue;
         cfg.after_install(j.assignment_id);
+    }
+    // Resumed after a clearance (request_reverification): every durable
+    // request applied to every matching job before anything else reads them,
+    // the scan asked at once, and only then the request removed.
+    const std::map<std::string, std::string> reverify = pending_reverifications(cfg.root);
+    for (ed::Job j : ed::list_jobs(cfg.root)) {
+        const auto rv = reverify.find(j.assignment_id);
+        if (rv == reverify.end() || !set_aside_refusal(j, rv->first, rv->second)) continue;
+        std::error_code ec;
+        fs::remove(vc::record_path(cfg.root, j.id), ec);
+        save(cfg, j);
+        log(cfg, j.id + ": resumed after a security clearance; revision " + rv->second + " is verified again here before it runs");
+    }
+    for (const auto& [assignment, revision] : reverify) {
+        { std::lock_guard<std::mutex> lock(controls().m); controls().verify.insert(assignment); }
+        std::error_code ec;
+        fs::remove(reverify_dir(cfg.root) / fs::path(assignment), ec);
     }
     for (ed::Job j : ed::list_jobs(cfg.root)) {
         if (stopping(cfg)) break;

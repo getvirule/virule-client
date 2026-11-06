@@ -63,4 +63,15 @@ inline bool says(const std::string& body, const char* key) {
     return body.find(std::string("\"") + key + "\":true") != std::string::npos;
 }
 
+// A RE-VERIFICATION PENDING after a Resume (client/transfers.hpp
+// request_reverification; owner decision 2026-11-05): the request file. While
+// it exists nothing of the assignment is launched (launcher.hpp), so the
+// cleared build never runs on its old scan before the driver applied it.
+inline fs::path reverify_dir(const fs::path& root) { return root / L"evaluator" / L"reverify"; }
+inline bool reverify_pending(const fs::path& root, const std::string& assignment_id) {
+    if (!ev::is_hex32(assignment_id)) return false;
+    std::error_code ec;
+    return fs::exists(reverify_dir(root) / fs::path(assignment_id), ec);
+}
+
 } // namespace vclient::security_marks

@@ -476,26 +476,22 @@ bool content_held(const virule::core::evaluation_distribution::Job& j) {
     return j.security_held || vclient::security_marks::has(vclient::paths::virule_data_root(), j.assignment_id, vclient::security_marks::kHold);
 }
 
-// THE RESUME GATE (client/account.hpp resume_gate; owner brief 2026-11-05
-// sections 8 and 19): this computer's own scan refused the build the Resume
-// names (a detection is final per revision here: transfers.hpp
-// revision_held_here). No bypass: the Resume is NOT relayed; the Client
-// reports the refusal itself under its machine proof and the service
-// releases the assignment without fault. Otherwise "" (relay the Resume).
-std::string resume_gate(const std::string& assignment_id, const std::string& revision_id) {
-    namespace ac = vclient::account;
-    namespace relay = vclient::account_relay;
-    const auto root = vclient::paths::virule_data_root();
-    if (revision_id.size() != 32 || !vclient::transfers::detail::revision_held_here(root, assignment_id, revision_id)) return "";
-    const vclient::transfers::Reply r = g_transfer_service.call("POST", "/v1/assignments/" + assignment_id + "/security/refusal",
-        "{\"revision_id\":\"" + revision_id + "\"}", "application/json", {});
-    vclient::log::client("resume of " + assignment_id + " refused here: this computer's scan refused that build (service " +
-                         std::to_string(r.status) + ")");
+// RESUMED (client/account.hpp on_resumed; owner decision 2026-11-05): the
+// service restored the assignment after a person cleared the exact build.
+// THIS COMPUTER'S CURRENT VERIFICATION decides now (transfers.hpp
+// request_reverification): an earlier refusal of that revision here is set
+// aside and the build verified again from the start before anything of it
+// runs. No bypass: a current refusal is reported as an incident, and the
+// service releases this evaluator without fault (the same adjudicated
+// finding) or opens a new review (a new finding).
+void on_resumed(const std::string& assignment_id, const std::string& revision_id) {
+    if (!vclient::transfers::request_reverification(vclient::paths::virule_data_root(), assignment_id, revision_id)) {
+        vclient::log::client("resumed " + assignment_id + ": the re-verification request could not be written");
+    }
+    vclient::log::client("resumed " + assignment_id + ": revision " + revision_id + " is verified again here before it runs");
     vclient::evidence::note_change();
+    if (g_transfer_wake) SetEvent(g_transfer_wake);
     if (g_runtime_report) g_runtime_report->wake();
-    // WORKING WORDING, PENDING OWNER REVIEW (no em dash; names no threat).
-    return relay::refused_here(r.status, "\"This computer's security scan can't verify this game, so it can't be resumed here. "
-                                         "The evaluation was released and this doesn't count against you.\"");
 }
 
 void start_runtime_report() {
@@ -543,6 +539,12 @@ void start_runtime_report() {
         }
         vclient::evidence::note_change();
         (void)ac::run_security_end(cleanup_config(), id, content_held);
+    };
+    // A SECURITY REVIEW BEGAN while the game runs (owner decision
+    // 2026-11-05): closed, graceful first (client/launcher.hpp).
+    cfg.security_stop = [](const std::string& id) {
+        if (g_launcher) (void)g_launcher->stop_for_security(id);
+        vclient::evidence::note_change();
     };
     cfg.resume_cleanups = [] {
         namespace ac = vclient::assignment_cleanup;
@@ -1377,7 +1379,7 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
     start_launcher();
     start_runtime_report();
     // The Resume is relayed only past this computer's own check (client/account.hpp).
-    vclient::account::resume_gate() = ::resume_gate;
+    vclient::account::on_resumed() = ::on_resumed;
 
     // Game distribution: Build for Evaluation's upload and the evaluator's
     // install are carried by this process (client/transfers.hpp), whether

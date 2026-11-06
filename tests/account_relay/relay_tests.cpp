@@ -178,8 +178,9 @@ int main() {
               !mp::not_bound(401, R"({"error":{"code":"not_authorized","message":"x"}})") && !mp::not_bound(400, "machine_not_bound"));
     }
 
-    // ---- THE RESUME (owner brief 2026-11-05): relayed for the Admin, after the
-    // Client's own check (client/account.hpp resume_gate).
+    // ---- THE RESUME (owner brief 2026-11-05): relayed for the Admin; on its
+    // success the Client verifies the cleared build again (client/account.hpp
+    // on_resumed; owner decision 2026-11-05: no historical veto).
     {
         const std::string A = "0123456789abcdef0123456789abcdef";
         check("the Resume is an Admin route (POST only)", relay::admin_route_ok("POST", "/v1/assignments/" + A + "/resume") &&
@@ -189,8 +190,16 @@ int main() {
         check("the Resume is recognized with its assignment (the gate runs on it)", q.ok && relay::resume_assignment(q) == A);
         const relay::Request other = relay::parse("{\"type\":\"account_api\",\"method\":\"POST\",\"path\":\"/v1/assignments/offers/open\"}");
         check("no other request is a Resume", other.ok && relay::resume_assignment(other).empty());
-        check("the local refusal's answer says so, with no HTTP status",
+        check("the 0.9.24 local refusal's documented answer shape is unchanged (no longer produced)",
               relay::refused_here(200, "\"x\"") == R"({"type":"account_api","status":0,"error":"refused_here","reported":true,"message":"x"})");
+        // THE ONE-TIME SECURITY END NOTICE (2026-11-05): the evaluator's OK.
+        check("the security end acknowledgment is an Admin route (POST only, an assignment id)",
+              relay::admin_route_ok("POST", "/v1/assignments/" + A + "/security/seen") &&
+              !relay::admin_route_ok("GET", "/v1/assignments/" + A + "/security/seen") &&
+              !relay::admin_route_ok("POST", "/v1/assignments/xyz/security/seen"));
+        check("...and nothing else under security: the incident and the refusal stay the Client's own calls",
+              !relay::admin_route_ok("POST", "/v1/assignments/" + A + "/security/incident") &&
+              !relay::admin_route_ok("POST", "/v1/assignments/" + A + "/security/refusal"));
     }
 
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);

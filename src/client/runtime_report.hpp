@@ -28,7 +28,9 @@
 //
 // WHEN. Every RUNNING change the launcher sees (a start, the last exit, a
 // job state change: its change hook wakes this thread), at Client start,
-// and every 30 minutes. The state is SAMPLED at the moment each report is
+// every 30 minutes, and every 5 minutes while a game runs (0.9.25: an
+// answer saying `security_hold` while the game runs closes it,
+// cfg.security_stop). The state is SAMPLED at the moment each report is
 // signed, never queued: a retry is a new observation (a stale sample must
 // never arrive after a launch). A report that fails is simply sent again
 // at the next wake or interval.
@@ -86,6 +88,9 @@ namespace ee = virule::core::evaluation_evidence;
 
 // How often every installed assignment is reported without a change.
 inline constexpr DWORD kIntervalMs = 30 * 60 * 1000;
+// ...and while one of its games runs (owner decision 2026-11-05: a security
+// review that begins meanwhile must stop it; the answer says so).
+inline constexpr DWORD kRunningIntervalMs = 5 * 60 * 1000;
 // A burst of changes (a wrapper and its game starting) is one report.
 inline constexpr DWORD kSettleMs = 2000;
 // The absolute deadline, from the service's acceptance (VIRULE_BACKEND
@@ -211,6 +216,10 @@ struct Config {
     // The assignment ENDED FOR SECURITY (the service only): `outcome`
     // "released" or "terminated" (client/assignment_cleanup.hpp "security end").
     std::function<void(const std::string& assignment_id, const std::string& outcome)> security_ended;
+    // The service says nothing of the assignment may run (`security_hold`)
+    // while its game runs here: close it (client/launcher.hpp
+    // stop_for_security: graceful first, then the guarded terminate).
+    std::function<void(const std::string& assignment_id)> security_stop;
     // Resume every cleanup a mark left unfinished (each cycle).
     std::function<void()> resume_cleanups;
     std::function<std::time_t()> now = [] { return std::time(nullptr); };
@@ -262,6 +271,12 @@ public:
                         if (!security_marks::set(cfg_.root, t.assignment_id, security_marks::kHold, security_marks::says(a.body, "security_hold")) ||
                             !security_marks::set(cfg_.root, t.assignment_id, security_marks::kProtected, security_marks::says(a.body, "security_protected"))) {
                             say("runtime report: " + t.assignment_id + " security state could not be recorded");
+                        }
+                        // A SECURITY REVIEW BEGAN while the game runs (owner
+                        // decision 2026-11-05): it is closed now, nothing deleted.
+                        if (running && security_marks::says(a.body, "security_hold") && cfg_.security_stop) {
+                            say("runtime report: " + t.assignment_id + " is held for security while its game runs; closing it");
+                            cfg_.security_stop(t.assignment_id);
                         }
                         // The deadline the service states now (restored on a Resume).
                         const std::int64_t dl = says_deadline(a.body);
@@ -324,6 +339,7 @@ public:
         const std::int64_t now = (std::int64_t)cfg_.now();
         std::int64_t best = (std::int64_t)kIntervalMs / 1000;
         for (const auto& t : targets(cfg_.root)) {
+            if (cfg_.running && cfg_.running(t.assignment_id)) best = std::min<std::int64_t>(best, kRunningIntervalMs / 1000);
             const std::int64_t cut = cut_instant(t);
             if (cut <= 0) continue;
             for (const std::int64_t at : { cut + kAbsoluteAskSeconds, cut + kLocalMarginSeconds + 1 }) {
