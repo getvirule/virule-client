@@ -1828,8 +1828,13 @@ the file, and never with an extra read of content it already reads:
   developer's own folder) is hashed AT DETECTION only while it is still on
   disk and the scan did not report it gone or changed (`missing`); one the
   antivirus took is `local` with no digest. Nothing is fabricated.
-- A download-stage finding (the package zip itself) states `package` with
-  no digest: nothing of it was extracted.
+- A finding on the package file itself, wherever the Client knows it as
+  the package (the downloaded zip at download or while it is extracted;
+  the developer's built package in the developer's verification), states
+  `package` with no digest: the package is a container, never one of the
+  files VIRULE wrote from it.
+- A detection VIRULE Desktop's own precheck, build or packaging met (`establish_host_detection` reads Defender's record for the game's source and evaluation build folders) is attributed WITHOUT a package index: every file it names there, the built package included, is `local`, hashed at detection only while still on disk and not reported taken. Such a developer-side digest never decides anything: the same-finding match is for evaluator reports only, and a hold carrying a developer-side detection is never cleared, so nothing of it is recorded as cleared.
+  (`fi::attach` with an empty `fi::Index`.)
 - THE FOLDER CASE RULE (owner decision 2026-11-06, VIRULE
   `docs/specs/evaluation-security.md` decision 62): index keys fold case, so
   a digest (from the index, or hashed now) is given only when every folder
