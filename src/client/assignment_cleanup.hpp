@@ -187,10 +187,10 @@ inline bool run(const Config& cfg, const std::string& id) {
 //   4. REMOVE THE GAME, with the expiry's own guard (only the job's folder,
 //      directly inside the installs location, named by the game's id), and
 //      the download's temp file.
-// KEPT: the unsubmitted draft (WORKING CHOICE, PENDING OWNER DECISION: a
-// security end is not the evaluator's doing, and the owner has not said the
-// draft goes with it), the ticket, the ledger, the evidence outbox and
-// receipts, so evidence still on its way is delivered.
+// KEPT: the unsubmitted draft (owner decision 2026-11-05, VIRULE
+// docs/specs/evaluation-security.md decision 44: kept while any hold applies,
+// never delivered as an evaluation), the ticket, the ledger, the evidence
+// outbox and receipts, so evidence still on its way is delivered.
 
 inline fs::path security_end_path(const fs::path& root, const std::string& id) { return assignment_dir(root, id) / L"security_end.json"; }
 
