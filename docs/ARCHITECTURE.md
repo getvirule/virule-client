@@ -2025,8 +2025,9 @@ Client does:
   above). Reports come every 60 seconds while a game runs (0.9.26, owner
   decision 2026-11-05), so a running game learns of a review placed
   elsewhere within about a minute; this computer's own detection acts at
-  once, and Play is refused at once. While no game runs nothing reports more
-  often than every 30 minutes.
+  once, and Play is refused at once. While no game runs there is no 60-second
+  cadence (the 30-minute interval, the one-shot deadline reports and the
+  launcher's change wakes, as before).
 - THE OFFLINE CUT FOLLOWS THE STATED DEADLINE: every answer's `deadline_utc`
   is kept (`evaluator\assignments\<id>\deadline_utc`); offline, the cut is
   that deadline + 24 hours + the 15-minute margin (a deadline restored on a
