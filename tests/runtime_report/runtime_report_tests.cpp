@@ -419,10 +419,14 @@ int main(int argc, char** argv) {
             rr::Reporter rep(c);
             rep.cycle();
             check("no hold: a running game is left alone", stopped.empty());
-            check("while a game runs, the report comes every 5 minutes (not 30)", rep.next_wait_ms() == rr::kRunningIntervalMs, std::to_string(rep.next_wait_ms()));
+            check("while a game runs, the report comes every 60 seconds (owner decision 2026-11-05; not 30 minutes)",
+                  rr::kRunningIntervalMs == 60 * 1000 && rep.next_wait_ms() == 60 * 1000, std::to_string(rep.next_wait_ms()));
         }
+        // A REVIEW PLACED ELSEWHERE (another computer's detection, a person's
+        // hold): the service's answer changes; the next report, at most 60
+        // seconds away while the game runs, learns it and closes the game.
         answer_body = "{\"ok\":true,\"state\":\"active\",\"security_hold\":true,\"security_review\":\"review\",\"deadline_utc\":\"2026-10-31T12:00:00Z\"}";
-        { rr::Reporter rep(c); rep.cycle(); }
+        { rr::Reporter rep(c); check("...a review placed elsewhere is learned at the next report, due within 60 seconds", rep.next_wait_ms() <= 60 * 1000); rep.cycle(); }
         check("THE HOLD ARRIVES while the game runs: ITS game is closed (security_stop), the one not running is not",
               stopped.size() == 1 && stopped[0] == P);
         check("...and the hold marker refuses the next launch", vclient::security_marks::has(r6, P, vclient::security_marks::kHold));
@@ -436,6 +440,8 @@ int main(int argc, char** argv) {
             rep.cycle();
             check("closed: no further stop, and the report goes back to every 30 minutes", stopped.empty() && rep.next_wait_ms() == rr::kIntervalMs,
                   std::to_string(rep.next_wait_ms()));
+            check("NO POLLING WHILE NOTHING RUNS: installed assignments not running never shorten the 30-minute interval",
+                  rep.next_wait_ms() == 30 * 60 * 1000);
         }
         std::error_code e6;
         fs::remove_all(r6, e6);

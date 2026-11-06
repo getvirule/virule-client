@@ -28,9 +28,11 @@
 //
 // WHEN. Every RUNNING change the launcher sees (a start, the last exit, a
 // job state change: its change hook wakes this thread), at Client start,
-// every 30 minutes, and every 5 minutes while a game runs (0.9.25: an
-// answer saying `security_hold` while the game runs closes it,
-// cfg.security_stop). The state is SAMPLED at the moment each report is
+// every 30 minutes, and every 60 seconds while one of the games runs
+// (0.9.26, owner decision 2026-11-05; 0.9.25 every 5 minutes): an answer
+// saying `security_hold` while the game runs closes it (cfg.security_stop),
+// so a review placed elsewhere stops a running game within about a minute.
+// Nothing reports more often while no game runs. The state is SAMPLED at the moment each report is
 // signed, never queued: a retry is a new observation (a stale sample must
 // never arrive after a launch). A report that fails is simply sent again
 // at the next wake or interval.
@@ -89,8 +91,9 @@ namespace ee = virule::core::evaluation_evidence;
 // How often every installed assignment is reported without a change.
 inline constexpr DWORD kIntervalMs = 30 * 60 * 1000;
 // ...and while one of its games runs (owner decision 2026-11-05: a security
-// review that begins meanwhile must stop it; the answer says so).
-inline constexpr DWORD kRunningIntervalMs = 5 * 60 * 1000;
+// review placed elsewhere must stop it within about a minute; the answer
+// says so). Only while a game runs: never a background poll otherwise.
+inline constexpr DWORD kRunningIntervalMs = 60 * 1000;
 // A burst of changes (a wrapper and its game starting) is one report.
 inline constexpr DWORD kSettleMs = 2000;
 // The absolute deadline, from the service's acceptance (VIRULE_BACKEND

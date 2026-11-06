@@ -1960,7 +1960,8 @@ signed out or another account, nothing is sent).
 WHEN: at start (after the launcher's first scan, so a game already running
 reads running), at every change the launcher notes (its change hook wakes
 the thread; a burst settles for two seconds), every 30 minutes, and every
-5 minutes while one of the games runs (0.9.25: an answer saying
+60 seconds while one of the games runs (0.9.26, owner decision 2026-11-05;
+0.9.25 every 5 minutes; never more often while no game runs: an answer saying
 `security_hold` for a running game closes it, below). The
 state is SAMPLED as each report is signed, never queued: a failed post is
 simply a new observation at the next wake or interval, so a stale sample
@@ -2021,8 +2022,11 @@ Client does:
   left after `kSecurityCloseGraceMs` (10 s) is terminated. Nothing is
   deleted: the folder, the saves, the draft and the evidence stay; a session
   cut short keeps its checkpoint for the recovery (deferred while held, as
-  above). Reports come every 5 minutes while a game runs, so a running game
-  learns of a review within about 5 minutes; Play is refused at once.
+  above). Reports come every 60 seconds while a game runs (0.9.26, owner
+  decision 2026-11-05), so a running game learns of a review placed
+  elsewhere within about a minute; this computer's own detection acts at
+  once, and Play is refused at once. While no game runs nothing reports more
+  often than every 30 minutes.
 - THE OFFLINE CUT FOLLOWS THE STATED DEADLINE: every answer's `deadline_utc`
   is kept (`evaluator\assignments\<id>\deadline_utc`); offline, the cut is
   that deadline + 24 hours + the 15-minute margin (a deadline restored on a
@@ -2071,20 +2075,24 @@ Client does:
   game running; VIRULE Desktop requires 0.9.25 (`client_requirement.hpp`).
 - Tests: `tests/account_relay` (the Resume and `security/seen` routes),
   `tests/transfers` (the reverification, unit), `tests/runtime_report` (the
-  stop on a hold, the 5-minute cadence, and `stop_for_security` against real
+  stop on a hold, the 60-second cadence while running and none while idle,
+  and `stop_for_security` against real
   Windows processes: a windowed one closes itself, one that ignores the close
-  is terminated, the folder and a saved game stay). PRE-PRODUCTION TEST GAP:
-  the end-to-end stage of `tests/transfers` (`tools/transfer_test.mjs`
-  starting the unsigned `transfers_tests.exe`) is refused intermittently by
-  Microsoft Defender, `Trojan:Win32/Bearfoos.A!ml` (ThreatID 2147731250, a
+  is terminated, the folder and a saved game stay). PRE-PRODUCTION
+  TEST-INFRASTRUCTURE ITEM (the product's transfer and security paths have
+  automated coverage in these suites): the one end-to-end harness executable
+  of `tests/transfers` (`tools/transfer_test.mjs` starting the unsigned
+  `transfers_tests.exe`) is quarantined intermittently by Microsoft Defender
+  before that stage runs, `Trojan:Win32/Bearfoos.A!ml` (ThreatID 2147731250, a
   machine-learning verdict on the unsigned test program; detections
   2026-10-30 13:41, 2026-11-05 15:52, 18:04 and 18:05, the program
   quarantined). The same stage passed 43 of 43 at 2026-11-05 about 17:40 with
   a static-CRT build that Defender quarantined minutes later, so neither
   build is a fix. No exclusion, no disabled protection, nothing whitelisted
   (security posture outranks a green test); the unit stage runs before the
-  quarantine and passes. Resolving it needs a signed or otherwise reputable
-  test program, outside this change.
+  quarantine and passes. The future fix is a security-compatible test
+  artifact (an appropriately signed or reputable test executable); no
+  signing project is authorized for it now.
 
 ## Expired assignment cleanup (0.9.21, 2026-10-28; `src/client/assignment_cleanup.hpp`)
 
