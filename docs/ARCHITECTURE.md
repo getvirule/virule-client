@@ -107,21 +107,39 @@ listed local development origins in `src/client/bridge.hpp`); anything
 else is dropped at handshake. A connection with NO Origin header is a
 local control connection (second-instance forwarding, Setup's shutdown
 request). The origin check defends against the WEB, not against local
-code: any local program can reach the control messages.
+code: any local program running as this Windows user can reach the control
+messages.
+
+User policy (audit H-3, 2026-11-11; Client source after 0.9.28): every
+accepted connection is mapped to
+the process on its other end (`GetExtendedTcpTable`, the mirrored 4-tuple)
+and refused before a byte is read unless that process's token user SID is
+this client's own (`src/shared/loopback_peer.hpp`). It fails closed: an
+owner that cannot be read is refused, which is also how another account's
+process normally reads to a standard user. The site in this user's browser,
+VIRULE Desktop, the evaluation wrapper, Setup and a second client instance
+all run as this user and pass; a process of another Windows user on the
+same computer cannot use the bridge. `loopback_roundtrip` checks the
+listener it reaches the same way before sending anything. The listener is
+bound with `SO_EXCLUSIVEADDRUSE` and serves at most 128 connections at once
+(beyond that a connection is closed at once). This takes no position on
+whether two Windows users may each run VIRULE on one computer.
 
 LOCAL CALLERS VERSUS OPERATION AUTHORIZATION (owner decision 2026-11-02,
 `VIRULE/docs/specs/evaluation-security.md` decision 16). Reaching the
 bridge is never permission to skip a VIRULE rule. A privileged VIRULE
 operation enforces its own invariants at the component that owns its
 credential or action, whoever asked: there is no "trusted Admin" caller,
-since the Admin reaches this bridge exactly as any local program does and
+since the Admin reaches this bridge exactly as any local program of this
+user does and
 its screen checks are presentation only. Being a local caller suffices only
 for what such a program could already do itself (open virule://, run Setup
 or an update). Examples: an evaluation purchase is refused by the Client
 before it uses its authorization when this computer cannot verify games;
 the relay admits only the Admin's own requests, never the routes of the
 Client's own drivers. LIMIT: the account session and device key are
-DPAPI user-scope protected, which stops copying and other Windows users but
+DPAPI user-scope protected, which stops copying and other Windows users
+(who also cannot reach the bridge, User policy above) but
 is NOT a hardware boundary against hostile code already running as this
 user; VIRULE claims no protection from such code, only that it offers no
 supported path around its own rules (stronger endpoint isolation: open

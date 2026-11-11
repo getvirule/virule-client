@@ -97,6 +97,7 @@
 #include "client/finding_identity.hpp"
 #include "client/verified_digests.hpp"
 #include "shared/json_scan.hpp"
+#include "shared/launch_name.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 #include "virule/core/malware_scan.hpp"
@@ -1522,7 +1523,8 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         (void)ev::json::get_int(a.body, "package_bytes", pbytes);
         (void)ev::json::get_int(a.body, "content_bytes", cbytes);
         (void)ev::json::get_int(a.body, "revision", rev);
-        if (!ev::is_hex32(did) || !ev::is_hex32(rid) || !ev::is_sha256_hex(sha) || launch.empty()) {
+        // launch_exe is re-checked here, not trusted (shared/launch_name.hpp).
+        if (!ev::is_hex32(did) || !ev::is_hex32(rid) || !ev::is_sha256_hex(sha) || !launch_name::is_safe(launch)) {
             defer(cfg, j, "The service answered with a malformed download.");
             return;
         }

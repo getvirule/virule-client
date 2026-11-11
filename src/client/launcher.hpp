@@ -64,6 +64,7 @@
 #include "client/assignment_cleanup.hpp"
 #include "client/security_marks.hpp"
 #include "shared/json_scan.hpp"
+#include "shared/launch_name.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 #include "virule/core/malware_scan.hpp"
@@ -461,7 +462,9 @@ private:
             return false;
         }
         std::error_code ec;
-        if (job.install_dir.empty() || job.launch_exe.empty() ||
+        // The launch file is one bare .exe name inside the install folder
+        // (shared/launch_name.hpp), checked again before it is ever started.
+        if (job.install_dir.empty() || !launch_name::is_safe(job.launch_exe) ||
             !fs::is_regular_file(path_of(job.install_dir) / path_of(job.launch_exe), ec) || ec) {
             code = "missing";
             why = kMissing;

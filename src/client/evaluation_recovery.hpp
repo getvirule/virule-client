@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "client/security_marks.hpp"
+#include "shared/launch_name.hpp"
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 
@@ -193,7 +194,9 @@ public:
     Verdict evaluate(const std::string& assignment_id, fs::path& exe, fs::path& dir, std::string& why) {
         ed::Job job;
         if (!ed::install_for_assignment(cfg_.root, assignment_id, job) || job.state != "installed" ||
-            job.install_dir.empty() || job.launch_exe.empty()) {
+            job.install_dir.empty() || !launch_name::is_safe(job.launch_exe)) {
+            // The launch file is one bare .exe name inside the install folder
+            // (shared/launch_name.hpp), checked again before it is ever started.
             return Verdict::NotInstalled;
         }
         dir = path_of(job.install_dir);

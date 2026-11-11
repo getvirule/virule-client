@@ -14,18 +14,28 @@
 //     refused, so a /v2 can exist later without ambiguity.
 //
 // SECURITY MODEL:
-//   - Binds 127.0.0.1 ONLY. Never a LAN interface, never a remote
-//     fallback.
+//   - Binds 127.0.0.1 ONLY (SO_EXCLUSIVEADDRUSE). Never a LAN interface,
+//     never a remote fallback.
+//   - THIS WINDOWS USER ONLY (audit H-3, 2026-11-11): every accepted
+//     connection is mapped to the process on its other end and refused,
+//     before a byte is read, unless that process runs as the same Windows
+//     user as this client (shared/loopback_peer.hpp; fail closed when the
+//     owner cannot be read). The website in this user's browser, VIRULE
+//     Desktop, the evaluation wrapper and Setup all run as this user; a
+//     process of ANOTHER Windows user on this computer cannot reach the
+//     bridge at all. loopback_roundtrip applies the same check to the
+//     listener it reaches before trusting its hello.
 //   - A browser connection always carries an Origin header; only the
 //     virule.app origins (plus the explicit local development origins
 //     below) are accepted, so a foreign website can neither probe nor
 //     drive the bridge. A local no-Origin connection is a control
 //     connection: a local process could fake an Origin anyway, so origin
 //     checks defend against the WEB, not against local code. Any local
-//     program can therefore REACH the control messages; that is never
-//     permission to skip a VIRULE rule. Being a local caller is enough only
-//     for what such a program could already do itself (launch virule://,
-//     run Setup or an update, delete its own files).
+//     program running as this user can therefore REACH the control
+//     messages; that is never permission to skip a VIRULE rule. Being a
+//     local caller is enough only for what such a program could already do
+//     itself (launch virule://, run Setup or an update, delete its own
+//     files).
 //   - A PRIVILEGED VIRULE OPERATION ENFORCES ITS OWN INVARIANTS AT THE
 //     COMPONENT THAT OWNS ITS CREDENTIAL OR ACTION, whoever asked (owner
 //     decision 2026-11-02). There is no "trusted Admin" caller: the Admin
@@ -35,8 +45,9 @@
 //     account authorization is used, when this computer cannot verify games
 //     (client/account.hpp api_call, shared/evaluation_purchase_readiness.hpp).
 //   - The account session and device key are DPAPI user-scope protected:
-//     safe from copying and from other Windows users, NOT a hardware
-//     boundary against hostile code already running as this user. This
+//     safe from copying and from other Windows users (who also cannot
+//     reach this bridge, above), NOT a hardware boundary against hostile
+//     code already running as this user. This
 //     bridge does not claim to stop such code; it guarantees that VIRULE
 //     offers no supported path around its own rules.
 //   - There is no generic command endpoint, no filesystem surface, no
@@ -176,6 +187,7 @@
 #include "shared/installed_capabilities.hpp"
 #include "shared/json_scan.hpp"
 #include "shared/logging.hpp"
+#include "shared/loopback_peer.hpp"
 #include "shared/protocol_reg.hpp"
 #include "shared/version.h"
 #include "virule/core/embargo_signing.hpp"
@@ -314,7 +326,24 @@ inline std::atomic<bool> g_self_update_draining{ false };
 // Activity clock for the idle-exit policy: any accepted connection or
 // handled message refreshes it.
 inline std::atomic<unsigned long long> g_last_activity_tick{ 0 };
+// Connections being served (each has its own thread), counted at accept.
 inline std::atomic<int> g_open_connections{ 0 };
+
+// The most connections served at once (audit L-24). Every open virule.app
+// tab holds one and VIRULE Desktop, Setup and the wrapper make short round
+// trips, so a real computer stays far below this; beyond it a connection is
+// closed at once instead of costing a thread.
+constexpr int kMaxOpenConnections = 128;
+
+// Refusals are logged at most once a minute (a flood never floods the log).
+inline std::atomic<unsigned long long> g_last_refusal_log_tick{ 0 };
+inline void log_refusal(const std::string& text) {
+    const unsigned long long now = GetTickCount64();
+    unsigned long long last = g_last_refusal_log_tick.load();
+    if (last != 0 && now - last < 60000) return;
+    if (!g_last_refusal_log_tick.compare_exchange_strong(last, now)) return;
+    log::client(text);
+}
 
 inline void touch_activity() { g_last_activity_tick.store(GetTickCount64()); }
 
@@ -1064,12 +1093,19 @@ inline DWORD WINAPI client_thread_main(LPVOID p) {
     ClientThreadArg* arg = (ClientThreadArg*)p;
     const SOCKET s = arg->socket;
     delete arg;
-    g_open_connections.fetch_add(1);
-    handle_client(s);
-    g_open_connections.fetch_sub(1);
-    touch_activity();
-    shutdown(s, SD_BOTH);
+    // THIS WINDOWS USER ONLY, before a byte is read (header, SECURITY
+    // MODEL). Fail closed: an owner that cannot be read is refused.
+    const loopback_peer::Result peer = loopback_peer::check_peer(s);
+    if (peer.verdict == loopback_peer::Verdict::same_user) {
+        handle_client(s);
+        touch_activity();
+        shutdown(s, SD_BOTH);
+    } else {
+        log_refusal(std::string("bridge: connection refused (") + peer.why +
+                    ", pid " + std::to_string(peer.pid) + ")");
+    }
     closesocket(s);
+    g_open_connections.fetch_sub(1);
     return 0;
 }
 
@@ -1084,6 +1120,13 @@ inline DWORD WINAPI listener_thread_main(LPVOID) {
         g_listen_state.store(2);
         return 0;
     }
+    // No other socket, of any user, may bind this address while it is ours
+    // (audit L-24). Re-binding right after accepted connections closed (the
+    // self-update relaunch, restart_listening) is unaffected:
+    // tests\loopback_peer probes exactly that.
+    BOOL exclusive = TRUE;
+    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               (const char*)&exclusive, sizeof(exclusive));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(kPort);
@@ -1109,6 +1152,13 @@ inline DWORD WINAPI listener_thread_main(LPVOID) {
             Sleep(100); // a transient accept error must never hot-spin
             continue;
         }
+        // Counted here, before the thread exists, so the cap cannot race.
+        if (g_open_connections.fetch_add(1) >= kMaxOpenConnections) {
+            g_open_connections.fetch_sub(1);
+            closesocket(client);
+            log_refusal("bridge: connection refused (too many open connections)");
+            continue;
+        }
         auto* arg = new ClientThreadArg{ client };
         HANDLE h = CreateThread(nullptr, 0, client_thread_main, arg, 0, nullptr);
         if (h) {
@@ -1116,6 +1166,7 @@ inline DWORD WINAPI listener_thread_main(LPVOID) {
         } else {
             delete arg;
             closesocket(client);
+            g_open_connections.fetch_sub(1);
         }
     }
 }
@@ -1152,7 +1203,8 @@ inline void restart_listening() {
 // ask a running client to exit, and by the QA flow to report a result to a
 // running VIRULE Admin GUI session on port 47611 (its qa_bridge speaks the
 // same frames). No Origin is sent: that is exactly what marks the
-// connection as local.
+// connection as local. The listener reached must run as this Windows user
+// (loopback_peer), or nothing is sent.
 
 inline bool client_send_masked(SOCKET s, const std::string& payload) {
     unsigned char mask[4];
@@ -1225,7 +1277,11 @@ inline bool loopback_roundtrip(unsigned short port, const wchar_t* path_unused,
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         unsigned char nonce[16];
+        // The listener must belong to THIS Windows user before anything is
+        // sent to it (another user's process holding the port is never
+        // this user's client or Admin; fail closed, shared/loopback_peer.hpp).
         if (connect(s, (const sockaddr*)&addr, sizeof(addr)) == 0 &&
+            loopback_peer::peer_is_same_user(s) &&
             BCryptGenRandom(nullptr, nonce, sizeof(nonce),
                             BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
             // Port 47612 serves /v1; the Admin's 47611 bridge serves /.
