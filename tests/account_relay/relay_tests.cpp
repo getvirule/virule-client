@@ -202,6 +202,63 @@ int main() {
               !relay::admin_route_ok("POST", "/v1/assignments/" + A + "/security/refusal"));
     }
 
+    // ---- the evaluator's contractor payments (owner brief 2026-11-06) ----
+    {
+        const std::string I = "0123456789abcdef0123456789abcdef";
+        const std::string F = "/v1/assignments/payments";
+        check("payments: the view, older invoices, one invoice, its line pages and its document are GETs the Admin makes",
+              relay::admin_route_ok("GET", F) && relay::admin_route_ok("GET", F + "/older/" + I) &&
+              relay::admin_route_ok("GET", F + "/invoices/" + I) && relay::admin_route_ok("GET", F + "/invoices/" + I + "/document") &&
+              relay::admin_route_ok("GET", F + "/invoices/" + I + "/1") && relay::admin_route_ok("GET", F + "/invoices/" + I + "/9999"));
+        check("payments: the submission is the one POST", relay::admin_route_ok("POST", F + "/invoices/" + I + "/submit") &&
+              !relay::admin_route_ok("GET", F + "/invoices/" + I + "/submit"));
+        check("payments: nothing else is relayed (no write of an amount, no other GET)",
+              !relay::admin_route_ok("POST", F) && !relay::admin_route_ok("POST", F + "/invoices/" + I) &&
+              !relay::admin_route_ok("POST", F + "/invoices/" + I + "/document") && !relay::admin_route_ok("GET", F + "/entries") &&
+              !relay::admin_route_ok("POST", F + "/entries") && !relay::admin_route_ok("GET", F + "/invoices") &&
+              !relay::admin_route_ok("GET", F + "/older") && !relay::admin_route_ok("PUT", F));
+        check("payments: malformed ids and pages are refused",
+              !relay::admin_route_ok("GET", F + "/invoices/xyz") && !relay::admin_route_ok("GET", F + "/invoices/" + I + "/0") &&
+              !relay::admin_route_ok("GET", F + "/invoices/" + I + "/10000") && !relay::admin_route_ok("GET", F + "/invoices/" + I + "/01") &&
+              !relay::admin_route_ok("GET", F + "/older/ABCDEF0123456789abcdef0123456789") &&
+              !relay::admin_route_ok("POST", F + "/invoices/" + I.substr(1) + "/submit"));
+        check("payments: the paths pass the family grammar (four segments at most)",
+              relay::path_ok(F + "/invoices/" + I + "/document") && !relay::path_ok(F + "/invoices/" + I + "/document/x"));
+        check("payments: the developer family has no payments routes",
+              !relay::admin_route_ok("GET", "/v1/evaluations/payments") && !relay::admin_route_ok("POST", "/v1/evaluations/payments/invoices/" + I + "/submit"));
+        check("payments: the evaluator workspace GET is unchanged and other GETs stay refused",
+              relay::admin_route_ok("GET", "/v1/assignments") && !relay::admin_route_ok("GET", "/v1/assignments/offers") &&
+              !relay::admin_route_ok("GET", "/v1/assignments/" + I + "/ticket"));
+        const relay::Request q = relay::parse("{\"type\":\"account_api\",\"method\":\"POST\",\"path\":\"" + F + "/invoices/" + I +
+                                              "/submit\",\"body\":{\"version\":2,\"snapshot_sha256\":\"" + std::string(64, 'a') + "\"}}");
+        check("payments: a submission parses with its body, and is neither a purchase nor a Resume",
+              q.ok && q.body.find("\"version\":2") != std::string::npos && !relay::is_purchase(q) && relay::resume_assignment(q).empty());
+    }
+
+    // ---- STRIPE CHECKOUT AND THE FINANCIAL HOLD (owner brief 2026-11-10) ----
+    {
+        const std::string C = "0123456789abcdef0123456789abcdef";
+        const std::string K = "/v1/evaluations/checkouts";
+        check("checkout: creating one is a developer POST, read is a GET of one, cancel a POST of one",
+              relay::admin_route_ok("POST", K) && relay::admin_route_ok("GET", K + "/" + C) && relay::admin_route_ok("POST", K + "/" + C + "/cancel"));
+        check("checkout: nothing else of it is relayed",
+              !relay::admin_route_ok("GET", K) && !relay::admin_route_ok("POST", K + "/" + C) && !relay::admin_route_ok("GET", K + "/" + C + "/cancel") &&
+              !relay::admin_route_ok("POST", K + "/" + C + "/settle") && !relay::admin_route_ok("POST", K + "/" + C + "/paid") &&
+              !relay::admin_route_ok("GET", K + "/xyz") && !relay::admin_route_ok("GET", K + "/" + C + "/x"));
+        check("checkout: the evaluator family has no checkout routes",
+              !relay::admin_route_ok("POST", "/v1/assignments/checkouts") && !relay::admin_route_ok("GET", "/v1/assignments/checkouts/" + C));
+        check("checkout: the webhook and the return page are never relayed",
+              !relay::path_ok("/v1/stripe/webhook") && !relay::path_ok("/v1/checkout/return"));
+        const auto purchase = [](const std::string& m) { return relay::is_purchase(relay::parse(m)); };
+        check("checkout: creating one is a PURCHASE (the readiness gate decides it first); reading or cancelling one is not",
+              purchase(R"({"type":"account_api","method":"POST","path":"/v1/evaluations/checkouts","body":{}})") &&
+              !purchase("{\"type\":\"account_api\",\"method\":\"GET\",\"path\":\"" + K + "/" + C + "\"}") &&
+              !purchase("{\"type\":\"account_api\",\"method\":\"POST\",\"path\":\"" + K + "/" + C + "/cancel\",\"body\":{}}"));
+        check("the OK of an evaluation a financial hold ended is relayed, nothing else of it",
+              relay::admin_route_ok("POST", "/v1/assignments/" + C + "/ended/seen") && !relay::admin_route_ok("GET", "/v1/assignments/" + C + "/ended/seen") &&
+              !relay::admin_route_ok("POST", "/v1/assignments/xyz/ended/seen") && !relay::admin_route_ok("POST", "/v1/assignments/" + C + "/ended"));
+    }
+
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

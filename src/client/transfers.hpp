@@ -1264,7 +1264,9 @@ inline ChainOutcome ensure_launch_chain(const DriverConfig& cfg, const std::stri
         r.code = t.status == 0 ? std::string() : body_code(t.body);
         // A GAME UNDER A SECURITY HOLD (VIRULE_BACKEND security.ts) is a
         // final answer until it is released, never a retry.
-        if (t.status == 409 && r.code == "security_hold") r.retryable = false;
+        // A financial hold on the developer's account is the same final
+        // answer (owner brief 2026-11-10).
+        if (t.status == 409 && security_marks::is_hold_refusal(r.code)) r.retryable = false;
         return r;
     }
     std::string_view ticket_raw;
@@ -1506,7 +1508,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             if (a.status == 409 && body_code(a.body) == "no_build") { fail(cfg, j, body_message(a.body)); return; }
             // THE GAME IS HELD after a security detection (VIRULE_BACKEND
             // security.ts): a final answer until it is released, never retried.
-            if (a.status == 409 && body_code(a.body) == "security_hold") { fail(cfg, j, body_message(a.body)); return; }
+            if (a.status == 409 && security_marks::is_hold_refusal(body_code(a.body))) { fail(cfg, j, body_message(a.body)); return; }
             if (a.status == 404 || a.status == 403) { fail(cfg, j, body_message(a.body)); return; }
             defer(cfg, j, a.status == 0 ? "Couldn't reach our servers right now." : body_message(a.body));
             return;
@@ -1728,7 +1730,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             const ChainOutcome chain = ensure_launch_chain(cfg, j.assignment_id, j.install_dir, j.launch_exe, j.revision_id);
             if (!chain.ok) {
                 fs::remove_all(staging, ec);
-                if (chain.code == "security_hold") { fs::remove(temp, ec); fail(cfg, j, chain.why); return; }
+                if (security_marks::is_hold_refusal(chain.code)) { fs::remove(temp, ec); fail(cfg, j, chain.why); return; }
                 if (chain.retryable) defer(cfg, j, chain.why); else fail(cfg, j, chain.why);
                 return;
             }
@@ -1781,7 +1783,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
         if (done.status != 200) {
             // THE GAME WAS HELD while this computer installed it: final, never
             // retried (the next pass would extract and scan it all again).
-            if (done.status == 409 && body_code(done.body) == "security_hold") {
+            if (done.status == 409 && security_marks::is_hold_refusal(body_code(done.body))) {
                 fs::remove(temp, ec);
                 fail(cfg, j, body_message(done.body));
                 return;

@@ -107,6 +107,9 @@ inline constexpr const char* kEnded = "This evaluation has ended.";
 // A scan that cannot run here says why (malware_scan.hpp
 // unverified_sentence).
 inline constexpr const char* kSecurityHold = "This game is unavailable while it is reviewed.";
+// A FINANCIAL HOLD on the game's developer (owner brief 2026-11-10): never a
+// security word. WORKING WORDING, PENDING OWNER REVIEW.
+inline constexpr const char* kFinancialHold = "This evaluation is paused.";
 inline constexpr const char* kVerifying = "Verifying game files. Try again in a moment.";
 // The service could not be asked before Play (the approved connection
 // sentence, as transfers.hpp states it).
@@ -441,7 +444,9 @@ private:
         // clean (installed before scanning existed: the transfer driver
         // scans it, then Play is offered).
         if (job.security_held || security_marks::has(cfg_.root, assignment, security_marks::kHold)) {
-            code = "security_hold"; why = kSecurityHold; return false;
+            code = "security_hold";
+            why = security_marks::has(cfg_.root, assignment, security_marks::kFinancial) && !job.security_held ? kFinancialHold : kSecurityHold;
+            return false;
         }
         // Resumed after a clearance and not verified again yet (the request is
         // pending; transfers.hpp request_reverification): Verifying, never Play.
@@ -492,9 +497,13 @@ private:
             const Config::ServiceWord w = cfg_.service_check(assignment);
             if (w.status == 200) {
                 if (!security_marks::set(cfg_.root, assignment, security_marks::kHold, false)) say("launch: the hold marker of " + assignment + " could not be cleared");
-            } else if (w.status == 409 && w.code == "security_hold") {
+                (void)security_marks::set(cfg_.root, assignment, security_marks::kFinancial, false);
+            } else if (w.status == 409 && security_marks::is_hold_refusal(w.code)) {
                 (void)security_marks::set(cfg_.root, assignment, security_marks::kHold, true);
-                code = "security_hold"; why = kSecurityHold; return false;
+                (void)security_marks::set(cfg_.root, assignment, security_marks::kFinancial, w.code == "financial_hold");
+                code = "security_hold";
+                why = w.code == "security_hold" || w.message.empty() ? std::string(kSecurityHold) : w.message;
+                return false;
             } else if (w.status == 0) {
                 code = "offline"; why = kOffline; return false;
             } else if (w.status != -1) {

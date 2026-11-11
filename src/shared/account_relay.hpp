@@ -6,8 +6,10 @@
 //
 // The relay reaches EXACTLY the Admin's own requests of the two path
 // families of the VIRULE API, /v1/evaluations and /v1/assignments
-// (VIRULE_BACKEND docs/EVALUATIONS.md), with GET or POST (admin_route_ok).
-// Everything else is refused before a token is touched.
+// (VIRULE_BACKEND docs/EVALUATIONS.md), with GET or POST (admin_route_ok),
+// the evaluator's contractor PAYMENTS included (/v1/assignments/payments...,
+// owner brief 2026-11-06; VIRULE_BACKEND docs/PAYMENTS.md): exact routes,
+// never "any GET". Everything else is refused before a token is touched.
 //
 // THE CLIENT'S OWN DRIVERS' ROUTES ARE NEVER RELAYED (owner decision
 // 2026-11-02, "no lower-level bypass"): the evaluator credential for THIS
@@ -81,6 +83,36 @@ inline bool is_id(const std::string& s) {
     return true;
 }
 
+/** 1 to 9999, no leading zero: where an invoice's lines continue (the
+ *  `next_offset` the service gave; VIRULE_BACKEND src/payments/contractor_routes.ts). */
+inline bool is_line_offset(const std::string& s) {
+    if (s.empty() || s.size() > 4 || s[0] == '0') return false;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+/** THE EVALUATOR'S CONTRACTOR PAYMENTS (owner brief 2026-11-06): their own
+ *  earnings, invoices and payments, the invoice document, and the explicit
+ *  approval and submission of one invoice version. `rest` is the path's
+ *  segments after "payments". Nothing here can write an amount or a line:
+ *  the service has no such route. */
+inline bool payments_route_ok(const std::string& method, const std::vector<std::string>& rest) {
+    const size_t n = rest.size();
+    if (method == "GET") {
+        if (n == 0) return true;                                              // the Payments view
+        if (n == 2 && rest[0] == "older") return is_id(rest[1]);              // older invoices
+        if (n >= 2 && rest[0] == "invoices" && is_id(rest[1])) {
+            if (n == 2) return true;                                          // one invoice
+            if (n == 3) return rest[2] == "document" || is_line_offset(rest[2]); // its document; its lines from an offset
+        }
+        return false;
+    }
+    if (method != "POST") return false;
+    return n == 3 && rest[0] == "invoices" && is_id(rest[1]) && rest[2] == "submit";
+}
+
 inline bool admin_route_ok(const std::string& method, const std::string& path) {
     std::vector<std::string> seg;
     for (size_t i = 1; i <= path.size();) {
@@ -94,12 +126,26 @@ inline bool admin_route_ok(const std::string& method, const std::string& path) {
     const bool dev = seg[1] == "evaluations";
     const size_t n = seg.size() - 2;
     const auto at = [&](size_t k) -> const std::string& { return seg[k + 2]; };
-    if (method == "GET") return n == 0;   // the developer view, the evaluator workspace
+    if (!dev && n >= 1 && at(0) == "payments") {
+        return payments_route_ok(method, std::vector<std::string>(seg.begin() + 3, seg.end()));
+    }
+    if (method == "GET") {
+        if (n == 0) return true;   // the developer view, the evaluator workspace
+        // A Stripe Checkout's state (owner brief 2026-11-10): the developer's
+        // VIRULE Desktop reads it while the hosted payment page is open; the
+        // service, never the browser's return, decides that it was paid.
+        return dev && n == 2 && at(0) == "checkouts" && is_id(at(1));
+    }
     if (method != "POST") return false;
     if (dev) {
-        if (n == 1) return at(0) == "purchases" || at(0) == "seen";
+        // A purchase: the simulated settlement (staging) or a Stripe Checkout
+        // the service prices and creates (owner brief 2026-11-10).
+        if (n == 1) return at(0) == "purchases" || at(0) == "checkouts" || at(0) == "seen";
         if (n == 2) return (at(0) == "games" && is_id(at(1))) || (is_id(at(0)) && at(1) == "rating");   // the profile; a rating
-        if (n == 3) return at(0) == "games" && is_id(at(1)) && at(2) == "build";                       // the build record
+        if (n == 3) {
+            if (at(0) == "checkouts" && is_id(at(1)) && at(2) == "cancel") return true;                // stop an unpaid Checkout
+            return at(0) == "games" && is_id(at(1)) && at(2) == "build";                               // the build record
+        }
         return false;
     }
     if (n == 1) return at(0) == "preferences" || at(0) == "support";
@@ -109,8 +155,11 @@ inline bool admin_route_ok(const std::string& method, const std::string& path) {
     // on_resumed; owner decision 2026-11-05: its CURRENT verification decides).
     if (n == 2) return (at(0) == "offers" && at(1) == "open") || (is_id(at(0)) && at(1) == "resume");
     if (n == 3) {
-        // The evaluator's OK of the one-time security end notice (2026-11-05).
+        // The evaluator's OK of the one-time security end notice (2026-11-05),
+        // and of the one-time notice of an evaluation a financial hold on its
+        // developer ended (owner brief 2026-11-10).
         if (is_id(at(0)) && at(1) == "security" && at(2) == "seen") return true;
+        if (is_id(at(0)) && at(1) == "ended" && at(2) == "seen") return true;
         return at(0) == "offers" && is_id(at(1)) &&
                (at(2) == "close" || at(2) == "accept" || at(2) == "reject" || at(2) == "decline");
     }
@@ -144,7 +193,9 @@ inline Request parse(const std::string& message) {
  *  the PARSED request, which is exactly what api_call would send, so no
  *  spelling of the message reaches the purchase without being recognized. */
 inline bool is_purchase(const Request& r) {
-    return r.ok && r.method == "POST" && r.path == "/v1/evaluations/purchases";
+    // A Stripe Checkout's creation is a purchase too (owner brief 2026-11-10):
+    // the same readiness gate decides it before anything is sent.
+    return r.ok && r.method == "POST" && (r.path == "/v1/evaluations/purchases" || r.path == "/v1/evaluations/checkouts");
 }
 
 /** POST /v1/assignments/<id>/resume: the assignment id, else "". */

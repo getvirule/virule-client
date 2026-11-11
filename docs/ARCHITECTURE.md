@@ -313,7 +313,21 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
     GET `/v1/evaluations` and `/v1/assignments`; POST `purchases`, `seen`,
     `games/<id>`, `games/<id>/build`, `<id>/rating`; POST `preferences`,
     `support`, `offers/open`, `offers/<id>/{close,accept,reject,decline}`
-    (ids 32 lowercase hex). The routes of the Client's own drivers
+    (ids 32 lowercase hex); and THE EVALUATOR'S CONTRACTOR PAYMENTS (owner
+    brief 2026-11-06, VIRULE_BACKEND `docs/PAYMENTS.md`; `payments_route_ok`,
+    Client 0.9.28, BUILT, NOT YET RELEASED): GET `payments`,
+    `payments/older/<id>`, `payments/invoices/<id>`, `payments/invoices/<id>/document`,
+    `payments/invoices/<id>/<line offset 1..9999>`, and POST
+    `payments/invoices/<id>/submit`, nothing else (no route of the service
+    takes an amount). VIRULE Desktop's Payments needs a Client with it.
+    SINCE 0.9.28 (owner brief 2026-11-10, VIRULE_BACKEND `docs/FINANCE.md`;
+    built, not released): the developer's STRIPE CHECKOUT, POST `checkouts`,
+    GET `checkouts/<id>`, POST `checkouts/<id>/cancel` (`is_purchase` counts
+    the Checkout's creation as a purchase, so the same purchase readiness
+    decides it before anything is sent; no Stripe secret or key ever reaches
+    the Client, which only relays the service's answer with the hosted page's
+    address), and the evaluator's acknowledgement of a financial end, POST
+    `<a>/ended/seen`. VIRULE Desktop requires 0.9.28 (its minimum Client). The routes of the Client's own drivers
     (`credential`, `<a>/runtime`, both `security/incident`, `<a>/download`
     and its `complete`/`failed`, `games/<id>/uploads`, `uploads/*`,
     `<a>/evidence/*`, `<a>/progress`, `early-completion`, `report`, `art`,
@@ -1724,7 +1738,19 @@ never a re-download. A detection: the staging folder and the package go,
 `security_held` (retry and Install again refuse that revision here),
 `/download/<id>/failed` with reason `security`, and the incident is kept on
 the job. The service's 409 `security_hold` at `/complete` also fails the job
-for good. A job in `scanning` that was interrupted extracts and scans again.
+for good. SINCE 0.9.28 a 409 `financial_hold` (owner brief 2026-11-10: the
+game's developer is under a financial hold) is the SAME FINAL REFUSAL at
+every one of these boundaries (`security_marks::is_hold_refusal`: the
+download's authorize and `/complete`, the launch chain's ticket, the
+pre-Play ticket): never retried, the service's sentence stated, the
+installed folder and the evaluator's files untouched. A running game is
+closed by the runtime answer's `security_hold`, which the service also sets
+while a financial hold pauses the assignment (`financial_hold: true` beside
+it). The Client records the CAUSE beside the shared hold marker
+(`security_marks::kFinancial`, set from a `financial_hold` ticket refusal or
+a runtime answer saying `financial_hold` with no `security_review`), so a
+later local Play refusal states `This evaluation is paused.` (working
+wording, PENDING OWNER REVIEW), never the security sentence. A job in `scanning` that was interrupted extracts and scans again.
 
 THE INSTALLED CONTENT IS VERIFIED BEFORE EVERY PLAY (`verify_installed`):
 the folder is compared with the record; new or changed files (the game's
@@ -1938,7 +1964,9 @@ computer's Ed25519 identity (`dev_machine.cred`), the QA link's convention
 BEFORE EVERY PLAY (`src/client/launcher.hpp`, its header): (1) the
 service's current word, the ticket GET bounded at 2 s per step and 3 s to
 answer, inside the Admin host's 30 s wait for `game_launch` (`main.cpp`
-`prelaunch_service_check`): 409 `security_hold` refuses
+`prelaunch_service_check`): 409 `security_hold` (and, since 0.9.28,
+409 `financial_hold`: a FINANCIAL HOLD on the game's developer, owner brief
+2026-11-10; both read by `security_marks::is_hold_refusal`) refuses
 Play and sets the hold marker, 200 clears it, no answer refuses with
 `Couldn't reach our servers right now.`, any other refusal states the
 service's sentence; signed out the Client cannot ask and the wrapper's

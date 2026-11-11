@@ -272,7 +272,9 @@ public:
                         // SECURITY (2026-10-30, client/security_marks.hpp): the
                         // service's hold and protection, kept until it says otherwise.
                         if (!security_marks::set(cfg_.root, t.assignment_id, security_marks::kHold, security_marks::says(a.body, "security_hold")) ||
-                            !security_marks::set(cfg_.root, t.assignment_id, security_marks::kProtected, security_marks::says(a.body, "security_protected"))) {
+                            !security_marks::set(cfg_.root, t.assignment_id, security_marks::kProtected, security_marks::says(a.body, "security_protected")) ||
+                            !security_marks::set(cfg_.root, t.assignment_id, security_marks::kFinancial,
+                                security_marks::says(a.body, "financial_hold") && a.body.find("\"security_review\":") == std::string::npos)) {
                             say("runtime report: " + t.assignment_id + " security state could not be recorded");
                         }
                         // A SECURITY REVIEW BEGAN while the game runs (owner

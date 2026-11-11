@@ -36,6 +36,10 @@ namespace ev = virule::core::evaluation_evidence;
 
 inline constexpr const wchar_t* kHold = L"security_hold";
 inline constexpr const wchar_t* kProtected = L"security_protected";
+// The hold's cause is FINANCIAL (owner brief 2026-11-10): set beside kHold
+// while the service says `financial_hold`, so a local refusal never states
+// a security sentence for a developer's chargeback.
+inline constexpr const wchar_t* kFinancial = L"financial_hold";
 
 inline fs::path dir_of(const fs::path& root, const std::string& assignment_id) {
     return root / L"evaluator" / L"assignments" / fs::path(std::wstring(assignment_id.begin(), assignment_id.end()));
@@ -61,6 +65,14 @@ inline bool set(const fs::path& root, const std::string& assignment_id, const wc
 /** The answer's `"<key>":true`. */
 inline bool says(const std::string& body, const char* key) {
     return body.find(std::string("\"") + key + "\":true") != std::string::npos;
+}
+
+/** A refusal that holds the game until the service lifts it, never a retry:
+ *  a security hold, or a FINANCIAL HOLD on its developer's account (owner
+ *  brief 2026-11-10; VIRULE_BACKEND src/finance/holds.ts). Both keep the
+ *  hold marker; neither deletes anything. */
+inline bool is_hold_refusal(const std::string& code) {
+    return code == "security_hold" || code == "financial_hold";
 }
 
 // A RE-VERIFICATION PENDING after a Resume (client/transfers.hpp
