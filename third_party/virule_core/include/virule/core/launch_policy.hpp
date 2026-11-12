@@ -425,7 +425,8 @@ inline std::string press_revoke_message(const std::string& build_uuid,
 // LIVE EMBARGO SCHEDULE (2026-08-27). Two distinct signed grammars:
 //
 // 1. The DEVELOPER PROOF the Admin signs to set (or clear, with empty
-//    unlock) the game-scoped online schedule. Fixed field count, so empty
+//    unlock) the online schedule of the builds pinned to this key (per
+//    game AND key since the audit C-1 fix, 2026-11-11). Fixed field count, so empty
 //    instants stay unambiguous. Same trust anchor as the other developer
 //    proofs: the key pinned to a registered build of the game.
 inline std::string press_schedule_message(const std::string& build_uuid,
@@ -436,17 +437,41 @@ inline std::string press_schedule_message(const std::string& build_uuid,
          + "|" + timestamp_utc;
 }
 
-// 2. The SERVICE-SIGNED schedule document runtimes verify against
-//    kViruleEmbargoPublicKeyHex before caching or using it, so a forged or
-//    edited local cache can never move a date. GAME-scoped: every build of
-//    the game shares one schedule. press_access_utc may be empty (no press
-//    window in the override).
+// 2. The SERVICE-SIGNED, GAME-scoped schedule document (`schedule_signature`).
+//    It names the game only, so a document the service signed for ANY build
+//    of the game verifies for every build of it (the known residual of the
+//    shipped wrappers, VIRULE_BACKEND/docs/PRESS_EMBARGO.md "Live embargo
+//    schedule"). The current wrapper never CACHES it: it persists only the
+//    build-bound grammar 3 below, and verifies this one only for an answer
+//    from a service that predates grammar 3 (no `schedule_build_signature`
+//    field), whose schedule it then uses for display in that run only,
+//    never for the trusted-time fallback (access_gate.hpp
+//    schedule_online_action AdoptForRun, HeldSchedule).
+//    press_access_utc may be empty (no press window in the override).
 inline std::string embargo_schedule_message(const std::string& game_uuid,
                                             const std::string& unlock_utc,
                                             const std::string& press_access_utc,
                                             const std::string& updated_utc) {
     return "virule-embargo-schedule.v1|" + game_uuid + "|" + unlock_utc + "|" + press_access_utc
          + "|" + updated_utc;
+}
+
+// 3. The SERVICE-SIGNED, BUILD-BOUND schedule document
+//    (`schedule_build_signature`, the audit C-1 fix, 2026-11-11): the same
+//    instants signed for the PRESENTING build, verified against
+//    kViruleEmbargoPublicKeyHex for the wrapper's OWN game_uuid AND
+//    build_uuid before it is used or cached, so a document the service
+//    signed for any other build (a stranger's build of the same game
+//    included) never verifies here. VIRULE_BACKEND/docs/PRESS_EMBARGO.md
+//    "Live embargo schedule", BUILD-BOUND SIGNATURE.
+//    press_access_utc may be empty (no press window in the override).
+inline std::string embargo_schedule_build_message(const std::string& game_uuid,
+                                                  const std::string& build_uuid,
+                                                  const std::string& unlock_utc,
+                                                  const std::string& press_access_utc,
+                                                  const std::string& updated_utc) {
+    return "virule-embargo-schedule.v2|" + game_uuid + "|" + build_uuid + "|" + unlock_utc + "|"
+         + press_access_utc + "|" + updated_utc;
 }
 
 // The right certificate message for a build: v2 when it carries a press
