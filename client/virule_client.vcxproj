@@ -45,6 +45,16 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>false</GenerateDebugInformation>
+      <!-- DLL search order (audit L-24, 2026-11-11). Every system DLL this
+           exe imports that is NOT a KnownDLL is delay-loaded, so the loader
+           never resolves it at process start from the exe's own directory
+           (a %TEMP% helper copy, src\client\self_update.hpp and
+           src\shared\uninstall.hpp). They load on first call, after
+           wWinMain's SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32),
+           from System32 only. Function imports only, all present on the
+           Windows 10 floor. A newly imported non-KnownDLL belongs here. -->
+      <AdditionalDependencies>delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>bcrypt.dll;crypt32.dll;wintrust.dll;version.dll;wevtapi.dll;winhttp.dll;iphlpapi.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>

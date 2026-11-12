@@ -223,6 +223,12 @@ int run() {
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // DLL search order (audit L-24, 2026-11-11), the Client's rule kept here
+    // too: every later load by name resolves from System32 only, never from
+    // this executable's directory or the current directory. The Service
+    // imports only KnownDLLs and loads no library by name.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+
     // Own the working directory: never hold a handle on a directory someone
     // else may rename (the client's 2026-09-04 lesson, kept here too).
     {

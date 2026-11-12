@@ -448,17 +448,25 @@ inline void remove_registrations(const std::wstring& installed_exe) {
 inline void schedule_self_delete() {
     wchar_t self[MAX_PATH] = {};
     if (!GetModuleFileNameW(nullptr, self, MAX_PATH)) return;
-    std::wstring cmd = L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /f /q \"";
+    // Full System32 paths for cmd.exe and ping.exe: this helper runs from the
+    // %TEMP% root, where a bare name would find a planted binary first (audit
+    // L-24, the search-order hardening).
+    wchar_t sys[MAX_PATH] = {};
+    const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    const std::wstring sysdir(sys, n);
+    const std::wstring cmd_exe = sysdir + L"\\cmd.exe";
+    std::wstring cmd = L"\"" + cmd_exe + L"\" /c \"\"" + sysdir + L"\\PING.EXE\" -n 3 127.0.0.1 >nul & del /f /q \"";
     cmd += self;
-    cmd += L"\"";
+    cmd += L"\"\"";
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi{};
     std::wstring mutable_cmd = cmd;
-    if (CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessW(cmd_exe.c_str(), mutable_cmd.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, sysdir.c_str(), &si, &pi)) {
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }

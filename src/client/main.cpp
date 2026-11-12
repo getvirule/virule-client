@@ -1510,6 +1510,18 @@ void serve(const std::string& initial_qa_token, bool register_protocol,
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    // DLL SEARCH ORDER (audit L-24, 2026-11-11), FIRST, before anything can
+    // load a library: every later load by name resolves from System32 only,
+    // never from this executable's directory or the current directory. The
+    // replacement and uninstall helpers run as copies of this exe from the
+    // %TEMP% root (self_update.hpp begin_swap, uninstall.hpp
+    // spawn_uninstall_helper), a directory anything running as the user can
+    // write. The Client ships no DLL of its own and loads none by name; the
+    // system DLLs outside KnownDLLs that it imports are delay-loaded
+    // (client\virule_client.vcxproj DelayLoadDLLs), so they too are resolved
+    // here, after this call, and only from System32.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+
     // OWN THE WORKING DIRECTORY (the 2026-09-04 update-loop root cause).
     // A client started by another process INHERITS that process's current
     // directory; the managed virule.exe runs with the Admin install dir as
