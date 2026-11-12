@@ -343,13 +343,13 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
     `support`, `offers/open`, `offers/<id>/{close,accept,reject,decline}`
     (ids 32 lowercase hex); and THE EVALUATOR'S CONTRACTOR PAYMENTS (owner
     brief 2026-11-06, VIRULE_BACKEND `docs/PAYMENTS.md`; `payments_route_ok`,
-    Client 0.9.28, BUILT, NOT YET RELEASED): GET `payments`,
+    Client 0.9.28; on staging, not in production): GET `payments`,
     `payments/older/<id>`, `payments/invoices/<id>`, `payments/invoices/<id>/document`,
     `payments/invoices/<id>/<line offset 1..9999>`, and POST
     `payments/invoices/<id>/submit`, nothing else (no route of the service
     takes an amount). VIRULE Desktop's Payments needs a Client with it.
     SINCE 0.9.28 (owner brief 2026-11-10, VIRULE_BACKEND `docs/FINANCE.md`;
-    built, not released): the developer's STRIPE CHECKOUT, POST `checkouts`,
+    on staging, not in production): the developer's STRIPE CHECKOUT, POST `checkouts`,
     GET `checkouts/<id>`, POST `checkouts/<id>/cancel` (`is_purchase` counts
     the Checkout's creation as a purchase, so the same purchase readiness
     decides it before anything is sent; no Stripe secret or key ever reaches
