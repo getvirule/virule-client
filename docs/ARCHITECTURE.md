@@ -110,7 +110,7 @@ request). The origin check defends against the WEB, not against local
 code: any local program running as this Windows user can reach the control
 messages.
 
-User policy (audit H-3, 2026-11-11; Client source after 0.9.28): every
+User policy (audit H-3, 2026-11-11; Client 0.9.29, staging): every
 accepted connection is mapped to
 the process on its other end (`GetExtendedTcpTable`, the mirrored 4-tuple)
 and refused before a byte is read unless that process's token user SID is
@@ -124,6 +124,16 @@ listener it reaches the same way before sending anything. The listener is
 bound with `SO_EXCLUSIVEADDRUSE` and serves at most 128 connections at once
 (beyond that a connection is closed at once). This takes no position on
 whether two Windows users may each run VIRULE on one computer.
+
+DLL SEARCH ORDER (audit L-24, Client 0.9.29, staging): `virule-client.exe`
+and `ViruleService.exe` call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`
+first thing at entry, and the Client delay-loads its system imports that are
+not KnownDLLs (bcrypt, crypt32, wintrust, version, wevtapi, winhttp,
+iphlpapi; `client/virule_client.vcxproj`), so a DLL planted beside the exe
+(the Downloads folder, the `%TEMP%` helper copies) is never loaded. The
+`%TEMP%` uninstall helper starts `cmd.exe` and `ping.exe` by their full
+System32 paths. The permanent signed Setup is unchanged; manifest signing and
+a downgrade floor remain open (owner).
 
 LOCAL CALLERS VERSUS OPERATION AUTHORIZATION (owner decision 2026-11-02,
 `VIRULE/docs/specs/evaluation-security.md` decision 16). Reaching the
