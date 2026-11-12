@@ -35,6 +35,11 @@ those, so a retried transient is not a failure.
 node tools\protocol_routing_test.mjs      # virule:// grammar of BOTH components; fails on divergence
 build\Release\x64\virule-client.exe --no-register   # dev run without touching the machine's virule://
 node tools\bridge_test.mjs                # bridge protocol/security matrix
+tests\environment\run_tests.bat           # compiled as BOTH builds: development origins staging
+                                          # only (audit M-6); development command-line seams
+                                          # (--dev-unsigned, loopback manifest urls, account
+                                          # endpoint) only in staging or a sandboxed run with
+                                          # LOCALAPPDATA redirected (audit L-24); starts NO client
 tests\usage\run_tests.bat                 # usage spool, check-in and update-health units, then the
                                           # check-in end to end against the real service code
                                           # (needs ..\..\VIRULE_BACKEND); starts NO client

@@ -26,8 +26,8 @@
 //     bridge at all. loopback_roundtrip applies the same check to the
 //     listener it reaches before trusting its hello.
 //   - A browser connection always carries an Origin header; only the
-//     virule.app origins (plus the explicit local development origins
-//     below) are accepted, so a foreign website can neither probe nor
+//     virule.app origins (plus, in a staging build only, the explicit
+//     local development origins below) are accepted, so a foreign website can neither probe nor
 //     drive the bridge. A local no-Origin connection is a control
 //     connection: a local process could fake an Origin anyway, so origin
 //     checks defend against the WEB, not against local code. Any local
@@ -222,7 +222,8 @@ constexpr size_t kMaxLocalFrameBytes = 60000;
 
 // Accepted browser origins live in the ONE environment seam
 // (shared/environment.hpp -> virule/core/launch_policy.hpp): this
-// environment's site, plus the explicit local development origins. Never
+// environment's site, plus the explicit local development origins in a
+// staging build only (audit M-6; a production build answers none). Never
 // '*', never a wildcard. The environments' site lists do not overlap, so a
 // production client does not answer the staging site and a staging client
 // does not answer virule.app.

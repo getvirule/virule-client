@@ -102,9 +102,11 @@ this PC + wake). Proof: `v1_mvp_site/tools/permission_state_test.mjs` and
 verified only headed).
 
 Origin policy: browser connections must present one of the explicit
-allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
-listed local development origins, `kDevOrigins` in `src/shared/environment.hpp`); anything
-else is dropped at handshake. A connection with NO Origin header is a
+allowed origins of this build's environment (production `https://virule.app`
+and `https://www.virule.app`; staging its own site), and a STAGING build
+also accepts the listed local development origins (`kDevOrigins` in
+`src/shared/environment.hpp`; a production build accepts none of them since
+audit M-6, 2026-11-12); anything else is dropped at handshake. A connection with NO Origin header is a
 local control connection (second-instance forwarding, Setup's shutdown
 request). The origin check defends against the WEB, not against local
 code: any local program running as this Windows user can reach the control
@@ -396,7 +398,8 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   `/me` answers. It is a menu-offer flag only: confirmed participation is
   the account's `qa_tester` capability and `qa_linked_testers`.
 - Development seam: `--account-endpoint=http(s)://127.0.0.1:<port>` (loopback
-  only) points the service and site at a test server and replaces opening the
+  only; honored only in a staging build or a sandboxed run, Development
+  command-line seams) points the service and site at a test server and replaces opening the
   browser with a `test_authorize_url` in the status. Proof:
   `tools/account_flow_test.mjs` (the real binary, sandboxed, against the real
   service routes). A second seam, `--account-browser=capture`, exists ONLY in
@@ -515,8 +518,9 @@ protect one another:
 - Each restores ONLY the exact managed executable under
   `%LOCALAPPDATA%\Programs\VIRULE\` (`launch_managed` refuses any other
   path), with the client's own fixed development seams and nothing else
-  (`--no-register`, `--dev-unsigned`, and manifest overrides only when they
-  point at the loopback interface). No path, executable or command line is
+  (`--no-register`, and, only where the seams are honored (a staging build
+  or a sandboxed run, Development command-line seams), `--dev-unsigned` and
+  manifest overrides that point at the loopback interface). No path, executable or command line is
   accepted from anywhere; there is no new IPC surface.
 - Both run only AS the managed install (a copy elsewhere exits at once) and
   never under the uninstall latch.
@@ -617,7 +621,25 @@ DEVELOPMENT origins (the vite dev server for the site and `wrangler dev`
 for the QA page, neither of which exists for the Admin). Its
 `origin_allowed()` defers to `launch_policy::is_site_origin()` rather than
 repeating a site URL, so the client's bridge and the Admin's QA bridge can
-never disagree about which pages they answer.
+never disagree about which pages they answer. The development origins are
+accepted by a STAGING build only (audit M-6; the owner brief
+`VIRULE/docs/scratchpads/FINISH_HARDENING_BRIEF_2026-11-12.md` item 3
+directs their removal from production unless a legitimate production
+dependency exists, and none was found in code or authority), because any
+page served on one of those localhost ports would otherwise be treated as virule.app by a production
+client. The gate is compile-time on purpose (any web page can present any
+Origin, so nothing known at run time may widen it). Local site or QA page
+development therefore pairs with a client built with `-Environment
+Staging`; `v1_mvp_site`'s `npm run dev` page still carries production
+constants: the bridge protocol does not depend on them, but that page's
+install flow offers the production Setup and reads the production approved
+Admin version (`src/install/useInstallFlow.tsx`, `src/config.ts`). Proof:
+`tests/environment/run_tests.bat` (the same test compiled as both builds).
+Setup's handoff listener (`src/setup/handoff_listener.hpp`) answers through
+the same function, so the rule is in Setup's SOURCE, but the permanent
+signed Setups (`release/setup`, The canonical Setup) were cut before it and
+keep accepting the development origins on 47613 until the owner re-cuts
+them.
 
 That sharing is the point rather than tidiness: the Admin host's client
 self-heal (`admin_host.cpp`, `client_health`) reads the SAME client-release
@@ -650,8 +672,13 @@ deliberately narrow and structural:
 
 - it lives in ONE constant, `kRequireAuthenticode`;
 - that constant is `true` in every build that does not define
-  `VIRULE_ENV_STAGING`, so a production binary contains no reachable path
-  that skips the signature gates;
+  `VIRULE_ENV_STAGING`, so a production binary's environment never skips
+  the signature gates. The `--dev-unsigned` development seam waives them
+  only where every development seam is honored: a staging build, or a
+  sandboxed run whose `LOCALAPPDATA` is redirected (Development
+  command-line seams, below). Production Setup is the exception: it parses
+  its own `--dev-unsigned` and `--manifest-url=` ungated, and the
+  permanent signed Setups keep that until the owner re-cuts them;
 - a staging build only ever downloads from the staging release repository
   and the staging Worker, neither of which holds a production artifact;
 - the exact-size and exact-SHA-256 gates are NOT relaxed. A staging
@@ -659,8 +686,45 @@ deliberately narrow and structural:
 
 The origin allowlists are environment-scoped rather than merged, and they
 do not overlap: a staging client does not answer virule.app, and a
-production client does not answer the staging site. That is what stops a
-page in one environment from ever driving an install in the other.
+production client does not answer the staging site (nor, since audit M-6,
+the local development origins, which only a staging build accepts).
+That is what stops a page in one environment from ever driving an
+install in the other.
+
+**Development command-line seams** (audit L-24, 2026-11-12; owner brief
+`VIRULE/docs/scratchpads/FINISH_HARDENING_BRIEF_2026-11-12.md` item 2,
+"implement only changes consistent with established authority").
+`src/shared/dev_seams.hpp` is the one rule for the client's test seams:
+`--dev-unsigned`, `--self-manifest-url=`, `--admin-manifest-url=` and
+`--account-endpoint=` are honored, and forwarded by the residency layer
+(`residency::forward_seams`, which is all VIRULE Service parses), ONLY
+where `dev_seams::allowed()` answers true: a staging build, or a run whose
+`LOCALAPPDATA` is redirected away from the real profile
+(`paths::environment_redirected`, which fails to false). The evidence test
+transport (`--evidence-test-endpoint=`) uses the same predicate, and the
+two staging-only harness seams (`--account-browser=capture`,
+`--test-purchase-blocker=`) stay stricter (staging builds only). A
+production build on a real profile ignores every one of them, as it
+ignores any unknown argument; for the four command-line seams it notes the
+count in `virule-client.log` (the evidence transport logs its own line).
+Every production launch of the client (Setup's start, the Run value, the
+`virule://` handler, Apps & Features `--uninstall`, VIRULE Desktop's
+starts, the helpers and the residency restores) inherits the real
+environment and passes no such seam, while every sandboxed harness
+redirects `LOCALAPPDATA` and so keeps driving the production build it
+tests. The manifest urls must be loopback (`127.0.0.1` or `localhost` with
+a port) and the account endpoint `127.0.0.1`, in every build.
+`--no-register` is not gated: it relaxes nothing (it only skips the
+machine registrations) and every harness relies on it. This is a RUN-TIME
+rule on purpose, unlike the compile-time origin rule: a browser or protocol
+launch can carry extra arguments but cannot redirect the environment.
+RESIDUAL, inside the same-user trust model (Origin policy above: the
+bridge defends against the web, not against local code): a process already
+running as this Windows user that starts the client with a redirected
+`LOCALAPPDATA` can still reach the seams. Setup's own seams
+(`src/setup/main.cpp`) are unchanged, so the permanent signed Setups keep
+them ungated until the owner re-cuts both. Proof:
+`tests/environment/run_tests.bat`.
 
 **Staging distribution** uses FIXED tags on `getvirule/virule-staging-releases`
 rather than a `latest` pointer, because that repository also carries the
@@ -862,8 +926,9 @@ release's `manifest.json`, url pinned to that repository's
 `releases/download/` prefix, exact declared size, exact SHA-256 (never
 waived), Authenticode + `CN=Heath Michaels` - re-verified IN FULL by the
 helper immediately before the swap. Dev seams mirror Setup's:
-`--self-manifest-url=` relaxes only the repository pin, `--dev-unsigned`
-waives only the signature gates.
+`--self-manifest-url=` (loopback only) relaxes only the repository pin,
+`--dev-unsigned` waives only the signature gates; both are honored only in a
+staging build or a sandboxed run (Development command-line seams).
 
 CADENCE: one asynchronous check shortly after startup (never blocking the
 bridge) plus a quiet 6-hour recheck while serving; the freshness stamp is
@@ -1359,8 +1424,9 @@ decides which Admin release is approved; the package bytes live on the
 and verified by `helpers/publish_admin.ps1`). The manifest url is pinned
 to that repository's `releases/download/` prefix. Dev seams mirror
 Setup's: `--admin-manifest-url=` points the approved-manifest fetch
-elsewhere and relaxes only the repository pin; `--dev-unsigned` waives
-only the signature gates.
+at a loopback server and relaxes only the repository pin; `--dev-unsigned`
+waives only the signature gates; both are honored only in a staging build
+or a sandboxed run (Development command-line seams).
 
 THE VERIFIED STAGED PIPELINE (install and update are the same path; an
 update never touches the live install file-by-file): fetch manifest ->
@@ -2406,7 +2472,8 @@ TRANSPORTS:
   `pending` and writing stays locked.
 - TEST: loopback HTTP JSON against `--evidence-test-endpoint=http://127.0.0.1:<port>/<path>`,
   honored ONLY in a staging build or while `paths::environment_redirected()`
-  is true, and only for a `127.0.0.1`/`localhost` url; otherwise it is
+  is true (the client's one development-seam predicate,
+  `src/shared/dev_seams.hpp`), and only for a `127.0.0.1`/`localhost` url; otherwise it is
   ignored with a log line. Every receipt it produces carries
   `simulated: true`. Wire: `POST <endpoint>/packages/<id>` registers
   `{v:1, package_id, assignment_id, files:[{file, sha256, bytes}]}`; then

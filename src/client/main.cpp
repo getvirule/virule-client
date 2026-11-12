@@ -68,6 +68,7 @@
 #include "client/game_art.hpp"
 #include "client/uninstall_dialog.hpp"
 #include "shared/client_state.hpp"
+#include "shared/dev_seams.hpp"
 #include "shared/environment.hpp"
 #include "shared/evidence_queue.hpp"
 #include "client/evaluation_inbox.hpp"
@@ -1560,19 +1561,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // The development seams this run carries, in the only form residency
     // ever forwards (loopback manifest urls only; residency.hpp).
     const std::wstring residency_seams = vclient::residency::forward_seams(argc, argv);
+    // THE DEVELOPMENT SEAMS (audit L-24, 2026-11-12; shared/dev_seams.hpp):
+    // --dev-unsigned, the two loopback manifest urls and the account
+    // endpoint are honored only in a staging build or a sandboxed run. A
+    // production run on a real profile ignores them as it ignores any
+    // unknown argument; the diagnostic log notes it.
+    const vclient::dev_seams::Seams dev = vclient::dev_seams::parse(argc, argv, vclient::dev_seams::allowed());
+    dev_unsigned = dev.dev_unsigned;
+    self_manifest_url = dev.self_manifest_url;
+    admin_manifest_url = dev.admin_manifest_url;
+    if (!dev.account_endpoint.empty()) vclient::account::set_endpoint_override(dev.account_endpoint);
     for (int i = 1; i < argc; ++i) {
         const std::wstring arg = argv[i];
         if (arg == L"--no-register") no_register = true;
         if (arg == L"--delete-data") delete_data_arg = true;
-        if (arg == L"--dev-unsigned") dev_unsigned = true;
         if (arg == L"--restarted") restarted = true;
         if (arg == L"--restored") restored = true;
-        if (arg.rfind(L"--self-manifest-url=", 0) == 0) {
-            self_manifest_url = arg.substr(20);
-        }
-        if (arg.rfind(L"--admin-manifest-url=", 0) == 0) {
-            admin_manifest_url = arg.substr(21);
-        }
         if (arg.rfind(L"--evidence-test-endpoint=", 0) == 0) {
             g_evidence_test_endpoint = arg.substr(25);
         }
@@ -1588,16 +1592,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             for (const wchar_t c : arg.substr(24)) name += static_cast<char>(c < 0x80 ? c : '?');
             vclient::purchase_readiness::forced_blocker() = vclient::purchase_readiness::blocker_of(name);
         }
-        // Development seam for the account service (tools/account_flow_test.mjs):
-        // LOOPBACK ONLY, so no argument can point a real sign-in elsewhere.
-        if (arg.rfind(L"--account-endpoint=", 0) == 0) {
-            const std::wstring v = arg.substr(19);
-            if (v.rfind(L"http://127.0.0.1:", 0) == 0 || v.rfind(L"https://127.0.0.1:", 0) == 0) {
-                vclient::account::set_endpoint_override(v);
-            }
-        }
+        // The account service seam (tools/account_flow_test.mjs) is parsed
+        // with the other development seams above: 127.0.0.1 ONLY, so no
+        // argument can point a real sign-in elsewhere.
     }
     LocalFree(argv);
+    if (dev.ignored > 0) {
+        vclient::log::client("client: " + std::to_string(dev.ignored) +
+                             " development argument(s) ignored (not honored in this run, or not loopback)");
+    }
     if (arg1 == L"--no-register" || arg1 == L"--dev-unsigned" ||
         arg1 == L"--restarted" || arg1 == L"--restored" ||
         arg1.rfind(L"--self-manifest-url=", 0) == 0 ||

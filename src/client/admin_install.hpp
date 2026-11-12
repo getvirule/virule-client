@@ -133,7 +133,8 @@ constexpr bool kRequireAuthenticode = env::kRequireAuthenticode;
 // at a local server, relaxing ONLY the host and the package-repository
 // pin. Grammar, exact size and the exact-hash gate hold exactly as in
 // production. Both are inert in a normal install (never set by anything
-// but an explicit command line).
+// but an explicit command line, and honored only in a staging build or a
+// sandboxed run: shared/dev_seams.hpp, audit L-24).
 inline bool g_dev_unsigned = false;
 inline std::wstring g_manifest_override; // empty = production virule.app
 

@@ -51,8 +51,10 @@
 // "target_version","sha256","size","failed_utc"}. Removed on success and
 // by discard; reconciled deterministically at every client startup.
 //
-// Development seams (tests only; production runs take neither):
-//   --self-manifest-url=   fetch the release manifest elsewhere; relaxes
+// Development seams (tests only; honored only in a staging build or a
+// sandboxed run, shared/dev_seams.hpp, audit L-24):
+//   --self-manifest-url=   fetch the release manifest from a loopback
+//                          server; relaxes
 //                          ONLY the repository url pin, never the grammar
 //                          and never the hash gate
 //   --dev-unsigned         waives ONLY the signature gates (the exact

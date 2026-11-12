@@ -1,0 +1,131 @@
+#pragma once
+// THE DEVELOPMENT COMMAND-LINE SEAMS (audit L-24, 2026-11-12).
+//
+// The client's test harnesses drive it with a few command-line seams that a
+// production run must never act on:
+//
+//   --dev-unsigned            waives ONLY the signature gates (never the hash)
+//   --self-manifest-url=<u>   the client release manifest from a local server
+//   --admin-manifest-url=<u>  the approved Admin manifest from a local server
+//   --account-endpoint=<u>    the account service at a local test server
+//
+// They are honored ONLY where dev_seams::allowed() answers true: a
+// staging build, or a sandboxed run whose LOCALAPPDATA is redirected
+// (paths::environment_redirected), the gate --evidence-test-endpoint has
+// always had. A production build on a real profile, which is every launch a
+// browser, the protocol handler, Windows or VIRULE Desktop makes (they all
+// inherit the real environment and pass no seam), ignores them exactly as it
+// ignores any unknown argument. The manifest urls must also be loopback
+// (is_loopback_url) and the account endpoint 127.0.0.1, in every build.
+//
+// RESIDUAL, inside the documented same-user trust model (ARCHITECTURE.md,
+// "The origin check defends against the WEB, not against local code"): a
+// process already running as this Windows user that starts the client with a
+// redirected LOCALAPPDATA can still reach them. Setup parses its own two
+// seams (--dev-unsigned, --manifest-url=) in setup/main.cpp, ungated; the
+// permanent signed Setups keep that until the owner re-cuts them.
+//
+// --no-register is NOT gated: it relaxes no gate (it only skips the machine
+// registrations) and every harness, including the unsandboxed bridge_test,
+// relies on it to keep the machine's virule:// untouched.
+
+#include <string>
+
+#include "shared/environment.hpp"
+#include "shared/paths.hpp"
+
+namespace vclient::dev_seams {
+
+// THE ONE PREDICATE for every development test seam of the client: the
+// command-line seams below (also what VIRULE Service forwards) and the
+// evidence test transport (shared/evidence_queue.hpp). True in a staging
+// build, or in a run whose LOCALAPPDATA is redirected away from the real
+// profile (paths::environment_redirected, which fails to false). This is a
+// RUN-TIME rule, unlike the compile-time origin rule in environment.hpp: any
+// web page can present any Origin, but a launch from a browser, the protocol
+// handler, Windows or VIRULE Desktop inherits the real environment, so extra
+// arguments on it can never switch a seam on, while the sandboxed harnesses
+// keep running the production build they test.
+inline constexpr bool permitted(bool staging_build, bool redirected) {
+    return staging_build || redirected;
+}
+inline bool allowed() {
+    return permitted(env::kStaging, paths::environment_redirected());
+}
+
+// A loopback http(s) url: 127.0.0.1 or localhost followed by a port, with no
+// whitespace or quotes (the value becomes one argv element when forwarded).
+inline bool is_loopback_url(const std::wstring& url) {
+    for (const wchar_t* p : { L"http://127.0.0.1:", L"http://localhost:",
+                              L"https://127.0.0.1:", L"https://localhost:" }) {
+        if (url.rfind(p, 0) == 0) {
+            for (const wchar_t c : url) {
+                if (c == L' ' || c == L'"' || c == L'\t') return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// The account service seam's own rule (unchanged): 127.0.0.1 only.
+inline bool is_account_endpoint(const std::wstring& v) {
+    return v.rfind(L"http://127.0.0.1:", 0) == 0 || v.rfind(L"https://127.0.0.1:", 0) == 0;
+}
+
+struct Seams {
+    bool dev_unsigned = false;
+    std::wstring self_manifest_url;
+    std::wstring admin_manifest_url;
+    std::wstring account_endpoint;
+    int ignored = 0; // seams present on the command line and not honored
+};
+
+inline constexpr size_t kSelfLen = 20;    // --self-manifest-url=
+inline constexpr size_t kAdminLen = 21;   // --admin-manifest-url=
+inline constexpr size_t kAccountLen = 19; // --account-endpoint=
+
+// The seams this run honors. `honored` is dev_seams::allowed() at the call
+// sites; a parameter so the rule is testable in either build.
+inline Seams parse(int argc, wchar_t** argv, bool honored) {
+    Seams s;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--dev-unsigned") {
+            if (honored) s.dev_unsigned = true; else ++s.ignored;
+        } else if (a.rfind(L"--self-manifest-url=", 0) == 0) {
+            const std::wstring v = a.substr(kSelfLen);
+            if (honored && is_loopback_url(v)) s.self_manifest_url = v; else ++s.ignored;
+        } else if (a.rfind(L"--admin-manifest-url=", 0) == 0) {
+            const std::wstring v = a.substr(kAdminLen);
+            if (honored && is_loopback_url(v)) s.admin_manifest_url = v; else ++s.ignored;
+        } else if (a.rfind(L"--account-endpoint=", 0) == 0) {
+            const std::wstring v = a.substr(kAccountLen);
+            if (honored && is_account_endpoint(v)) s.account_endpoint = v; else ++s.ignored;
+        }
+    }
+    return s;
+}
+
+// The seams a residency launch carries (client <-> VIRULE Service):
+// --no-register always, the others only where they are honored.
+inline std::wstring forward(int argc, wchar_t** argv, bool honored) {
+    std::wstring out;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--no-register") {
+            out += L" " + a;
+        } else if (!honored) {
+            continue;
+        } else if (a == L"--dev-unsigned") {
+            out += L" " + a;
+        } else if (a.rfind(L"--self-manifest-url=", 0) == 0 && is_loopback_url(a.substr(kSelfLen))) {
+            out += L" " + a;
+        } else if (a.rfind(L"--admin-manifest-url=", 0) == 0 && is_loopback_url(a.substr(kAdminLen))) {
+            out += L" " + a;
+        }
+    }
+    return out;
+}
+
+} // namespace vclient::dev_seams

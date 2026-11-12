@@ -76,6 +76,7 @@
 #include <string>
 #include <vector>
 
+#include "shared/dev_seams.hpp"
 #include "shared/lifecycle_intent.hpp"
 #include "shared/paths.hpp"
 
@@ -318,36 +319,11 @@ inline bool running_as(const std::filesystem::path& managed) {
 // launch, so a sandboxed test world keeps its posture when one peer restores
 // the other. Manifest overrides are forwarded only when they point at the
 // loopback interface (the only place the seams are ever used); anything else
-// is dropped. Production runs carry none of these.
-inline bool is_loopback_url(const std::wstring& url) {
-    for (const wchar_t* p : { L"http://127.0.0.1:", L"http://localhost:",
-                              L"https://127.0.0.1:", L"https://localhost:" }) {
-        if (url.rfind(p, 0) == 0) {
-            // no whitespace or quotes: the value becomes one argv element
-            for (const wchar_t c : url) {
-                if (c == L' ' || c == L'"' || c == L'\t') return false;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
+// is dropped. Since audit L-24 (2026-11-12) every seam but --no-register is
+// forwarded only where it is honored (shared/dev_seams.hpp: a staging build
+// or a sandboxed run), so a production run on a real profile forwards none.
 inline std::wstring forward_seams(int argc, wchar_t** argv) {
-    std::wstring out;
-    for (int i = 1; i < argc; ++i) {
-        const std::wstring a = argv[i];
-        if (a == L"--no-register" || a == L"--dev-unsigned") {
-            out += L" " + a;
-        } else if (a.rfind(L"--self-manifest-url=", 0) == 0 &&
-                   is_loopback_url(a.substr(20))) {
-            out += L" " + a;
-        } else if (a.rfind(L"--admin-manifest-url=", 0) == 0 &&
-                   is_loopback_url(a.substr(21))) {
-            out += L" " + a;
-        }
-    }
-    return out;
+    return dev_seams::forward(argc, argv, dev_seams::allowed());
 }
 
 // Start the managed executable `exe` (and only if it is one of the two

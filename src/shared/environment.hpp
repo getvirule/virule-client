@@ -6,7 +6,7 @@
 // `virule/core/launch_policy.hpp` (vendored into this repo under
 // third_party/), and this header only re-exports those constants under the
 // names the client's call sites use, plus the ONE thing that is genuinely
-// client-specific: the local development origins.
+// client-specific: the local development origins (staging builds only).
 //
 // It exists so that a client call site reads `env::kAdminManifestHost`
 // rather than reaching into launch_policy for a value that means something
@@ -61,6 +61,18 @@ inline constexpr const wchar_t* kExpectedSigner = lp::kExpectedSignerW;
 // the site and wrangler dev for the QA page both talk to a locally built
 // client, and neither exists for the Admin.
 //
+// THE DEVELOPMENT ORIGINS ARE ACCEPTED BY A STAGING BUILD ONLY (audit M-6,
+// 2026-11-12). A production build answers its own site's origins and
+// nothing else: any page served on one of those localhost ports (any local
+// dev server) would otherwise be treated as virule.app. Local site or QA
+// page development therefore pairs with a client built with
+// `helpers\build.ps1 -Environment Staging`. This is a COMPILE-TIME rule on
+// purpose: any web page can present any Origin, so nothing known at run
+// time may widen it. Setup's handoff listener shares this function
+// (setup/handoff_listener.hpp), so the rule reaches Setup's source; the
+// permanent signed Setups (release/setup) keep the older answer until the
+// owner re-cuts them.
+//
 // The site origins are deliberately NOT repeated here. Never '*', never a
 // wildcard. The two environments' site lists do not overlap, so a production
 // client does not answer the staging site and a staging client does not
@@ -76,10 +88,15 @@ inline constexpr const char* kDevOrigins[] = {
 
 inline bool origin_allowed(const std::string& origin) {
     if (lp::is_site_origin(origin)) return true;
-    for (const char* dev : kDevOrigins) {
-        if (origin == dev) return true;
+    if constexpr (kStaging) {
+        for (const char* dev : kDevOrigins) {
+            if (origin == dev) return true;
+        }
     }
     return false;
 }
+
+// The development TEST SEAMS (command line and evidence transport) are a
+// different, RUN-TIME rule: shared/dev_seams.hpp.
 
 } // namespace vclient::env

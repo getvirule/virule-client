@@ -11,7 +11,9 @@
 // CLOSED, VERSIONED, TEMPORARY:
 //   - 127.0.0.1:47613 only, path /handoff, alive only while Setup runs;
 //   - browser pages ONLY: a connection must present one of the explicit
-//     allowed virule.app / development origins (bridge.hpp's list). A
+//     allowed site origins of this build, plus the development origins in
+//     a staging build only (environment.hpp origin_allowed, audit M-6;
+//     the permanent signed Setups predate that rule). A
 //     connection with no Origin is dropped: local processes have no
 //     business handing Setup intent.
 //   - hello {"virule_setup":1,"v":1} so the page knows it reached Setup;

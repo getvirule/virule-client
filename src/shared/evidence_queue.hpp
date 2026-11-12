@@ -75,6 +75,7 @@
 #include <system_error>
 #include <vector>
 
+#include "shared/dev_seams.hpp"
 #include "shared/http_client.hpp"
 #include "virule/core/evaluation_evidence.hpp"
 
@@ -595,9 +596,10 @@ private:
 
 // The test endpoint is honored ONLY in a staging build or a sandbox whose
 // LOCALAPPDATA is redirected (paths::environment_redirected). A production
-// build on a real profile ignores it.
+// build on a real profile ignores it. The rule is the client's one
+// development-seam predicate (shared/dev_seams.hpp, audit L-24).
 inline bool test_endpoint_permitted(bool staging_build, bool redirected) {
-    return staging_build || redirected;
+    return dev_seams::permitted(staging_build, redirected);
 }
 
 // A loopback http(s) url: 127.0.0.1 or localhost, nothing else.
