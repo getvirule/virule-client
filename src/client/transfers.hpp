@@ -1099,7 +1099,7 @@ inline bool verify_package(const DriverConfig& cfg, ed::Job& j) {
         fi::add_package(idx, written);
         r = removal_of(seen, j.launch_exe, "The game's launch file was removed by the antivirus while the package was verified.");
     } else {
-        const ms::Extracted x = ms::extract_wrapped_originals(scratch, originals, keep);
+        const ms::Extracted x = ms::extract_wrapped_originals(scratch, originals, keep, path_of(j.launch_exe));
         fi::add_package(idx, written);
         fi::add_originals(idx, x.originals, scratch);
         if (!x.ok) {
@@ -1431,8 +1431,17 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
         if (vd::read_record(vd::record_path(cfg.root, j.id), digests)) fi::add_installed(idx, digests, revision, dir, u.now);
     }
     ms::Result r;
-    if (whole) {
-        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+    // THE LAUNCH FILE MUST BE THE WRAPPER (audit 2026-11-11 H-2): every
+    // extraction below names it, so a launch file that is not a wrapper the
+    // shared locator reads, or is missing, fails closed. A name that is not
+    // one bare .exe (an empty or damaged record) would switch that check off
+    // and hide a changed launch file from plan_scan, so nothing of such a job
+    // is ever verified.
+    if (!launch_name::is_safe(j.launch_exe)) {
+        r.outcome = ms::Outcome::error;
+        r.detail = "The game's launch file name is not valid.";
+    } else if (whole) {
+        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going, path_of(j.launch_exe));
         fi::add_originals(idx, x.originals, dir);
         if (!x.ok) {
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
@@ -1441,7 +1450,7 @@ inline void verify_installed(const DriverConfig& cfg, ed::Job& j) {
             r = run_scan(cfg, {dir, scan_dir}, since, keep_going);
         }
     } else if (plan.launch_changed) {
-        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going);
+        const ms::Extracted x = ms::extract_wrapped_originals(dir, scan_dir, keep_going, path_of(j.launch_exe));
         fi::add_originals(idx, x.originals, dir);
         if (!x.ok) {
             if (x.blocked) r = ms::removed_by_antivirus(j.launch_exe, x.why);
@@ -1679,7 +1688,7 @@ inline void run_install(const DriverConfig& cfg, ed::Job& j, const std::string& 
             (void)vc::inventory(staging, delivered);
             const fs::path scan_dir = path_of(j.install_root) / L".virule-staging" / (dst.filename().wstring() + L".scan");
             fs::remove_all(scan_dir, ec);
-            const ms::Extracted x = ms::extract_wrapped_originals(staging, scan_dir, [&]() { return !stopping(cfg); });
+            const ms::Extracted x = ms::extract_wrapped_originals(staging, scan_dir, [&]() { return !stopping(cfg); }, path_of(j.launch_exe));
             // WHAT THIS CLIENT WROTE, with the digests it computed while it
             // wrote them, as it stands right before the scan.
             fi::Index idx = extracted_index();

@@ -103,7 +103,7 @@ verified only headed).
 
 Origin policy: browser connections must present one of the explicit
 allowed origins (`https://virule.app`, `https://www.virule.app`, plus the
-listed local development origins in `src/client/bridge.hpp`); anything
+listed local development origins, `kDevOrigins` in `src/shared/environment.hpp`); anything
 else is dropped at handshake. A connection with NO Origin header is a
 local control connection (second-instance forwarding, Setup's shutdown
 request). The origin check defends against the WEB, not against local
@@ -1740,7 +1740,21 @@ malware_scan.hpp "WHICH DEFENDER STATES SCAN"; the policy
 THE INSTALL (`src/client/transfers.hpp` `run_install`): after the
 package's SHA-256 and extraction into `.virule-staging`, `scanning` copies
 the wrapper's original executable out (never run) and scans it with every
-extracted file; only `clean` goes on. For an update the evaluator's own
+extracted file; only `clean` goes on. THE LAUNCH FILE MUST BE THE WRAPPER
+(the owner's audit remediation campaign of 2026-11-11, applying the audit's
+H-2 fix "or when `launch_exe` does not parse as a wrapper",
+`VIRULE/docs/reviews/COMPREHENSIVE_AUDIT_2026-11-11.md`; Client source after
+0.9.28): every Client call of
+`extract_wrapped_originals` (this scan, `verify_package` and both
+extracting branches of `verify_installed`) names the job's `launch_exe`, so
+a launch file that is not a wrapper the shared locator
+(`virule/core/wrapper_payload.hpp`) reads fails the extraction before any
+scan (outcome `error`: a refusal, never an incident or a hold). A MISSING
+launch file at the install and at the developer's verification is the
+earlier existence check (a failure, or the antivirus removal path when
+Defender took it); only the pre-Play check reaches the extractor's own
+"not found" refusal. An ordinary `.exe` beside the wrapper (a helper, a
+redistributable) still scans as itself. For an update the evaluator's own
 files are then carried over. BEFORE ANYTHING IS PLACED the launch chain is
 asked for (`ensure_launch_chain`, the ticket GET): a 409 `security_hold`
 fails the job for good with the service's sentence, the package and the
@@ -1775,7 +1789,10 @@ the folder is compared with the record; new or changed files (the game's
 saves, the wrapper's log, an executable it left behind) are scanned, and
 ONLY those (`verified_content.hpp` `plan_scan`: a new folder of only new
 files is one target; the wrapper's original is copied out only when the
-launch file changed); unchanged content is never scanned again, and the
+launch file changed, and then the launch file must still be a wrapper:
+a launch file replaced by a plain one is refused, never taken into the
+record, and a job whose `launch_exe` is not one bare `.exe` name is never
+verified); unchanged content is never scanned again, and the
 whole folder only when no record of the installed revision exists (an
 update, a replacement build, content installed before scanning existed)
 (owner decisions 2026-10-30, "Scan cadence"); clean takes them into
@@ -1908,7 +1925,8 @@ host's statement that it built a package, nothing more.
   (the 20 GB cap), checks free space for one more copy, extracts it with the
   install's zip-slip-guarded extractor into `<package>.verify` beside it,
   copies the wrapper's original executable into `<package>.verify-originals`
-  (`extract_wrapped_originals`, never run), and scans the package, the
+  (`extract_wrapped_originals`, never run; the launch file must be that
+  wrapper, or the job fails before any scan, as at the install), and scans the package, the
   extraction and the originals (`malware_scan.hpp`, the one engine and
   policy). Both scratch folders are always removed.
 - THE RECORD: clean, with the package still the size and last write time it
@@ -1937,8 +1955,19 @@ host's statement that it built a package, nothing more.
   a job file, a forged record, the healthy path with wrong host figures,
   bytes changed after verification with the write time put back, a restart
   without the record, held uploads changed and unchanged, another build
-  under the same job, a host-reported detection established or not) and
-  `test_upload_gate_real_defender` (this computer's real scanner).
+  under the same job, a host-reported detection established or not),
+  `test_upload_gate_real_defender` (this computer's real scanner) and
+  `test_launch_file_must_be_wrapper` (the extractor: a plain, mismatched,
+  missing and malformed launch file refused, a plain helper beside the
+  wrapper still passing; `verify_package` and `run_install`: plain,
+  mismatched and malformed refused, and a missing one failed by the
+  earlier existence check; `verify_installed`: plain on a first verification, a
+  launch file replaced by a plain one after verification, an empty launch
+  file name). In `tests/transfers` and `tools/transfer_test.mjs`, every
+  package and installed game a test expects to verify, install or pass the
+  pre-Play check has a `Game.exe` that is a real VRULPK1 wrapper built byte
+  by byte in the test (`wrapped_game` in `transfers_tests.cpp`, the
+  harness's own `wrapper` in `transfer_test.mjs`); no binary is shipped.
 - LIMIT: the Client and the Admin are the same Windows user; a program
   running as that user could read the DPAPI-protected key or change the
   package between the read and the extraction and back (accepted MVP

@@ -411,7 +411,10 @@ try {
   await sleep(1100); // a later creation second than the held job's
   const [JR2] = (await run("package", VROOT, GR, "2600")).split(" ");
   await release();
-  done = await waitFor(() => readJob(JR2)?.state === "done", 20000);
+  // The held job is retired by the pass that RELEASES held jobs, which can
+  // follow the pass that carried the new build (a pass without the release
+  // skips a held job still waiting): wait for both, then check how.
+  done = await waitFor(() => readJob(JR2)?.state === "done" && readJob(JR)?.state === "failed", 20000);
   check("a newer build of the game retires the held job (failed, never carried) and uploads itself",
     !!done && readJob(JR).state === "failed" && readJob(JR).error === "Replaced by a newer build." &&
     requestsFor(new RegExp(`games/${GR}/uploads`)).length === opensR + 1, [readJob(JR), readJob(JR2)?.state]);
@@ -432,9 +435,20 @@ try {
   })();
   // Replace revision J1's bytes with a real archive (built by the C++ unit
   // test's own writer would be circular; a minimal stored zip is written here).
-  const { bytes: zipBytes } = (() => {
+  // Its Game.exe is a REAL VIRULE wrapper (audit 2026-11-11 H-2: the Client
+  // refuses a launch file the shared locator does not read as one): the stub,
+  // a VRULPK1 archive holding the original raw, the 24-byte VRULEND1 footer
+  // (v2_mvp include/virule/core/wrapper_payload.hpp), built byte by byte.
+  const wrapper = (stub, member, original) => {
+    const m = Buffer.from(member);
+    const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v, 0); return b; };
+    const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v), 0); return b; };
+    const payload = Buffer.concat([Buffer.from("VRULPK1\0", "latin1"), u32(1), u32(m.length), m, u64(0), u64(original.length), original]);
+    return Buffer.concat([stub, payload, Buffer.from("VRULEND1"), u64(payload.length), u64(24)]);
+  };
+  const { bytes: zipBytes, exe: zipExe } = (() => {
     const name = Buffer.from("Game.exe");
-    const data = Buffer.from("exe bytes " + "x".repeat(200000));
+    const data = wrapper(Buffer.from("exe bytes " + "x".repeat(200000)), "__virule__/orig/Game.exe", Buffer.from("the original game executable"));
     const crc = (() => { let c = ~0; for (const b of data) { c ^= b; for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xEDB88320 & -(c & 1)); } return ~c >>> 0; })();
     const local = Buffer.alloc(30);
     local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(0, 6); local.writeUInt16LE(0, 8);
@@ -451,7 +465,7 @@ try {
     const cdSize = central.length + name.length;
     end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(0, 4); end.writeUInt16LE(0, 6); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10);
     end.writeUInt32LE(cdSize, 12); end.writeUInt32LE(cdOffset, 16); end.writeUInt16LE(0, 20);
-    return { bytes: Buffer.concat([local, name, data, central, name, end]) };
+    return { bytes: Buffer.concat([local, name, data, central, name, end]), exe: data };
   })();
   packages.set(zipRevision, { bytes: zipBytes, sha: sha256(zipBytes), launch: "Game.exe" });
   assignments.set(A1, { revision: zipRevision, game: GI });
@@ -484,7 +498,7 @@ try {
   };
   const rec1 = recordOf();
   check("the install records what its clean scan verified: the revision and the delivered launch file",
-    !!rec1 && rec1.format === "virule-verified-content.v1" && rec1.revision === zipRevision && rec1.files.get("game.exe")?.size === 200010 &&
+    !!rec1 && rec1.format === "virule-verified-content.v1" && rec1.revision === zipRevision && rec1.files.get("game.exe")?.size === zipExe.length &&
     readJob(JI).scan_revision_id === zipRevision && readJob(JI).scan_outcome === "clean", { rec1, job: readJob(JI) });
   // THE VERIFIED DIGESTS RECORD (owner brief 2026-11-06; verified_digests.hpp):
   // beside verified.txt (which shipped wrappers read, unchanged), the digest

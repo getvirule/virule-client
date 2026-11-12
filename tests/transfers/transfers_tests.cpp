@@ -311,6 +311,41 @@ struct AckService final : tr::Service {
     std::string machine_key() override { return machine; }
 };
 
+static void put32(std::string& s, std::uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); }
+static void put64(std::string& s, std::uint64_t v) { s.append(reinterpret_cast<const char*>(&v), 8); }
+/** A VIRULE wrapper as the Admin builds it: a stub, a VRULPK1 archive holding
+ *  the original executable raw, and the 24-byte VRULEND1 footer. */
+static std::string wrapper_bytes(const std::string& stub, const std::string& member, const std::string& original) {
+    std::string table;
+    put32(table, static_cast<std::uint32_t>(member.size()));
+    table += member;
+    put64(table, 0);
+    put64(table, original.size());
+    std::string payload("VRULPK1\0", 8);
+    put32(payload, 1);
+    payload += table;
+    payload += original;
+    std::string footer("VRULEND1", 8);
+    put64(footer, payload.size());
+    put64(footer, 24);
+    return stub + payload + footer;
+}
+/** THE LAUNCH FILE OF EVERY FIXTURE GAME (audit 2026-11-11 H-2): the Client
+ *  refuses a launch file that is not a wrapper the shared locator
+ *  (virule/core/wrapper_payload.hpp) reads, so a delivered or packaged
+ *  Game.exe is a real wrapper whose original is `original`. Built here, byte
+ *  by byte; no binary is shipped. */
+static std::string wrapped_game(const std::string& original) {
+    return wrapper_bytes("MZ virule stub", "__virule__/orig/Game.exe", original);
+}
+/** A launch file with the VRULEND1 footer but no VRULPK1 archive where the
+ *  footer points: malformed, never examined, never passed. */
+static std::string malformed_game(const std::string& original) {
+    std::string b = wrapped_game(original);
+    b.replace(b.find("VRULPK1"), 7, "XXXXXXX");
+    return b;
+}
+
 static void write_zip(const fs::path& zp, const std::vector<std::pair<std::string, std::string>>& files) {
     mz_zip_archive zip{};
     FILE* zf = nullptr;
@@ -337,11 +372,11 @@ static void test_update_and_removal() {
     const fs::path installs = root / "games";
     const fs::path dst = installs / game;
     fs::create_directories(dst / "saves");
-    std::ofstream(dst / "Game.exe", std::ios::binary) << "old exe";
+    std::ofstream(dst / "Game.exe", std::ios::binary) << wrapped_game("old exe");
     std::ofstream(dst / "data.bin", std::ios::binary) << "old data";
     std::ofstream(dst / "saves" / "slot1.sav", std::ios::binary) << "the evaluator's save";
     const fs::path zp = root / "update.zip";
-    write_zip(zp, { { "Game.exe", "new exe" }, { "data.bin", "new data" }, { "extra/new.txt", "added" } });
+    write_zip(zp, { { "Game.exe", wrapped_game("new exe") }, { "data.bin", "new data" }, { "extra/new.txt", "added" } });
     std::string sha;
     tr::sha256_file_hex(zp, sha);
     ed::Job j;
@@ -373,14 +408,14 @@ static void test_update_and_removal() {
     ed::Job back;
     CHECK(ed::read_job(root, j.id, back) && back.state == "extracting" && back.error.find("Close the game") != std::string::npos);
     CHECK(back.next_attempt_utc > 0);
-    CHECK(slurp(dst / "Game.exe") == "old exe");
+    CHECK(slurp(dst / "Game.exe") == wrapped_game("old exe"));
     CloseHandle(presence);
     CHECK(!ev::session_running(assignment));
 
     // Closed: the update lands.
     tr::detail::run_install(cfg, back, "eva@example.com");
     CHECK(ed::read_job(root, j.id, back) && back.state == "installed");
-    CHECK(slurp(dst / "Game.exe") == "new exe");
+    CHECK(slurp(dst / "Game.exe") == wrapped_game("new exe"));
     CHECK(slurp(dst / "data.bin") == "new data");
     CHECK(slurp(dst / "extra" / "new.txt") == "added");
     CHECK(slurp(dst / "saves" / "slot1.sav") == "the evaluator's save");   // THE SAVE IS KEPT
@@ -500,18 +535,19 @@ static int run_package(int argc, char** argv) {
     j.file_count = 3;
     const fs::path pkg = root / "packages" / fs::path(j.build_uuid + ".zip");
     // A REAL package (2026-11-02: the Client extracts and verifies it before
-    // any upload): one stored Game.exe, sized so the archive is exactly
-    // `bytes` long (a stored zip's overhead is constant for one entry).
-    std::string content(static_cast<size_t>(bytes > 512 ? bytes - 512 : 1), '\0');
+    // any upload): one stored Game.exe, a real wrapper (wrapped_game) of a
+    // random original, sized so the archive is exactly `bytes` long (a stored
+    // zip's overhead, and the wrapper's, are constant for one entry).
+    std::string content(static_cast<size_t>(bytes > 1024 ? bytes - 1024 : 1), '\0');
     {
         std::mt19937_64 rng(std::hash<std::string>{}(j.build_uuid));
         for (auto& c : content) c = static_cast<char>(rng());
     }
-    write_zip(pkg, { { "Game.exe", content } });
+    write_zip(pkg, { { "Game.exe", wrapped_game(content) } });
     {
         std::error_code ec;
         const std::uint64_t got = fs::file_size(pkg, ec);
-        if (bytes > 512 && got != bytes) { content.resize(static_cast<size_t>(content.size() + bytes - got)); write_zip(pkg, { { "Game.exe", content } }); }
+        if (bytes > 1024 && got != bytes) { content.resize(static_cast<size_t>(content.size() + bytes - got)); write_zip(pkg, { { "Game.exe", wrapped_game(content) } }); }
     }
     std::string sha;
     tr::sha256_file_hex(pkg, sha);
@@ -1154,8 +1190,11 @@ struct UploadService final : tr::Service {
 };
 
 // A packaged job exactly as the Admin host hands one over (or as anything
-// else could write one): a real stored package of one Game.exe.
-static ed::Job packaged_job(const fs::path& root, const std::string& content) {
+// else could write one): a real stored package of one Game.exe, whose bytes
+// are `content` exactly (a wrapper from wrapped_game, or, to prove the
+// refusal, anything else), plus any `extra` entries.
+static ed::Job packaged_job(const fs::path& root, const std::string& content,
+                            const std::vector<std::pair<std::string, std::string>>& extra = {}) {
     ed::Job j;
     j.id = ed::random_hex32();
     j.kind = "upload";
@@ -1170,7 +1209,9 @@ static ed::Job packaged_job(const fs::path& root, const std::string& content) {
     const fs::path dir = root / "builds" / "package";
     fs::create_directories(dir);
     const fs::path pkg = dir / fs::path(j.build_uuid + ".zip");
-    write_zip(pkg, { { "Game.exe", content } });
+    std::vector<std::pair<std::string, std::string>> entries{ { "Game.exe", content } };
+    entries.insert(entries.end(), extra.begin(), extra.end());
+    write_zip(pkg, entries);
     j.package_path = utf8(pkg);
     j.package_bytes = fs::file_size(pkg);
     tr::sha256_file_hex(pkg, j.package_sha256);
@@ -1275,7 +1316,7 @@ static void test_upload_gate() {
     // and mid-upload; the Client has no record of its own. It verifies first,
     // and with an unsupported scanner nothing is ever sent.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(4000, 1));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(4000, 1)));
         j.state = "uploading";
         j.scan_outcome = "clean";
         j.session_id = ed::random_hex32();
@@ -1290,7 +1331,7 @@ static void test_upload_gate() {
     // 2. A DETECTION never uploads: the job fails with the threat sentence,
     // the incident is this Client's own (sealed) and is what is reported.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(4000, 2));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(4000, 2)));
         next = ms::Outcome::detected;
         drive_once(cfg);
         CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.error.find("found a threat") != std::string::npos);
@@ -1306,7 +1347,7 @@ static void test_upload_gate() {
     // 2b. A REFUSED PROOF (401: the key not proved yet, a clock) is never
     // final: the incident is sent again and recorded exactly once.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(4000, 21));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(4000, 21)));
         next = ms::Outcome::detected;
         svc.refuse_incidents = 1;
         const int before = svc.incidents, calls = svc.incident_calls;
@@ -1324,7 +1365,7 @@ static void test_upload_gate() {
         const fs::path games = root / "installs";
         const std::string assignment = ed::random_hex32(), revision = ed::random_hex32(), game = ed::random_hex32();
         fs::create_directories(games / game);
-        std::ofstream(games / game / "Game.exe") << "installed";
+        std::ofstream(games / game / "Game.exe", std::ios::binary) << wrapped_game("installed");
         ed::Job j;
         j.id = ed::random_hex32();
         j.kind = "install";
@@ -1353,7 +1394,7 @@ static void test_upload_gate() {
     // 3. AN INCIDENT WRITTEN INTO A JOB FILE is never sent (the host, or
     // anything else, cannot make this Client hold a game).
     {
-        ed::Job j = packaged_job(root, random_bytes_str(3000, 3));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(3000, 3)));
         j.state = "failed";
         j.incident = "{\"incident_id\":\"" + ed::random_hex32() + "\",\"operation\":\"scan_package\",\"outcome\":\"detected\"}";
         j.incident_reported = false;
@@ -1364,7 +1405,7 @@ static void test_upload_gate() {
     }
     // 4. A FORGED RECORD (unsealed, or sealed by another key) authorizes nothing.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(5000, 4));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(5000, 4)));
         fs::create_directories(uv::record_path(root, j.id).parent_path());
         std::ofstream(uv::record_path(root, j.id)) << "{\"format\":\"virule-upload-verification.v1\",\"job_id\":\"" << j.id
             << "\",\"package_sha256\":\"" << j.package_sha256 << "\",\"part_sha256\":[\"" << j.package_sha256 << "\"],\"seal\":\"" << std::string(64, 'a') << "\"}";
@@ -1379,7 +1420,8 @@ static void test_upload_gate() {
     // and the service holds exactly the verified bytes.
     ed::Job ok_job;
     {
-        ok_job = packaged_job(root, random_bytes_str(6000, 5));
+        const std::string ok_exe = wrapped_game(random_bytes_str(6000, 5));
+        ok_job = packaged_job(root, ok_exe);
         // The host's figures are wrong on purpose (a patched host): the
         // Client's own are what the service is told.
         ok_job.content_bytes = 1;
@@ -1389,14 +1431,14 @@ static void test_upload_gate() {
         drive_once(cfg);
         CHECK(ed::read_job(root, ok_job.id, got) && got.state == "done");
         uv::Record rec;
-        CHECK(uv::read_record(root, ok_job.id, rec) && rec.package_sha256 == ok_job.package_sha256 && rec.file_count == 1 && rec.content_bytes == 6000);
-        CHECK(svc.last_open.find("\"file_count\":1,") != std::string::npos && svc.last_open.find("\"content_bytes\":6000,") != std::string::npos);
+        CHECK(uv::read_record(root, ok_job.id, rec) && rec.package_sha256 == ok_job.package_sha256 && rec.file_count == 1 && rec.content_bytes == ok_exe.size());
+        CHECK(svc.last_open.find("\"file_count\":1,") != std::string::npos && svc.last_open.find("\"content_bytes\":" + std::to_string(ok_exe.size()) + ",") != std::string::npos);
         CHECK(tr::sha256_hex(svc.received(ok_job.build_uuid)) == ok_job.package_sha256);
     }
     // 6. BYTES CHANGED AFTER VERIFICATION (same size, the write time put
     // back): the changed part is never sent; the upload stops.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(7000, 6));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(7000, 6)));
         next = ms::Outcome::clean;
         // Verify only: a session that refuses to open keeps it at packaged.
         CHECK(tr::detail::verify_package(cfg, j));
@@ -1417,7 +1459,7 @@ static void test_upload_gate() {
     // 7. A RESTART MID-UPLOAD WITHOUT THE CLIENT'S RECORD (it was lost, or
     // never this Client's): verified again before another byte is sent.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(3000, 7));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(3000, 7)));
         next = ms::Outcome::clean;
         CHECK(tr::detail::verify_package(cfg, j));
         uv::remove_record(root, j.id);
@@ -1431,7 +1473,7 @@ static void test_upload_gate() {
     // 8. A HELD UPLOAD keeps its verification while the package is unchanged,
     // and verifies again once it moved (a rebuilt package at the same path).
     {
-        ed::Job j = packaged_job(root, random_bytes_str(3000, 8));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(3000, 8)));
         next = ms::Outcome::clean;
         CHECK(tr::detail::verify_package(cfg, j));
         ed::read_job(root, j.id, j);
@@ -1440,12 +1482,12 @@ static void test_upload_gate() {
         const int s0 = scans;
         drive_once(cfg);
         CHECK(scans == s0 && ed::read_job(root, j.id, got) && got.state == "done");
-        ed::Job k = packaged_job(root, random_bytes_str(3000, 9));
+        ed::Job k = packaged_job(root, wrapped_game(random_bytes_str(3000, 9)));
         CHECK(tr::detail::verify_package(cfg, k));
         ed::read_job(root, k.id, k);
         k.state = "held";
         ed::write_job(root, k);
-        write_zip(tr::path_of(k.package_path), { { "Game.exe", random_bytes_str(3100, 10) } });
+        write_zip(tr::path_of(k.package_path), { { "Game.exe", wrapped_game(random_bytes_str(3100, 10)) } });
         const int s1 = scans;
         drive_once(cfg);
         // Rebuilt under the job: not the package the host recorded, so it stops.
@@ -1454,7 +1496,7 @@ static void test_upload_gate() {
     // 9. ANOTHER BUILD under the same job id (the job re-pointed): the record
     // is of another build, so it is verified again.
     {
-        ed::Job j = packaged_job(root, random_bytes_str(2000, 11));
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(2000, 11)));
         next = ms::Outcome::clean;
         CHECK(tr::detail::verify_package(cfg, j));
         uv::Record rec;
@@ -1508,7 +1550,7 @@ static void test_upload_gate_real_defender() {
     cfg.root = root;
     cfg.service = &svc;
     cfg.log = [](const std::string& t) { std::printf("   %s\n", t.c_str()); };
-    ed::Job j = packaged_job(root, "a small clean game file " + random_bytes_str(64, 12));
+    ed::Job j = packaged_job(root, wrapped_game("a small clean game file " + random_bytes_str(64, 12)));
     const bool usable = ms::scanning_availability().usable;
     drive_once(cfg);
     ed::Job got;
@@ -1529,25 +1571,6 @@ static void test_upload_gate_real_defender() {
 // a file the antivirus took before VIRULE read it has none; Defender's Threat
 // ID is passed on only when valid. Every scan here is a stand-in naming
 // files; nothing is malware and nothing leaves this computer.
-static void put32(std::string& s, std::uint32_t v) { s.append(reinterpret_cast<const char*>(&v), 4); }
-static void put64(std::string& s, std::uint64_t v) { s.append(reinterpret_cast<const char*>(&v), 8); }
-/** A VIRULE wrapper as the Admin builds it: a stub, a VRULPK1 archive holding
- *  the original executable raw, and the 24-byte VRULEND1 footer. */
-static std::string wrapper_bytes(const std::string& stub, const std::string& member, const std::string& original) {
-    std::string table;
-    put32(table, static_cast<std::uint32_t>(member.size()));
-    table += member;
-    put64(table, 0);
-    put64(table, original.size());
-    std::string payload("VRULPK1\0", 8);
-    put32(payload, 1);
-    payload += table;
-    payload += original;
-    std::string footer("VRULEND1", 8);
-    put64(footer, payload.size());
-    put64(footer, 24);
-    return stub + payload + footer;
-}
 static std::string lower_utf8(const fs::path& p) {
     std::wstring w = p.wstring();
     for (auto& c : w) c = static_cast<wchar_t>(towlower(c));
@@ -1933,7 +1956,7 @@ static void test_finding_identity() {
         cfg.root = root;
         cfg.service = &svc;
         cfg.log = [](const std::string&) {};
-        const std::string content = random_bytes_str(4000, 65);
+        const std::string content = wrapped_game(random_bytes_str(4000, 65));
         cfg.scan = [&](const std::vector<fs::path>& targets, const std::string&, const std::function<bool()>&) {
             ms::Result s;
             s.scanner = "Test scanner";
@@ -1967,7 +1990,7 @@ static void test_finding_identity() {
         const std::string assignment = ed::random_hex32(), revision = ed::random_hex32(), game = ed::random_hex32();
         const fs::path gdir = games / game;
         fs::create_directories(gdir);
-        const std::string installed = "installed game file " + random_bytes_str(2000, 66);
+        const std::string installed = wrapped_game("installed game file " + random_bytes_str(2000, 66));
         std::ofstream(gdir / "Game.exe", std::ios::binary) << installed;
         std::ofstream(gdir / "save.dat", std::ios::binary) << "the game's own save";
         ed::Job j;
@@ -2016,6 +2039,210 @@ static void test_finding_identity() {
     fs::remove_all(root);
 }
 
+// ---- audit 2026-11-11 H-2: THE LAUNCH FILE MUST BE THE WRAPPER. Every
+// Client call of extract_wrapped_originals (verify_package, the install's
+// scan, both extracting branches of verify_installed) names the job's
+// launch_exe, so a launch file that is not a wrapper the shared locator
+// (virule/core/wrapper_payload.hpp) reads, or is missing, is refused before
+// any scan, never scanned as a plain file and passed. An ordinary .exe
+// BESIDE the wrapper (a helper, a redistributable) still scans as itself.
+// No scan runs in these refusals, so no Defender is involved.
+static void test_launch_file_must_be_wrapper() {
+    SECTION("the launch file must be a wrapper: a plain or mismatched launch file is refused at verify, install and Play");
+    namespace ms = virule::core::malware_scan;
+    namespace uv = vclient::upload_verification;
+    namespace vc = virule::core::verified_content;
+    const fs::path root = temp_root("launch-wrapper");
+    std::error_code ec;
+
+    // 1. THE EXTRACTOR ITSELF (the vendored malware_scan.hpp, as the Client
+    // compiles it).
+    {
+        const fs::path plain = root / "plain";
+        fs::create_directories(plain);
+        std::ofstream(plain / "Game.exe", std::ios::binary) << "MZ a plain executable, not a wrapper";
+        ms::Extracted x = ms::extract_wrapped_originals(plain, root / "c1", {}, "Game.exe");
+        CHECK(!x.ok && x.why == "The game's launch file is not a wrapped executable." && x.written.empty());
+        x = ms::extract_wrapped_originals(plain, root / "c2", {}, "Missing.exe");
+        CHECK(!x.ok && x.why == "The game's launch file was not found.");
+        x = ms::extract_wrapped_originals(plain, root / "c3", {});   // no launch file named: every .exe on its own
+        CHECK(x.ok && x.wrappers == 0);
+
+        // MISMATCHED: the wrapper is another file; the launch file is plain.
+        const fs::path mixed = root / "mixed";
+        fs::create_directories(mixed);
+        std::ofstream(mixed / "Game.exe", std::ios::binary) << "MZ a plain executable, not a wrapper";
+        std::ofstream(mixed / "Other.exe", std::ios::binary) << wrapped_game("the original");
+        x = ms::extract_wrapped_originals(mixed, root / "c4", {}, "Game.exe");
+        CHECK(!x.ok && x.why == "The game's launch file is not a wrapped executable.");
+        x = ms::extract_wrapped_originals(mixed, root / "c5", {}, "Other.exe");
+        CHECK(x.ok && x.wrappers == 1 && x.originals.size() == 1);
+
+        // THE WRAPPER beside a plain helper: the helper scans as itself; the
+        // launch file name matches as Windows does (case-insensitive).
+        const fs::path good = root / "good";
+        fs::create_directories(good / "bin");
+        std::ofstream(good / "Game.exe", std::ios::binary) << wrapped_game("the original");
+        std::ofstream(good / "bin" / "helper.exe", std::ios::binary) << "MZ a helper, signed or not";
+        x = ms::extract_wrapped_originals(good, root / "c6", {}, "game.EXE");
+        CHECK(x.ok && x.wrappers == 1 && x.originals.size() == 1 && slurp(x.originals[0].copy) == "the original");
+
+        // A launch file with the footer but a payload that is not one: malformed.
+        const fs::path bad = root / "bad";
+        fs::create_directories(bad);
+        std::ofstream(bad / "Game.exe", std::ios::binary) << malformed_game("the original");
+        x = ms::extract_wrapped_originals(bad, root / "c7", {}, "Game.exe");
+        CHECK(!x.ok && x.why == "A wrapped game file is malformed.");
+    }
+
+    UploadService svc;
+    int scans = 0;
+    tr::DriverConfig cfg;
+    cfg.root = root;
+    cfg.service = &svc;
+    cfg.log = [](const std::string&) {};
+    cfg.scan = [&](const std::vector<fs::path>&, const std::string&, const std::function<bool()>&) {
+        ++scans;
+        ms::Result r;
+        r.scanner = "Test scanner";
+        r.path = "defender";
+        r.outcome = ms::Outcome::clean;
+        return r;
+    };
+    ed::Job got;
+
+    // 2. THE DEVELOPER'S VERIFICATION (verify_package): a package whose launch
+    // file is plain, whose wrapper is another file, or whose launch file is a
+    // malformed wrapper never uploads; nothing is scanned, nothing sent, no
+    // record.
+    for (int k = 0; k < 3; ++k) {
+        const std::string plain_exe = "MZ a plain executable " + random_bytes_str(3000, 80 + k);
+        ed::Job j = k == 0 ? packaged_job(root, plain_exe)
+                  : k == 1 ? packaged_job(root, plain_exe, { { "Other.exe", wrapped_game(random_bytes_str(1000, 90)) } })
+                           : packaged_job(root, malformed_game(random_bytes_str(3000, 91)));
+        const int s0 = scans, o0 = svc.opens;
+        CHECK(!tr::detail::verify_package(cfg, j));
+        CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.scan_outcome == "error");
+        CHECK(scans == s0 && svc.opens == o0 && svc.puts == 0 && !fs::exists(uv::record_path(root, j.id)));
+        uv::Incident none;
+        CHECK(!uv::read_incident(root, j.id, none));   // a refusal, never an incident
+    }
+    // A launch file the package does not carry: the earlier existence check
+    // (no antivirus record of it), a failure before anything is scanned.
+    {
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(3000, 83)));
+        j.launch_exe = "Missing.exe";
+        ed::write_job(root, j);
+        const int s0 = scans, o0 = svc.opens;
+        CHECK(!tr::detail::verify_package(cfg, j));
+        CHECK(ed::read_job(root, j.id, got) && got.state == "failed" && got.error.find("has no Missing.exe") != std::string::npos);
+        CHECK(scans == s0 && svc.opens == o0 && !fs::exists(uv::record_path(root, j.id)));
+    }
+    // The same package with a wrapper launch file and a plain helper verifies.
+    {
+        ed::Job j = packaged_job(root, wrapped_game(random_bytes_str(3000, 82)), { { "bin/helper.exe", "MZ a helper" } });
+        const int s0 = scans;
+        CHECK(tr::detail::verify_package(cfg, j));
+        CHECK(scans == s0 + 1);
+    }
+
+    // 3. THE EVALUATOR'S INSTALL (run_install's scan): a delivered package
+    // whose launch file is plain, whose wrapper is another file, or whose
+    // launch file is a malformed wrapper fails before anything is scanned or
+    // placed; a refusal, not a detection, so nothing is held.
+    for (int k = 0; k < 4; ++k) {
+        AckService ack;
+        tr::DriverConfig icfg;
+        icfg.root = root;
+        icfg.service = &ack;
+        icfg.log = [](const std::string&) {};
+        const fs::path installs = root / "installs";
+        const std::string game = ed::random_hex32();
+        const fs::path dst = installs / game;
+        const fs::path zp = root / ("refused-delivery-" + std::to_string(k) + ".zip");
+        if (k == 0) write_zip(zp, { { "Game.exe", "MZ a plain executable, not a wrapper" }, { "data.bin", "data" } });
+        if (k == 1) write_zip(zp, { { "Game.exe", "MZ a plain executable, not a wrapper" }, { "Other.exe", wrapped_game("the original") } });
+        if (k == 2) write_zip(zp, { { "Game.exe", malformed_game("the original") }, { "data.bin", "data" } });
+        if (k == 3) write_zip(zp, { { "Other.exe", wrapped_game("the original") }, { "data.bin", "data" } });   // no Game.exe: the existence check
+        ed::Job j;
+        j.id = ed::random_hex32();
+        j.kind = "install";
+        j.state = "extracting";
+        j.account_email = "eva@example.com";
+        j.assignment_id = ed::random_hex32();
+        j.game_uuid = game;
+        j.revision_id = ed::random_hex32();
+        j.download_id = std::string(32, 'd');
+        tr::sha256_file_hex(zp, j.package_sha256);
+        j.launch_exe = "Game.exe";
+        j.install_root = utf8(installs);
+        j.install_dir = utf8(dst);
+        j.temp_path = utf8(zp);
+        j.created_utc = tr::utc_now();
+        ed::write_job(root, j);
+        tr::detail::run_install(icfg, j, "eva@example.com");
+        ed::Job back;
+        CHECK(ed::read_job(root, j.id, back) && back.state == "failed" && !back.security_held &&
+              (k < 3 ? back.scan_outcome == "error" : back.error.find("has no Game.exe") != std::string::npos));
+        CHECK(ack.completes == 0 && !fs::exists(dst, ec));
+        CHECK(!fs::exists(installs / ".virule-staging" / game, ec));
+    }
+
+    // 4. THE PRE-PLAY CHECK (verify_installed): an installed game whose launch
+    // file is plain is never vouched for (Play stays refused); one verified as
+    // a wrapper whose launch file is then REPLACED by a plain file is refused
+    // too, and the record never takes the replacement.
+    {
+        const fs::path games = root / "games";
+        auto installed_job = [&](const std::string& exe_bytes) {
+            const std::string game = ed::random_hex32();
+            fs::create_directories(games / game);
+            std::ofstream(games / game / "Game.exe", std::ios::binary) << exe_bytes;
+            ed::Job j;
+            j.id = ed::random_hex32();
+            j.kind = "install";
+            j.state = "installed";
+            j.account_email = "dev@example.com";
+            j.assignment_id = ed::random_hex32();
+            j.game_uuid = game;
+            j.revision_id = ed::random_hex32();
+            j.installed_revision_id = j.revision_id;
+            j.launch_exe = "Game.exe";
+            j.install_root = utf8(games);
+            j.install_dir = utf8(games / game);
+            j.created_utc = tr::utc_now();
+            ed::write_job(root, j);
+            return j;
+        };
+        ed::Job p = installed_job("MZ a plain executable, not a wrapper");
+        int s0 = scans;
+        tr::detail::verify_installed(cfg, p);
+        CHECK(ed::read_job(root, p.id, got) && got.scan_outcome == "error" && got.scan_revision_id.empty() && !got.security_held);
+        CHECK(scans == s0);
+
+        ed::Job w = installed_job(wrapped_game("the original"));
+        s0 = scans;
+        tr::detail::verify_installed(cfg, w);
+        CHECK(ed::read_job(root, w.id, w) && w.scan_outcome == "clean" && w.scan_revision_id == w.revision_id && scans == s0 + 1);
+        CHECK(vc::verified_now(root, w.id, tr::path_of(w.install_dir), w.revision_id));
+        std::ofstream(tr::path_of(w.install_dir) / "Game.exe", std::ios::binary | std::ios::trunc) << "MZ a plain executable put in its place";
+        s0 = scans;
+        tr::detail::verify_installed(cfg, w);
+        CHECK(ed::read_job(root, w.id, got) && got.scan_outcome == "error" && scans == s0);
+        CHECK(!vc::verified_now(root, w.id, tr::path_of(w.install_dir), w.revision_id));   // the launcher's Play check: Verifying, never Play
+
+        // An empty launch file name (a damaged record) would switch the check
+        // off: refused instead.
+        ed::Job e = installed_job(wrapped_game("the original"));
+        e.launch_exe.clear();
+        ed::write_job(root, e);
+        s0 = scans;
+        tr::detail::verify_installed(cfg, e);
+        CHECK(ed::read_job(root, e.id, got) && got.scan_outcome == "error" && got.scan_revision_id.empty() && scans == s0);
+    }
+    fs::remove_all(root, ec);
+}
+
 int main(int argc, char** argv) {
     // The recovery-only mode as an installed wrapper with the marker runs
     // it (test_recovery_rules starts a copy of this exe as Game.exe).
@@ -2043,6 +2270,7 @@ int main(int argc, char** argv) {
     test_upload_gate();
     test_reverify_after_resume();
     test_finding_identity();
+    test_launch_file_must_be_wrapper();
     test_upload_gate_real_defender();
     std::printf("%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;
