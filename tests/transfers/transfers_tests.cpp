@@ -1679,14 +1679,16 @@ static void test_finding_identity() {
         CHECK(r2.threats[0].identity.origin == "package" && r2.threats[0].identity.sha256.empty());
     }
     // 5. A FILE MORE THAN ONE ENTRY WROTE has no digest (which entry's bytes
-    // the antivirus saw cannot be established): the same name twice, a case
-    // variant, and a name Windows maps onto the same file (a trailing dot);
+    // the antivirus saw cannot be established): the same name twice and a
+    // case variant (a name Windows would map onto the same file by a
+    // trailing dot or space never reaches the disk: the zip entry guard
+    // refuses it, checked below);
     // a name carried twice identifies neither entry by name, and nothing in
     // VIRULE's own extraction folder is hashed after the fact.
     {
         const fs::path dup = root / "dup.zip";
         write_zip(dup, { { "a.dll", "first" }, { "a.dll", "second" }, { "B.dll", "upper" }, { "b.dll", "lower" },
-                         { "c.dll", "plain" }, { "c.dll.", "dotted" }, { "d.dll", "alone" } });
+                         { "c.dll", "plain" }, { "C.DLL", "variant" }, { "d.dll", "alone" } });
         std::vector<fi::WrittenEntry> w2;
         CHECK(tr::detail::extract_zip(dup, root / "dup", why, {}, &w2) && w2.size() == 7);
         fi::Index i2;
@@ -1705,7 +1707,7 @@ static void test_finding_identity() {
         // entry): the extractor sees no file there, yet both names are one
         // file, so neither keeps a digest.
         const fs::path alias = root / "alias.zip";
-        write_zip(alias, { { "c.dll", "plain" }, { "x.dll", "other" }, { "c.dll.", "dotted" } });
+        write_zip(alias, { { "c.dll", "plain" }, { "x.dll", "other" }, { "C.DLL", "variant" } });
         std::vector<fi::WrittenEntry> w3;
         int entries = 0;
         CHECK(tr::detail::extract_zip(alias, root / "alias", why, [&]() {
@@ -1724,6 +1726,15 @@ static void test_finding_identity() {
         CHECK(r5.threats[0].identity.sha256.empty() && r5.missing_identity[0].sha256.empty());
         CHECK(r5.threats[1].identity.sha256 == tr::sha256_hex(std::string("other")));
         CHECK(fi::key_of(root / "a" / "c.dll. ") == fi::key_of(root / "A" / "C.DLL"));
+        // The names Windows strips (a trailing dot or space) are refused by
+        // the extractor before anything is written (zip_entry.hpp, audit L-24).
+        for (const char* stripped : { "c.dll.", "c.dll ", "bin./c.dll" }) {
+            const fs::path sz = root / "stripped.zip";
+            write_zip(sz, { { stripped, "dotted" } });
+            std::vector<fi::WrittenEntry> ws;
+            CHECK(!tr::detail::extract_zip(sz, root / "stripped", why, {}, &ws) && ws.empty() &&
+                  why == "The package holds an unsafe file name.");
+        }
         // A REPORTED name with a literal trailing dot or space (a file or
         // folder the game created so, beside an installed file VIRULE placed)
         // never borrows the placed file's recorded digest, and is never read.

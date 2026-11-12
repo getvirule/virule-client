@@ -102,6 +102,7 @@
 #include "virule/core/evaluation_evidence.hpp"
 #include "virule/core/malware_scan.hpp"
 #include "virule/core/verified_content.hpp"
+#include "virule/core/zip_entry.hpp"
 #include "miniz/miniz.h"
 
 #if defined(_WIN32)
@@ -883,22 +884,21 @@ inline size_t zip_write_cb(void* opaque, mz_uint64, const void* buf, size_t n) {
     if (s->digest && wrote > 0) s->digest->update(buf, wrote);
     return wrote;
 }
+// THE ZIP ENTRY NAME GUARD is the one shared rule (virule/core/zip_entry.hpp,
+// vendored; audit L-24, 2026-11-12): the Desktop package install
+// (admin_install.hpp) and VIRULE Desktop's own extraction refuse the same
+// names. It is stricter than the rule this replaced on every class (doubled
+// separators, device names, trailing dots and spaces, the characters Windows
+// forbids, control characters) and never repairs a name. A name that is not
+// well-formed UTF-8 is refused too: the path conversion throws on it, which
+// uncaught would end the Client (a developer's package could then crash an
+// evaluator's Client on every start).
 inline bool safe_entry(const std::string& name, fs::path& rel_out) {
-    if (name.empty() || name.size() > 1024) return false;
-    fs::path rel;
-    std::string part;
-    for (size_t i = 0; i <= name.size(); ++i) {
-        const char c = i < name.size() ? name[i] : '/';
-        if (c == '/' || c == '\\') {
-            if (part.empty()) { if (i == 0) return false; continue; }
-            if (part == "." || part == ".." || part.find(':') != std::string::npos) return false;
-            rel /= fs::path(std::u8string(part.begin(), part.end()));
-            part.clear();
-        } else part += c;
+    try {
+        return virule::core::zip_entry::relative_path(name, rel_out);
+    } catch (...) {
+        return false;
     }
-    if (rel.empty()) return false;
-    rel_out = rel;
-    return true;
 }
 /** `written` (optional): every file entry as the extractor wrote it, in
  *  order, with the SHA-256 of the bytes written (finding_identity.hpp); an

@@ -73,6 +73,8 @@
 #include <string>
 #include <vector>
 
+#include "virule/core/folder_walk.hpp"
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -608,9 +610,10 @@ struct SetResult {
 
 /**
  * SCAN EVERY REGULAR FILE under the targets (a target may be a file) with
- * the one allowed provider (header). Links are never followed; a folder that
- * cannot be walked whole is incomplete. `keep_going` false stops: what was
- * not presented is not scanned, so the set is incomplete.
+ * the one allowed provider (header). Links are never followed, and a folder
+ * that holds one, or that cannot be walked whole, is incomplete
+ * (folder_walk.hpp). `keep_going` false stops: what was not presented is not
+ * scanned, so the set is incomplete.
  */
 inline SetResult scan_targets(const std::vector<fs::path>& targets, const std::function<bool()>& keep_going,
                               const std::function<void()>& heartbeat, const Policy& policy = shipped_policy()) {
@@ -630,19 +633,13 @@ inline SetResult scan_targets(const std::vector<fs::path>& targets, const std::f
     for (const auto& t : targets) {
         if (fs::is_regular_file(fs::symlink_status(t, ec))) { files.push_back(t); continue; }
         if (!fs::is_directory(t, ec)) { walked = false; break; }
-        for (auto it = fs::recursive_directory_iterator(t, fs::directory_options::none, ec);
-             !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-            // An entry whose status cannot be read is never skipped: the
-            // walk is incomplete, so the set is never clean.
-            std::error_code fec;
-            const bool link = it->is_symlink(fec);
-            if (fec) { walked = false; break; }
-            if (link) { if (it->is_directory(fec)) it.disable_recursion_pending(); continue; }
-            const bool regular = it->is_regular_file(fec);
-            if (fec) { walked = false; break; }
-            if (regular) files.push_back(it->path());
-        }
-        if (ec) { walked = false; break; }
+        // Nothing is skipped: an entry that cannot be read, or a link, makes
+        // the walk incomplete, so the set is never clean.
+        const auto w = virule::core::folder_walk::walk(t, [&](const virule::core::folder_walk::File& f) {
+            files.push_back(f.path);
+            return true;
+        });
+        if (!w.ok()) { walked = false; break; }
     }
     bool any_detected = false, any_not_clean = false, any_incomplete = !walked, stopped = false;
     for (const auto& f : files) {

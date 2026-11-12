@@ -51,6 +51,7 @@
 
 #include "virule/core/evaluation_distribution.hpp"
 #include "virule/core/evaluation_evidence.hpp"
+#include "virule/core/folder_walk.hpp"
 
 namespace virule::core::verified_content {
 
@@ -94,32 +95,24 @@ inline fs::path path_of_key(const std::string& key) {
 
 } // namespace detail
 
-/** Every regular file under `dir` (links never followed): size and write
- *  time by relative path. False when the folder cannot be walked whole. */
+/** Every regular file under `dir`: size and write time by relative path.
+ *  False when the folder cannot be walked whole, or holds a link (never
+ *  followed; folder_walk.hpp). */
 inline bool inventory(const fs::path& dir, Inventory& out) {
     out.clear();
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return false;
-    for (auto it = fs::recursive_directory_iterator(dir, fs::directory_options::none, ec);
-         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        // An entry whose status cannot be read is never skipped: the walk
-        // fails, so nothing is vouched for (a scan of the whole folder; the
-        // wrapper's check refuses).
-        std::error_code fec;
-        const bool link = it->is_symlink(fec);
-        if (fec) return false;
-        if (link) { if (it->is_directory(fec)) it.disable_recursion_pending(); continue; }
-        const bool regular = it->is_regular_file(fec);
-        if (fec) return false;
-        if (!regular) continue;
+    // An entry that cannot be read is never skipped: the walk fails, so
+    // nothing is vouched for (a scan of the whole folder; the wrapper's
+    // check refuses).
+    const auto w = virule::core::folder_walk::walk(dir, [&](const virule::core::folder_walk::File& f) {
         Seen s;
-        s.size = static_cast<std::uint64_t>(it->file_size(fec));
-        if (fec) return false;
-        s.mtime = static_cast<std::int64_t>(it->last_write_time(fec).time_since_epoch().count());
-        if (fec) return false;
-        out[detail::key_of(it->path().lexically_relative(dir))] = s;
-    }
-    return !ec;
+        s.size = f.size;
+        s.mtime = f.mtime;
+        out[detail::key_of(f.relative)] = s;
+        return true;
+    });
+    return w.ok();
 }
 
 inline bool write_record(const fs::path& path, const Record& r) {

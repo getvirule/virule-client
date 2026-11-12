@@ -21,7 +21,8 @@
 //      declared size, hashed while downloading;
 //   4. exact size, then exact SHA-256 (the gate that never has a waiver);
 //   5. extract into a staging directory beside the target; every entry is
-//      zip-slip guarded (no "..", no absolute paths, no drive letters);
+//      zip-slip guarded by the shared zip entry name rule
+//      (virule/core/zip_entry.hpp);
 //   6. verify Authenticode + the VIRULE signer identity on every
 //      VIRULE-owned executable/component in the staged tree;
 //   7. place atomically: fresh install is ONE directory rename; update is
@@ -78,6 +79,7 @@
 #include "shared/usage_checkin.hpp"
 #include "shared/verify_binary.hpp"
 #include "virule/core/time.hpp"
+#include "virule/core/zip_entry.hpp"
 #include "shared/version.h"
 
 #include "miniz/miniz.h"
@@ -1622,10 +1624,13 @@ inline size_t zip_write_callback(void* opaque, mz_uint64, const void* buf,
     return n;
 }
 
-// Extract the verified package into `dst_dir`. Every entry name is guarded
-// against escaping the destination (the Admin's own zip-slip guard): no
-// "..", no absolute paths, no drive letters. Component-wise path
-// reassembly, wide-path file IO throughout.
+// Extract the verified package into `dst_dir`. Every entry name passes the
+// one shared zip entry name rule (virule/core/zip_entry.hpp, the rule
+// VIRULE Desktop's own extraction and the evaluation package use): no "."
+// or ".." segment, no absolute, UNC or device path, no ':' anywhere (drive,
+// drive-relative, stream), no forbidden character, trailing dot or space,
+// or device name. Segment-wise reassembly (UTF-8), wide-path file IO
+// throughout.
 inline bool extract_package(const std::filesystem::path& zip_path,
                             const std::filesystem::path& dst_dir,
                             std::string& why) {
@@ -1658,16 +1663,25 @@ inline bool extract_package(const std::filesystem::path& zip_path,
             break;
         }
         const std::string name = st.m_filename;
-        // Reject entries that escape the destination (zip-slip guard).
-        if (name.find("..") != std::string::npos || name.empty() ||
-            name.front() == '/' || name.front() == '\\' ||
-            (name.size() > 1 && name[1] == ':')) {
+        // Reject entries that escape the destination (zip-slip guard): the
+        // one shared zip entry name rule (virule/core/zip_entry.hpp, audit
+        // L-24, 2026-11-12). The rule this replaced looked only at the
+        // FIRST segment for a drive, so "a/D:x" reassembled onto D:\.
+        // A name that is not well-formed UTF-8 is refused too (the path
+        // conversion throws on it; uncaught, that would end the Client).
+        std::filesystem::path rel;
+        bool safe = false;
+        try {
+            safe = virule::core::zip_entry::relative_path(name, rel);
+        } catch (...) {
+            safe = false;
+        }
+        if (!safe) {
             why = "zip entry escapes the destination: " + name;
             ok = false;
             break;
         }
-        std::filesystem::path out = dst_dir;
-        for (const auto& part : std::filesystem::path(name)) out /= part;
+        const std::filesystem::path out = dst_dir / rel;
         ec.clear();
         if (mz_zip_reader_is_file_a_directory(&zip, i)) {
             std::filesystem::create_directories(out, ec);

@@ -1432,7 +1432,8 @@ THE VERIFIED STAGED PIPELINE (install and update are the same path; an
 update never touches the live install file-by-file): fetch manifest ->
 validate structurally -> streamed download capped at the declared size,
 hashed on the way through -> exact size -> exact SHA-256 (never waived) ->
-zip-slip-guarded extraction into `Admin.staging\` -> Authenticode + the
+zip-slip-guarded extraction into `Admin.staging\` (THE ZIP ENTRY NAME GUARD,
+in "Local malware scanning") -> Authenticode + the
 VIRULE signer identity (`CN=Heath Michaels`) on every VIRULE-owned binary
 (virule.exe, ViruleAdminHost.exe, SidecarK32/64.dll, both
 SidecarKHost.exe, and ViruleUIHelper.exe WHEN PRESENT: newer packages carry
@@ -1813,6 +1814,52 @@ in limited periodic scanning is `unavailable` and blocks (the evidence:
 malware_scan.hpp "WHICH DEFENDER STATES SCAN"; the policy
 `VIRULE/docs/specs/evaluation-security.md`).
 
+THE ONE FOLDER WALK (Client 0.9.30; audit L-21; the vendored
+`virule/core/folder_walk.hpp` from v2_mvp `5ee4b54`, which `malware_scan.hpp`, `amsi_scan.hpp` and
+`verified_content.hpp` include; contract: `v2_mvp/docs/EVALUATION_VIRULE.md`
+9b "ONE FOLDER WALK"). Every walk the Client makes over a game's files to
+account for them goes through it: the scan's inventory and its search for
+wrapped originals (`extract_wrapped_originals`), the AMSI path's file list
+and the verified content record (`verified.txt`). Every regular file is
+listed and every folder entered. A LINK (a reparse point whose tag is a
+name surrogate: a symbolic link, a junction or mount point, a WSL link) is
+never followed and never skipped: it FAILS the walk. Every other reparse
+point is an ordinary file or folder, which is what a Dropbox, OneDrive or
+other Cloud Files placeholder is (metadata only is read, so no placeholder
+is hydrated by the walk). A folder that cannot be listed, or an entry whose
+metadata cannot be read, fails the walk too; each caller then fails with its
+own existing sentence (a scan is `incomplete`, nothing is vouched for).
+Before 0.9.30 these walks skipped links, and with them a junction's
+content. NOT CHANGED IN THIS PASS (lead's scope decision 2026-11-12; an
+open L-21 remainder, not a design ruling): an update's carry-over of the
+evaluator's own files (`transfers.hpp` `carry_over`) still skips links and
+folders it may not read (`skip_permission_denied`), so an unreadable folder
+of the evaluator's saves is silently not carried. Whether it should fail
+instead (which would stop the update) is an open question.
+
+THE ZIP ENTRY NAME GUARD (Client 0.9.30; audit L-24; the vendored
+`virule/core/zip_entry.hpp` from v2_mvp `5ee4b54`, the rule VIRULE
+Desktop's own extraction uses).
+Both Client extractors pass every entry name through it before anything is
+written: the evaluation package (`transfers.hpp` `safe_entry`, which fails
+with `The package holds an unsafe file name.`) and the Desktop package
+install (`admin_install.hpp` `extract_package`, `zip entry escapes the
+destination`). A name is refused whole, never repaired, unless every
+segment between '/' or '\' separators is non-empty (no leading separator,
+so no absolute, UNC or device path; no doubled separator; one trailing
+separator marks a folder), is not "." or "..", carries no ':' (drive,
+drive-relative, alternate stream), control character or `< > " | ? *`, does
+not end in '.' or ' ', and is not a device name (CON, PRN, AUX, NUL,
+COM0-9, LPT0-9 and their superscript forms, CONIN$, CONOUT$, alone or
+before an extension); at most 1024 bytes; and, in the Client, a name that
+is not well-formed UTF-8 is refused too (the path conversion throws on it,
+which uncaught would end the Client; `zip_entry::parse` itself does not yet
+check UTF-8). The Desktop guard it replaced
+checked only the first segment for a drive, so `a/D:x` reassembled onto
+`D:`; segments are now read as UTF-8 on both paths. Proof:
+`tests/zip_guard/run_tests.bat` (both real extractors; every entry name of
+the staging alpha.77 Desktop package passes) and `tests/transfers`.
+
 THE INSTALL (`src/client/transfers.hpp` `run_install`): after the
 package's SHA-256 and extraction into `.virule-staging`, `scanning` copies
 the wrapper's original executable out (never run) and scans it with every
@@ -1999,7 +2046,8 @@ host's statement that it built a package, nothing more.
   once for its SHA-256 and the SHA-256 of every 32 MiB part, compares the
   whole digest with the one the host packaged, lists the archive's contents
   (the 20 GB cap), checks free space for one more copy, extracts it with the
-  install's zip-slip-guarded extractor into `<package>.verify` beside it,
+  install's zip-slip-guarded extractor (THE ZIP ENTRY NAME GUARD) into
+  `<package>.verify` beside it,
   copies the wrapper's original executable into `<package>.verify-originals`
   (`extract_wrapped_originals`, never run; the launch file must be that
   wrapper, or the job fails before any scan, as at the install), and scans the package, the

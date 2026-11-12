@@ -40,6 +40,10 @@ tests\environment\run_tests.bat           # compiled as BOTH builds: development
                                           # (--dev-unsigned, loopback manifest urls, account
                                           # endpoint) only in staging or a sandboxed run with
                                           # LOCALAPPDATA redirected (audit L-24); starts NO client
+tests\zip_guard\run_tests.bat [pkg.zip]   # the zip entry name guard through BOTH real extractors
+                                          # (Desktop package, evaluation package); every entry name
+                                          # of a real Desktop package (default: the staging alpha.77
+                                          # one under %TEMP%\virule-rt\dl) must pass; starts NO client
 tests\usage\run_tests.bat                 # usage spool, check-in and update-health units, then the
                                           # check-in end to end against the real service code
                                           # (needs ..\..\VIRULE_BACKEND); starts NO client
