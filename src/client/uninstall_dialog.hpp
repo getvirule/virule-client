@@ -6,7 +6,7 @@
 // border, Segoe UI), mirroring the site's uninstall modal exactly:
 //
 //   Uninstall VIRULE?
-//   This removes VIRULE Admin and VIRULE Client from this PC.
+//   This removes VIRULE Desktop and VIRULE Client from this PC.
 //   Your local data will be kept.               (default copy)
 //   [ ] Delete local data                        (OFF by default)
 //   This cannot be undone. You will permanently  (only while checked)
@@ -139,8 +139,8 @@ inline void paint(HWND hwnd) {
         HGDIOBJ old_f = SelectObject(mem, f);
         SetTextColor(mem, g_pal.muted);
         const wchar_t* body = g_delete_data
-            ? L"This removes VIRULE Admin and VIRULE Client from this PC."
-            : L"This removes VIRULE Admin and VIRULE Client from this PC.\n"
+            ? L"This removes VIRULE Desktop and VIRULE Client from this PC."
+            : L"This removes VIRULE Desktop and VIRULE Client from this PC.\n"
               L"Your local data will be kept.";
         RECT br{ pad, usc(52), w - pad, usc(96) };
         DrawTextW(mem, body, -1, &br, DT_LEFT | DT_WORDBREAK);
