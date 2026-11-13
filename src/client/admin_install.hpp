@@ -63,7 +63,9 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "client/admin_version.hpp"
 #include "client/bridge.hpp"
 #include "client/result_card.hpp"
 #include "shared/client_state.hpp"
@@ -331,8 +333,6 @@ inline std::filesystem::path installed_release_file() {
     const auto d = paths::admin_install_dir();
     return d.empty() ? d : d / L"installed-release.json";
 }
-
-inline bool is_version_grammar(const std::string& s); // defined below
 
 // The version recorded inside the managed install itself; "" when the
 // file is missing (a pre-metadata install) or malformed.
@@ -1060,6 +1060,10 @@ struct Manifest {
     // pipeline is what refuses an Admin this client cannot serve).
     std::string minimum_client;
     bool client_too_old = false;
+    // The versions an OPERATOR ROLLBACK withdrew (admin_version.hpp
+    // parse_withdrawn; empty for every forward release and for a list that
+    // cannot be read exactly).
+    std::vector<std::string> withdrawn;
 };
 
 inline bool is_hex64(const std::string& s) {
@@ -1071,110 +1075,9 @@ inline bool is_hex64(const std::string& s) {
     return true;
 }
 
-inline bool is_version_grammar(const std::string& s) {
-    if (s.empty() || s.size() > 64) return false;
-    for (const char c : s) {
-        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-                        (c >= 'A' && c <= 'Z') || c == '.' || c == '-';
-        if (!ok) return false;
-    }
-    return true;
-}
-
-// SEMANTIC VERSION ORDERING (owner correction 2026-09-04, mirroring the
-// site's fix): an update is offered/performed only when the approved
-// version is a genuine UPGRADE over the installed one. An installed Admin
-// NEWER than the approved manifest is never auto-downgraded; a rollback
-// is an explicit controlled operation, not normal update UX.
-// Grammar: MAJOR.MINOR.PATCH with an optional pre-release suffix
-// ("0.1.1-alpha.17"). Standard SemVer precedence: the numeric triple,
-// then no-pre-release outranks pre-release, then pre-release identifiers
-// field by field (numeric identifiers numerically, and lower than
-// alphanumeric ones).
-inline int compare_prerelease(const std::string& a, const std::string& b) {
-    if (a.empty() && b.empty()) return 0;
-    if (a.empty()) return 1;  // a release outranks any pre-release
-    if (b.empty()) return -1;
-    size_t pa = 0, pb = 0;
-    for (;;) {
-        const bool more_a = pa < a.size();
-        const bool more_b = pb < b.size();
-        if (!more_a && !more_b) return 0;
-        if (!more_a) return -1; // fewer identifiers ranks lower
-        if (!more_b) return 1;
-        const size_t ea = a.find('.', pa);
-        const size_t eb = b.find('.', pb);
-        const std::string ia = a.substr(pa, (ea == std::string::npos ? a.size() : ea) - pa);
-        const std::string ib = b.substr(pb, (eb == std::string::npos ? b.size() : eb) - pb);
-        const bool na = !ia.empty() &&
-            ia.find_first_not_of("0123456789") == std::string::npos;
-        const bool nb = !ib.empty() &&
-            ib.find_first_not_of("0123456789") == std::string::npos;
-        if (na && nb) {
-            const long long va = std::stoll(ia);
-            const long long vb = std::stoll(ib);
-            if (va != vb) return va < vb ? -1 : 1;
-        } else if (na != nb) {
-            return na ? -1 : 1; // numeric identifiers rank lower
-        } else if (ia != ib) {
-            return ia < ib ? -1 : 1;
-        }
-        pa = (ea == std::string::npos) ? a.size() : ea + 1;
-        pb = (eb == std::string::npos) ? b.size() : eb + 1;
-    }
-}
-
-// True only when `approved` is a genuine upgrade over `installed`. An
-// unparseable version never wins a comparison (no claim either way).
-inline bool version_is_upgrade(const std::string& approved,
-                               const std::string& installed);
-
-// "x.y.z..." -> the leading numeric triple (pre-release suffixes ignored).
-inline bool parse_version_triple(const std::string& s, long long out[3]) {
-    size_t p = 0;
-    for (int i = 0; i < 3; ++i) {
-        bool any = false;
-        long long v = 0;
-        while (p < s.size() && s[p] >= '0' && s[p] <= '9') {
-            v = v * 10 + (s[p] - '0');
-            ++p;
-            any = true;
-        }
-        if (!any) return false;
-        out[i] = v;
-        if (i < 2) {
-            if (p >= s.size() || s[p] != '.') return false;
-            ++p;
-        }
-    }
-    return true;
-}
-
-inline bool version_is_upgrade(const std::string& approved,
-                               const std::string& installed) {
-    long long ta[3] = {};
-    long long tb[3] = {};
-    if (!parse_version_triple(approved, ta)) return false;
-    if (!parse_version_triple(installed, tb)) return false;
-    for (int i = 0; i < 3; ++i) {
-        if (ta[i] != tb[i]) return ta[i] > tb[i];
-    }
-    auto prerelease_of = [](const std::string& v) -> std::string {
-        // The suffix after the numeric triple's '-', up to any '+' build
-        // metadata; "" = a plain release.
-        size_t p = 0;
-        for (int i = 0; i < 3; ++i) {
-            while (p < v.size() && v[p] >= '0' && v[p] <= '9') ++p;
-            if (i < 2) { if (p >= v.size() || v[p] != '.') return ""; ++p; }
-        }
-        if (p >= v.size() || v[p] != '-') return "";
-        std::string rest = v.substr(p + 1);
-        const size_t plus = rest.find('+');
-        if (plus != std::string::npos) rest.resize(plus);
-        return rest;
-    };
-    return compare_prerelease(prerelease_of(approved), prerelease_of(installed)) > 0;
-}
+// The version grammar, the SemVer ordering and THE ONE DESKTOP UPDATE RULE
+// (update_wanted, with the operator rollback's `withdrawn` list) live in
+// client/admin_version.hpp, pure and unit-tested (tests/admin_version).
 
 // This installation's check-in for the manifest request
 // (shared/usage_checkin.hpp): its identity and minimal state always, plus
@@ -1283,6 +1186,9 @@ inline bool fetch_manifest(Manifest& out, std::string& why, bool scheduled = fal
         why = "manifest size missing or out of bounds";
         return false;
     }
+    // THE OPERATOR ROLLBACK'S WITHDRAWN VERSIONS (owner ruling 2026-11-13):
+    // read strictly; an unreadable list withdraws nothing.
+    out.withdrawn = parse_withdrawn(body);
     // THE CLIENT THE ADMIN NEEDS (0.9.15): read, never a reason to refuse
     // the manifest here. An older client still learns the approved Admin
     // version; what it cannot do is INSTALL that Admin (run_pipeline), and
@@ -1372,6 +1278,7 @@ constexpr unsigned long long kUpdateCheckPeriodMs = 6ull * 60ull * 60ull * 1000u
 
 inline std::mutex g_update_mutex;
 inline std::string g_approved_version;             // "" = no answer yet
+inline std::vector<std::string> g_approved_withdrawn; // the same answer's withdrawn list
 inline unsigned long long g_update_check_tick = 0; // 0 = never attempted
 
 // Refresh the cached approved version when the cache is older than
@@ -1408,7 +1315,20 @@ inline void refresh_update_check(unsigned long long fresh_ms, bool scheduled = f
     if (g_approved_version != manifest.version) {
         log::client("admin: update check: approved version " + manifest.version);
     }
+    if (g_approved_withdrawn != manifest.withdrawn && !manifest.withdrawn.empty()) {
+        std::string list;
+        for (const auto& w : manifest.withdrawn) list += (list.empty() ? "" : ", ") + w;
+        log::client("admin: update check: withdrawn by an operator rollback: " + list);
+    }
     g_approved_version = manifest.version;
+    g_approved_withdrawn = manifest.withdrawn;
+}
+
+// The cached approved version and its withdrawn list, read together.
+inline void approved_snapshot(std::string& approved, std::vector<std::string>& withdrawn) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    approved = g_approved_version;
+    withdrawn = g_approved_withdrawn;
 }
 
 // THE LAUNCH-TIME LOOP BREAKER, PERSISTED (2026-09-04; hardened by the P2
@@ -1439,7 +1359,10 @@ inline void refresh_update_check(unsigned long long fresh_ms, bool scheduled = f
 // hold names ONE exact version (a newer approved version is never held),
 // a successful install/update clears it, and startup housekeeping clears
 // a record that is expired, malformed, or moot because the installed
-// version already reached it.
+// version IS the held one. (Not "the installed version is newer": under an
+// operator rollback the held version is OLDER than the installed one, and the
+// withdrawn list is unknown at startup, so that test would clear a rollback's
+// hold at every start and reopen the re-download loop.)
 inline std::string g_hold_version;      // under g_update_mutex ("" = none)
 inline long long g_hold_failed_utc = 0; //   mirrors state.json
 inline long long g_hold_until_utc = 0;
@@ -1493,7 +1416,7 @@ inline void clear_launch_update_hold() {
 // Startup housekeeping (the reconciliation-order contract in main.cpp):
 // load the persisted hold into this process, dropping a record that can
 // no longer mean anything - expired, malformed, stamped in the future, or
-// moot because the installed Admin already reached the held version.
+// moot because the installed Admin IS the held version.
 inline void reconcile_launch_update_hold() {
     const auto s = state::load();
     if (s.admin_hold_version.empty()) return;
@@ -1504,8 +1427,7 @@ inline void reconcile_launch_update_hold() {
                            s.admin_hold_until_utc <= s.admin_hold_failed_utc;
     const bool expired = now >= s.admin_hold_until_utc;
     const bool future = s.admin_hold_failed_utc > now + 300;
-    const bool moot = !installed.empty() &&
-                      !version_is_upgrade(s.admin_hold_version, installed);
+    const bool moot = !installed.empty() && installed == s.admin_hold_version;
     if (malformed || expired || future || moot) {
         std::lock_guard<std::mutex> lock(g_update_mutex);
         g_hold_version.clear();
@@ -1543,9 +1465,10 @@ inline std::string update_health_json() {
 // THE UPDATE CLAIM, alone (2026-10-22: admin_launch's no-update fallback
 // asks it before showing anything). "update" is a CLAIM and requires a real
 // comparison: both the installed version and the approved version must be
-// known, and the approved version must be a genuine UPGRADE (SemVer
-// ordering; never an automatic downgrade). Unknown installed version = no
-// claim in either direction. A version whose launch-time transaction just
+// known, and THE ONE RULE must hold (admin_version.hpp update_wanted: a
+// genuine UPGRADE, or the installed version is exactly one an operator
+// rollback withdrew; never any other move to an older version). Unknown
+// installed version = no claim in either direction. A version whose launch-time transaction just
 // failed is NOT claimed while the hold lasts (the loop breaker above).
 // Refreshes the cached manifest check when stale (bounded).
 inline bool update_claim(bool launch_context, bool& installed, std::string& admin_version, std::string& approved) {
@@ -1553,13 +1476,9 @@ inline bool update_claim(bool launch_context, bool& installed, std::string& admi
     admin_version.clear();
     if (installed) admin_version = authoritative_admin_version();
     if (installed) refresh_update_check(kUpdateCheckFreshMs);
-    {
-        std::lock_guard<std::mutex> lock(g_update_mutex);
-        approved = g_approved_version;
-    }
-    bool update = installed && !approved.empty() &&
-                  !admin_version.empty() &&
-                  version_is_upgrade(approved, admin_version);
+    std::vector<std::string> withdrawn;
+    approved_snapshot(approved, withdrawn);
+    bool update = installed && update_wanted(approved, admin_version, withdrawn);
     if (update && launch_update_on_hold(approved, launch_context)) update = false;
     return update;
 }
@@ -2217,13 +2136,10 @@ inline void launch_after_update_handoff() {
     // refetches, bounded by the HTTP timeouts).
     refresh_update_check(kUpdateCheckFreshMs);
     std::string approved;
-    {
-        std::lock_guard<std::mutex> lock(g_update_mutex);
-        approved = g_approved_version;
-    }
+    std::vector<std::string> withdrawn;
+    approved_snapshot(approved, withdrawn);
     const std::string installed = authoritative_admin_version();
-    const bool update = !approved.empty() && !installed.empty() &&
-                        version_is_upgrade(approved, installed);
+    const bool update = update_wanted(approved, installed, withdrawn);
     if (!update) {
         // Next surface first: the card holds until the Admin surface is
         // confirmed presented (a concrete launch failure resolves this

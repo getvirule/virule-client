@@ -137,6 +137,45 @@ iphlpapi; `client/virule_client.vcxproj`), so a DLL planted beside the exe
 System32 paths. The permanent signed Setup is unchanged; manifest signing and
 a downgrade floor remain open (owner).
 
+THE OPERATOR ROLLBACK REACHES INSTALLED DESKTOPS (owner ruling 2026-11-13,
+`VIRULE/docs/scratchpads/OWNER_ROLLBACK_PULLBACK_RULING_2026-11-13.md`; Client 0.9.32). An
+operator-initiated rollback (`v2_mvp/helpers/release_rollback.ps1`) also
+updates Desktops that ALREADY installed the withdrawn version, and for users
+it looks and behaves exactly like a normal update on all three paths:
+application restart (the launch check and `admin_launch`), Settings
+(`admin_update_check` + local `admin_install`) and the website (the site reads
+the same manifest and applies the same rule, `v1_mvp_site`
+`src/client/semver.ts` `updateWanted`; its Update sends a page
+`admin_install`). The signal is the Admin manifest's optional `withdrawn` list:
+the exact versions the rollback withdrew, written ONLY by the operator rollback
+(and the staging rehearsal, `release_staging.ps1 -Stage rollback`), absent
+from every forward release, so a forward release clears it. The rule
+(`client/admin_version.hpp`): the approved release is an update when it is a
+genuine upgrade OR the installed version is exactly listed (and is not the
+approved one). A lower approved version that does not list the installed
+version is never installed (no arbitrary downgrade), and there is no public
+downgrade control. The list is read STRICTLY (an array of at most 32 strings
+in the version grammar, one `withdrawn` field); anything else withdraws
+nothing and the manifest is still accepted, so a broken list can only fall
+back to the ordinary upgrade rule, never block an update. Every Desktop
+decision site uses the rule: `update_claim` (Settings, the launch check,
+`admin_launch`'s route), the launch handoff's re-check and the Setup
+takeover's "already current" short-circuit. TRUST BOUNDARY: the manifest is
+still an unsigned pointer written by whoever holds the production deploy
+credentials; the Client trusts only the package bytes (pinned release url
+prefix, exact size, exact SHA-256, VIRULE Authenticode). `withdrawn` adds no
+capability to whoever controls the manifest: that party can already make
+`update` true with a higher version string over an older retained package
+(`installed-release.json` records the manifest's version); the list needs an
+exact match of the installed version. Manifest signing and a downgrade floor
+(audit L-24, above) remain open with the owner. Data compatibility is the
+rollback's own gate: it refuses unless the target and every withdrawn version
+carry the identical Desktop database schema. A Client before 0.9.32 does not
+read the list; it reaches installed Desktops once the Client updates itself
+(the rollback says so when the approved Client is older). Proven by
+`tests\admin_version` (the rule, the strict reading) and
+`tools\rollback_pullback_test.mjs` (the three paths, the refusals, the hold).
+
 LOCAL CALLERS VERSUS OPERATION AUTHORIZATION (owner decision 2026-11-02,
 `VIRULE/docs/specs/evaluation-security.md` decision 16). Reaching the
 bridge is never permission to skip a VIRULE rule. A privileged VIRULE
@@ -175,7 +214,7 @@ in both components).
 | page | `{"type":"uninstall","nonce","timestamp","signature","delete_data"}` | VIRULE uninstall after verification; `delete_data` (default false) is the explicit destructive option |
 | local | `{"type":"qa_verify_url","token"}` | a second instance forwarding a `virule://` launch |
 | local | `{"type":"wake"}` / `{"type":"shutdown"}` | keep-alive no-op / clean exit (Setup replacing the exe; since 0.9.12 an event wakes the serve loop so draining starts at once, not at its next 1 s poll, narrowing the race with Setup's fixed 2 s wait before it replaces the exe) |
-| local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below |
+| local | `{"type":"admin_update_check"}` | answers `admin_update_status` (installed/approved versions + `update`); refreshes the cached manifest check when stale; a caller declaring `{"context":"launch"}` gets the launch-retry hold semantics below. `update` is THE ONE DESKTOP UPDATE RULE (`client/admin_version.hpp` `update_wanted`, 0.9.32): a genuine SemVer upgrade, or the installed version is EXACTLY one the manifest's `withdrawn` list names (an operator rollback, below) |
 | local | `{"type":"update_health"}` | answers `{"type":"update_health","blocked":bool}` from the persisted update-connectivity record (see "Update connectivity health"); a read only, it never makes a request (v0.8.6) |
 | local | `{"type":"admin_launch"}` | virule.exe handing over a user-initiated launch of an out-of-date managed Admin: the client updates first (native "Updating…" card) and launches only the new Admin; a failed update launches the current Admin, never blocking the launch. THE FALLBACK (owner ruling 2026-10-22, for evaluation games built before `assignment_open`, whose "Quit and Open VIRULE" sends `admin_launch`): the update claim is asked first, showing nothing (`admin_install::approved_update_available`, the same claim `admin_update_check` answers, launch context); with NO approved update the Admin is opened or focused as `admin_open` does, with no card (an update in flight is joined; a running Admin is focused at once and, if it was a handing-off virule.exe that exits within 10 s, launched); with a real approved update the behavior is exactly the update-on-launch handoff above |
 | local | `{"type":"assignment_open","assignment_id":"<32 hex>"}` | THE EVALUATION WRAPPER'S Write Evaluation (owner ruling 2026-10-22, `client/assignment_open.hpp`): records an in-memory OPEN INTENT (latest wins; expires after 10 minutes; survives an Admin update relaunch because the Client process stays), bumps the change counter, then opens or focuses the Admin through the `admin_open` path (an update in flight is joined; a running Admin is focused; else it is launched); never the "Updating…" card (virule.exe itself may still run a real approved update-on-launch). Answers `{"type":"assignment_open_started"}`, or `error` (malformed id, Admin not installed or not started); refused while uninstalling and during the self-update drain |
@@ -1297,7 +1336,11 @@ window for callers declaring `{"context":"launch"}` (the virule.exe
 launch check), so a persistently failing package is never re-downloaded
 on every launch while Settings and virule.app keep seeing the update.
 The hold is cleared by any successful install/update and by startup
-housekeeping (expired, moot, malformed, future-stamped). WATCHED
+housekeeping (expired, malformed, future-stamped, or moot: the installed
+Admin IS the held version; 0.9.32 narrowed "moot" from "the installed
+version is not older than the held one", which under an operator rollback,
+where the held version is the OLDER restored release, cleared the hold at
+every start and reopened the re-download loop). WATCHED
 RELAUNCH (P2): every update-path Admin launch is watched (a
 CreateProcess failure or an early exit with no managed process is a
 concrete failure); one automatic retry after 2 s, then the client-owned

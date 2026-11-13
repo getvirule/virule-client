@@ -219,16 +219,17 @@ inline void run_admin(bool shortcut, const std::string& capability) {
     // machine") is satisfied by opening it; re-running the verified
     // pipeline would re-download the whole package for nothing. Unknown
     // versions never short-circuit (no currency claims from unknowns).
+    // "Current" is THE ONE RULE's answer (admin_version.hpp update_wanted):
+    // an installed version an operator rollback withdrew is not current, so
+    // it takes the approved release like any other update.
     if (admin_install::admin_installed()) {
         admin_install::refresh_update_check(admin_install::kUpdateCheckFreshMs);
         std::string approved;
-        {
-            std::lock_guard<std::mutex> lock(admin_install::g_update_mutex);
-            approved = admin_install::g_approved_version;
-        }
+        std::vector<std::string> withdrawn;
+        admin_install::approved_snapshot(approved, withdrawn);
         const std::string installed = admin_install::authoritative_admin_version();
         if (!approved.empty() && !installed.empty() &&
-            !admin_install::version_is_upgrade(approved, installed)) {
+            !admin_install::update_wanted(approved, installed, withdrawn)) {
             // THE LAST HOP IS PROVEN LIKE EVERY OTHER (dead-air fix
             // 2026-09-10): the launch is watched (audit M15's bounded
             // recovery, which resolves THIS card into Try again on a
