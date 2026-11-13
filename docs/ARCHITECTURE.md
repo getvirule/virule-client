@@ -406,9 +406,8 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   saved before the list was kept falls back to the capability alone until
   `/me` answers. It is a menu-offer flag only: confirmed participation is
   the account's `qa_tester` capability and `qa_linked_testers`.
-- DEVELOPER KEY CUSTODY (owner brief 2026-11-12 section 6, the PRESERVE half
-  of optional account-based recovery; in source, not released, no version
-  bump; `src/shared/developer_custody.hpp`, `account.hpp`
+- DEVELOPER KEY CUSTODY (owner briefs 2026-11-12, optional account-based
+  recovery; Client 0.9.31 as published to staging from the commit after ee930ec (Setup 0.9.31, cut from ee930ec, contains no custody code); `src/shared/developer_custody.hpp`, `account.hpp`
   `deliver_custody_locked`; service half VIRULE_BACKEND `docs/ACCOUNTS.md`
   "Developer key custody"). AUTOMATIC while signed in: right after a sign-in
   reads `/v1/account/me`, and after every re-confirmation (`confirm_now`),
@@ -419,12 +418,16 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   authorization: `{machine_key, timestamp, machine_signature}`, the machine
   key signing `virule-developer-custody.v1|<API host>|<device id>|<machine key>|<timestamp>`
   (the developer machine binding's convention, "Machine proofs"). ONCE PER
-  (account hint, machine key), remembered in `client\developer_custody.json`
-  (no secret: the hint, the public key, the outcome): 200 `registered` or
-  `held` is never sent again; 409 `custody_held_elsewhere` (another account
-  holds this key) is recorded as `held_elsewhere` and never retried; nothing
-  shows it today, and whether and how VIRULE Desktop shows it is PENDING
-  OWNER DECISION; anything else
+  (account hint, machine key, device authorization), remembered in
+  `client\developer_custody.json` (no secret: the hint, the public key, the
+  device id, the outcome): 200 `registered` or `held` is not sent again under
+  the same sign-in; a NEW sign-in (a new device authorization, which a
+  password change or an account recovery forces) proves custody again, so
+  the service records the key's proof as fresh for the account's current
+  security state; 409 `custody_held_elsewhere` (another account holds this
+  key) is recorded as `held_elsewhere` and not retried under that sign-in
+  (shown nowhere: the computer keeps managing its own builds with its own
+  key, unchanged); anything else
   (offline, 5xx, 429, `clock_skew`, a refusal) waits on the evidence
   delivery's ladder (10 s, 60 s, 5 min, 15 min, then every 30 min) for a
   later confirmation. A 401 other than `clock_skew` refreshes once and sends
@@ -434,8 +437,15 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   the real service, the check-in's rule (`admin_install.hpp`
   `checkin_suppressed`); with `--account-endpoint` it sends to that test
   service. Removed with the client state directory at uninstall; a later
-  registration is answered `held`. IT AUTHORIZES NOTHING: the successor
-  authorization (a new key acting for a lost one) is PENDING OWNER DECISION.
+  registration is answered `held`. RECOVERY: the service lets a key act for
+  every other key in the same account's custody (builds, press access,
+  Press and QA Activity, QA testers) while the account is an active
+  developer without a financial hold, this key's proof is fresh, and this
+  computer's sign-in (the device authorization behind its latest proof) is
+  live now (VIRULE_BACKEND `src/developer_authority.ts`, `docs/ACCOUNTS.md`,
+  the full rule); a key
+  never placed in custody, or anonymous use, keeps exactly its own
+  authority.
   Units: `tests/developer_custody` (message bytes, body, the record, every
   gate, 409, the ladder).
 - Development seam: `--account-endpoint=http(s)://127.0.0.1:<port>` (loopback

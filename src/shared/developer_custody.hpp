@@ -7,7 +7,7 @@
 //
 // While a developer is signed in here, this Client proves this computer's
 // Developer Machine key (dev_machine.cred, machine_identity.hpp) to the
-// service ONCE per (account, machine key), so the account holds a proven
+// service ONCE per (account, machine key, device authorization), so the account holds a proven
 // record of it made BEFORE the computer can be lost:
 //
 //   POST /v1/account/developer-custody   (this installation's DPoP authorization)
@@ -26,18 +26,25 @@
 // service: the check-in's rule (admin_install.hpp checkin_suppressed).
 //
 // THE RECORD (%LOCALAPPDATA%\VIRULE\client\developer_custody.json, no
-// secret: the opaque account hint, the public key, the outcome):
-//   registered | held      the service holds this key for this account; never sent again
+// secret: the opaque account hint, the public key, the device id, the
+// outcome), one entry per (account, key, device authorization):
+//   registered | held      the service holds this key for this account; not
+//                          sent again under the same sign-in (a NEW sign-in
+//                          proves it again, so the service sees a fresh proof
+//                          from a live device authorization)
 //   held_elsewhere         409 custody_held_elsewhere: another account holds the
-//                          key; recorded, never retried (whether VIRULE Desktop
-//                          shows it is PENDING OWNER DECISION)
+//                          key; recorded and not retried under that sign-in
+//                          (nothing is shown: this computer keeps managing its
+//                          own builds with its own key)
 //   (no outcome)           not settled yet: `failures` and `next_attempt` place it on
 //                          the retry ladder (the evidence delivery's steps,
 //                          evidence_queue.hpp kBackoffLadder)
 // Removed with the client state directory by every uninstall; a later
 // registration is then answered `held` (idempotent at the service).
 //
-// IT AUTHORIZES NOTHING, here or at the service. Pure apart from the record
+// The service decides what custody authorizes (account-based recovery:
+// VIRULE_BACKEND src/developer_authority.ts, docs/ACCOUNTS.md); this file
+// only proves possession. Pure apart from the record
 // file: the signing and the sending are injected (client/account.hpp
 // deliver_custody_locked), which is what lets the whole exchange be tested
 // without a credential, a network or the bridge port.
@@ -103,6 +110,7 @@ inline std::int64_t backoff_seconds(std::int64_t failures) {
 struct Entry {
     std::string account;      // the service's opaque account hint (32 hex)
     std::string machine_key;  // 64 hex
+    std::string device;       // the device authorization (id) the proof was made under
     std::string outcome;      // "registered" | "held" | "held_elsewhere" | "" (unsettled)
     std::int64_t failures = 0;
     std::int64_t next_attempt = 0; // epoch seconds
@@ -117,12 +125,18 @@ inline bool settled(const Entry& e) {
     return e.outcome == "registered" || e.outcome == "held" || e.outcome == "held_elsewhere";
 }
 
-inline Entry* find(Record& r, const std::string& account, const std::string& key) {
-    for (auto& e : r.entries) if (e.account == account && e.machine_key == key) return &e;
+/* One entry per (account, machine key, DEVICE AUTHORIZATION). A new sign-in
+   is a new device authorization (a new device id), so custody is proven
+   again under it: the service then records that this key's proof is fresh
+   for the account's current security state, which is what lets this
+   computer act for the account's other keys after a password change or an
+   account recovery (VIRULE_BACKEND src/developer_authority.ts). */
+inline Entry* find(Record& r, const std::string& account, const std::string& key, const std::string& device) {
+    for (auto& e : r.entries) if (e.account == account && e.machine_key == key && e.device == device) return &e;
     return nullptr;
 }
-inline const Entry* find(const Record& r, const std::string& account, const std::string& key) {
-    for (const auto& e : r.entries) if (e.account == account && e.machine_key == key) return &e;
+inline const Entry* find(const Record& r, const std::string& account, const std::string& key, const std::string& device) {
+    for (const auto& e : r.entries) if (e.account == account && e.machine_key == key && e.device == device) return &e;
     return nullptr;
 }
 
@@ -145,6 +159,7 @@ inline Record parse(const std::string& t) {
         long long n = 0;
         (void)json_scan::find_string_in(t, b, e, "account", x.account);
         (void)json_scan::find_string_in(t, b, e, "machine_key", x.machine_key);
+        (void)json_scan::find_string_in(t, b, e, "device", x.device);
         (void)json_scan::find_string_in(t, b, e, "outcome", x.outcome);
         if (json_scan::find_number_in(t, b, e, "failures", n)) x.failures = n;
         if (json_scan::find_number_in(t, b, e, "next_attempt", n)) x.next_attempt = n;
@@ -163,7 +178,8 @@ inline std::string serialize(const Record& r) {
     for (size_t i = 0; i < r.entries.size(); ++i) {
         const Entry& e = r.entries[i];
         if (i) s += ",";
-        s += "{\"account\":\"" + e.account + "\",\"machine_key\":\"" + e.machine_key + "\",\"outcome\":\"" + e.outcome +
+        s += "{\"account\":\"" + e.account + "\",\"machine_key\":\"" + e.machine_key +
+             "\",\"device\":\"" + (is_hex(e.device, 32) ? e.device : std::string()) + "\",\"outcome\":\"" + e.outcome +
              "\",\"failures\":" + std::to_string(e.failures) + ",\"next_attempt\":" + std::to_string(e.next_attempt) +
              ",\"updated\":" + std::to_string(e.updated) + "}";
     }
@@ -250,7 +266,7 @@ inline Decision decide(const Inputs& in, const std::string& machine_key, const R
     if (in.account_status != "active" || in.cap_developer != "active") return Decision::not_developer;
     if (!is_hex(in.account_hint, 32) || in.device_id.empty()) return Decision::no_context;
     if (!is_hex(machine_key, 64)) return Decision::no_credential;
-    const Entry* e = find(r, in.account_hint, machine_key);
+    const Entry* e = find(r, in.account_hint, machine_key, in.device_id);
     if (e && settled(*e)) return Decision::settled;
     // A clock moved back far past the ladder's cap does not strand it.
     if (e && e->next_attempt > now && e->next_attempt - now <= kLadderCap) return Decision::waiting;
@@ -258,14 +274,15 @@ inline Decision decide(const Inputs& in, const std::string& machine_key, const R
 }
 
 /** Record the service's answer. 200 {custody:"registered"|"held"}: settled.
- *  409 custody_held_elsewhere: settled as held_elsewhere, never retried.
+ *  409 custody_held_elsewhere: settled as held_elsewhere, not retried under this sign-in.
  *  Anything else (no answer, 5xx, 429, a refusal such as clock_skew or a
  *  capability the service no longer confirms): the next ladder step. */
 inline void apply_answer(Record& r, const std::string& account, const std::string& key,
+                         const std::string& device,
                          unsigned long status, const std::string& reply, std::int64_t now) {
-    Entry* e = find(r, account, key);
+    Entry* e = find(r, account, key, device);
     if (!e) {
-        r.entries.push_back(Entry{ account, key, "", 0, 0, now });
+        r.entries.push_back(Entry{ account, key, device, "", 0, 0, now });
         e = &r.entries.back();
     }
     e->updated = now;
@@ -322,8 +339,8 @@ inline Decision run(const Inputs& in, Deps& d) {
     const std::string sig = d.sign_hex ? d.sign_hex(message(d.host, in.device_id, key, ts)) : std::string();
     if (!is_hex(sig, 128)) return Decision::no_credential;
     const Reply reply = d.send ? d.send(body(key, ts, sig)) : Reply{};
-    apply_answer(r, in.account_hint, key, reply.status, reply.body, d.now);
-    const Entry* e = find(r, in.account_hint, key);
+    apply_answer(r, in.account_hint, key, in.device_id, reply.status, reply.body, d.now);
+    const Entry* e = find(r, in.account_hint, key, in.device_id);
     if (d.log) {
         d.log(std::string("account: developer key custody: ") +
               (e && !e->outcome.empty() ? e->outcome : "retry later (" + std::to_string(reply.status) + ")"));

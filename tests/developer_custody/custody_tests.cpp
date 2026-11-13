@@ -90,7 +90,7 @@ int main() {
             f.signed_message == dc::message(HOST, DEVICE, KEY_1, ts));
         check("the body sent is that key, instant and signature", f.sent_body == dc::body(KEY_1, ts, SIG));
         const dc::Record rec = dc::load(file);
-        const dc::Entry* e = dc::find(rec, HINT_A, KEY_1);
+        const dc::Entry* e = dc::find(rec, HINT_A, KEY_1, DEVICE);
         check("success is remembered locally", e && e->outcome == "registered");
         std::ifstream in(file, std::ios::binary);
         const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -114,7 +114,7 @@ int main() {
         (void)dc::run(developer(), d5);
         const dc::Record r2 = dc::load(f2);
         check("`held` (already registered, e.g. after a reinstall) is remembered too",
-            dc::find(r2, HINT_A, KEY_1) && dc::find(r2, HINT_A, KEY_1)->outcome == "held");
+            dc::find(r2, HINT_A, KEY_1, DEVICE) && dc::find(r2, HINT_A, KEY_1, DEVICE)->outcome == "held");
     }
 
     // ---- the gates: none of them signs, reads the credential or calls
@@ -181,7 +181,7 @@ int main() {
         (void)dc::run(developer(), d);
         const dc::Record rec = dc::load(file);
         check("a 409 custody_held_elsewhere is recorded (so the Desktop could show it)",
-            dc::find(rec, HINT_A, KEY_1) && dc::find(rec, HINT_A, KEY_1)->outcome == "held_elsewhere");
+            dc::find(rec, HINT_A, KEY_1, DEVICE) && dc::find(rec, HINT_A, KEY_1, DEVICE)->outcome == "held_elsewhere");
         Fake g;
         dc::Deps d2 = deps(g, file, T + 100000);
         check("...and stops the retries for good", dc::run(developer(), d2) == dc::Decision::settled && g.sends == 0);
@@ -190,7 +190,7 @@ int main() {
         const fs::path f2 = fresh_file();
         dc::Deps d3 = deps(h, f2, T);
         (void)dc::run(developer(), d3);
-        check("a 409 that is not custody_held_elsewhere is not settled", !dc::settled(*dc::find(dc::load(f2), HINT_A, KEY_1)));
+        check("a 409 that is not custody_held_elsewhere is not settled", !dc::settled(*dc::find(dc::load(f2), HINT_A, KEY_1, DEVICE)));
     }
 
     // ---- failures: the retry ladder
@@ -200,7 +200,7 @@ int main() {
         const fs::path file = fresh_file();
         dc::Deps d = deps(f, file, T);
         (void)dc::run(developer(), d);
-        const dc::Entry e1 = *dc::find(dc::load(file), HINT_A, KEY_1);
+        const dc::Entry e1 = *dc::find(dc::load(file), HINT_A, KEY_1, DEVICE);
         check("no answer (offline) is not settled; next attempt after the first step", e1.outcome.empty() && e1.failures == 1 && e1.next_attempt == T + 10);
         Fake g;
         dc::Deps d2 = deps(g, file, T + 5);
@@ -209,13 +209,13 @@ int main() {
         h.answer = { 503, "" };
         dc::Deps d3 = deps(h, file, T + 10);
         check("at the step: tries again", dc::run(developer(), d3) == dc::Decision::send && h.sends == 1);
-        const dc::Entry e2 = *dc::find(dc::load(file), HINT_A, KEY_1);
+        const dc::Entry e2 = *dc::find(dc::load(file), HINT_A, KEY_1, DEVICE);
         check("a 5xx is the next step (60 s)", e2.failures == 2 && e2.next_attempt == T + 10 + 60);
         Fake c;
         c.answer = { 401, "{\"error\":{\"code\":\"clock_skew\",\"message\":\"x\"}}" };
         dc::Deps d4 = deps(c, file, T + 70);
         (void)dc::run(developer(), d4);
-        const dc::Entry e3 = *dc::find(dc::load(file), HINT_A, KEY_1);
+        const dc::Entry e3 = *dc::find(dc::load(file), HINT_A, KEY_1, DEVICE);
         check("a clock_skew refusal is the next step too", e3.failures == 3 && e3.next_attempt == T + 70 + 300);
         check("the ladder's last step repeats", dc::backoff_seconds(50) == 1800);
         Fake z;
@@ -224,7 +224,7 @@ int main() {
         Fake ok;
         dc::Deps d6 = deps(ok, file, T + 100000);
         (void)dc::run(developer(), d6);
-        const dc::Entry e4 = *dc::find(dc::load(file), HINT_A, KEY_1);
+        const dc::Entry e4 = *dc::find(dc::load(file), HINT_A, KEY_1, DEVICE);
         check("a later success settles it and clears the ladder", e4.outcome == "registered" && e4.failures == 0);
     }
 
@@ -234,14 +234,30 @@ int main() {
         { std::ofstream o(file, std::ios::binary); o << "garbage {"; }
         check("an unreadable record is empty", dc::load(file).entries.empty());
         dc::Record r;
-        r.entries.push_back(dc::Entry{ HINT_A, KEY_1, "registered", 0, 0, T });
-        r.entries.push_back(dc::Entry{ HINT_B, KEY_2, "", 2, T + 60, T });
-        r.entries.push_back(dc::Entry{ "nothex", KEY_2, "registered", 0, 0, T });
+        r.entries.push_back(dc::Entry{ HINT_A, KEY_1, DEVICE, "registered", 0, 0, T });
+        r.entries.push_back(dc::Entry{ HINT_B, KEY_2, DEVICE, "", 2, T + 60, T });
+        r.entries.push_back(dc::Entry{ "nothex", KEY_2, DEVICE, "registered", 0, 0, T });
         check("the record saves", dc::save(file, r));
         const dc::Record back = dc::load(file);
         check("it reads back, malformed entries dropped", back.entries.size() == 2 &&
             back.entries[0].outcome == "registered" && back.entries[1].failures == 2 && back.entries[1].next_attempt == T + 60);
         check("a missing file is empty", dc::load(dir / "absent.json").entries.empty());
+        check("the device authorization reads back", back.entries[0].device == DEVICE);
+    }
+
+    // ---- a NEW sign-in (a new device authorization) proves custody again,
+    //      so the service records a proof fresh for the account's current
+    //      security state (recovery after a password change); the same
+    //      sign-in never repeats a settled answer.
+    {
+        dc::Record r;
+        r.entries.push_back(dc::Entry{ HINT_A, KEY_1, DEVICE, "held", 0, 0, T });
+        check("same device authorization, settled: not sent again",
+            dc::decide(developer(), KEY_1, r, T) == dc::Decision::settled);
+        dc::Inputs again = developer();
+        again.device_id = "ccccccccccccccccdddddddddddddddd";
+        check("a new device authorization: sent again",
+            dc::decide(again, KEY_1, r, T) == dc::Decision::send);
     }
 
     fs::remove_all(dir, ec);
