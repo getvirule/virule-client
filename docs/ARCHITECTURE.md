@@ -720,8 +720,8 @@ deliberately narrow and structural:
   command-line seams, below). Setup is STRICTER in source: its own
   `--dev-unsigned` and `--manifest-url=` are honored only in a sandboxed
   run, never merely in a staging build (Setup's development seams, below).
-  The permanent signed Setups (3454b27) predate that and still parse both
-  ungated until the owner re-cuts them;
+  The canonical signed Setups were re-cut with it (0.9.31, source ee930ec,
+  2026-11-12; "The canonical Setup" below);
 - a staging build only ever downloads from the staging release repository
   and the staging Worker, neither of which holds a production artifact;
 - the exact-size and exact-SHA-256 gates are NOT relaxed. A staging
@@ -797,14 +797,17 @@ there). RESIDUAL, inside the same-user trust model: a process already
 running as this Windows user can start Setup with a redirected
 `LOCALAPPDATA` and its own loopback server; that installs into the
 redirected tree only. Proof: `tests/environment/run_tests.bat`.
-THE SHIPPED SETUPS ARE NOT FIXED: the two PERMANENT signed Setups
-(`release/setup/{production,staging}/Virule-Setup.exe`, cut from 3454b27,
-`release/setup/canonical_setup.json`) predate this rule and still honor
-both seams ungated, from any host and on a real profile. Setup changes
-only by explicit owner authorization, and both are re-cut together from
-one commit (owner ruling 2026-10-19, "The canonical Setup" below); until
-the owner authorizes that re-cut through the existing signing and release
-procedure, the defect remains in what users download.
+THE CANONICAL SETUPS CARRY THE FIX: both permanent signed Setups
+(`release/setup/{production,staging}/Virule-Setup.exe`,
+`release/setup/canonical_setup.json`) were re-cut TOGETHER from ee930ec on
+2026-11-12 under the owner's finish brief of that day ("prepare the
+corrected signed installers using established release procedures. Do
+not independently replace production installers"): built, signed with
+the VIRULE identity, approved and pinned. The STAGING Setup is published
+by the next staging release; the PRODUCTION Setup is published only by a
+production Client publish (`publish.ps1`), which the owner authorizes:
+until then the Setup people download from production is the 3454b27 one
+and still honors both seams ungated.
 
 **Staging distribution** uses FIXED tags on `getvirule/virule-staging-releases`
 rather than a `latest` pointer, because that repository also carries the
@@ -861,8 +864,8 @@ identity and timestamped, committed in this repository:
 
 | File | Pinned in `release/setup/canonical_setup.json` |
 |---|---|
-| `release/setup/production/Virule-Setup.exe` | Setup 0.9.22, source 3454b27, signed 2026-10-31 |
-| `release/setup/staging/Virule-Setup.exe` | Setup 0.9.22, source 3454b27, signed 2026-10-31 |
+| `release/setup/production/Virule-Setup.exe` | Setup 0.9.31, source ee930ec, signed 2026-11-12 (not yet published to production) |
+| `release/setup/staging/Virule-Setup.exe` | Setup 0.9.31, source ee930ec, signed 2026-11-12 |
 
 `helpers/canonical_setup.ps1` is the one check, and it fails closed: a
 missing pin, a missing file, any byte or size difference, an invalid,
@@ -901,7 +904,8 @@ then `Assert-PublishedSetup`), because `publish.ps1` itself publishes the
 allowed was the first staging pin (2026-10-19), because no staging Setup
 existed.
 
-BOTH SETUPS SHARE ONE SOURCE since the 2026-10-31 re-cut (3454b27; owner
+BOTH SETUPS SHARE ONE SOURCE (re-cut 2026-11-12 from ee930ec: the gated
+development seams; before that the 2026-10-31 re-cut, 3454b27; owner
 brief 2026-10-31): the production Setup gained what the staging one already
 had (the evaluator entry point, 0.9.9; the "Continuing…" card, 0.9.10) and
 both gained the Windows 10 refusal. Compatibility with the production 0.9.0

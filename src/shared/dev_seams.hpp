@@ -29,9 +29,10 @@
 // downloads and runs on a real profile, and the staging Setup is signed too
 // while verifying no Authenticode (kRequireAuthenticode is false there), so a
 // staging exemption would let one argument install any payload from any host.
-// --manifest-url= must also be loopback (is_loopback_url). The PERMANENT
-// signed Setups (release/setup/, cut from 3454b27) predate this rule and
-// still parse both seams ungated until the owner authorizes their re-cut.
+// --manifest-url= must also be loopback (is_loopback_url). The canonical
+// signed Setups (release/setup/) were re-cut with this rule from ee930ec on
+// 2026-11-12; the production one reaches users at the next production
+// Client publish.
 //
 // --no-register is NOT gated: it relaxes no gate (it only skips the machine
 // registrations) and every harness, including the unsandboxed bridge_test,
