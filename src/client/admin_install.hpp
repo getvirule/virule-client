@@ -1281,6 +1281,32 @@ inline std::string g_approved_version;             // "" = no answer yet
 inline std::vector<std::string> g_approved_withdrawn; // the same answer's withdrawn list
 inline unsigned long long g_update_check_tick = 0; // 0 = never attempted
 
+// EVERY ANSWER THE MANIFEST GIVES IS THE CACHED ANSWER (0.9.33). The cached
+// approved version and withdrawn list are replaced, and the freshness stamp
+// renewed, by every successful manifest fetch: the quiet check below AND the
+// install/update operation's own fetches (run, run_pipeline). Before 0.9.33
+// only the quiet check wrote the cache, which forward releases never noticed
+// (the version just installed is never older than a cached one), but an
+// operator rollback did: the update installed the restored release while the
+// cache still named the withdrawn newer one, so the relaunched Desktop's
+// launch check claimed that version and handed the launch straight back (the
+// Desktop never appeared and the Try again card showed; found by the staging
+// rollback rehearsal of 2026-11-13).
+inline void remember_manifest(const Manifest& manifest) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (g_approved_version != manifest.version) {
+        log::client("admin: update check: approved version " + manifest.version);
+    }
+    if (g_approved_withdrawn != manifest.withdrawn && !manifest.withdrawn.empty()) {
+        std::string list;
+        for (const auto& w : manifest.withdrawn) list += (list.empty() ? "" : ", ") + w;
+        log::client("admin: update check: withdrawn by an operator rollback: " + list);
+    }
+    g_approved_version = manifest.version;
+    g_approved_withdrawn = manifest.withdrawn;
+    g_update_check_tick = GetTickCount64();
+}
+
 // Refresh the cached approved version when the cache is older than
 // `fresh_ms`. The attempt instant is stamped up front so a failing network
 // can never turn the quiet check into a hammer.
@@ -1311,17 +1337,7 @@ inline void refresh_update_check(unsigned long long fresh_ms, bool scheduled = f
         return;
     }
     note_client_requirement(manifest);
-    std::lock_guard<std::mutex> lock(g_update_mutex);
-    if (g_approved_version != manifest.version) {
-        log::client("admin: update check: approved version " + manifest.version);
-    }
-    if (g_approved_withdrawn != manifest.withdrawn && !manifest.withdrawn.empty()) {
-        std::string list;
-        for (const auto& w : manifest.withdrawn) list += (list.empty() ? "" : ", ") + w;
-        log::client("admin: update check: withdrawn by an operator rollback: " + list);
-    }
-    g_approved_version = manifest.version;
-    g_approved_withdrawn = manifest.withdrawn;
+    remember_manifest(manifest);
 }
 
 // The cached approved version and its withdrawn list, read together.
@@ -1719,6 +1735,7 @@ inline std::string run_pipeline(bool shortcut, bool was_installed) {
         return "failed";
     }
     note_client_requirement(manifest);
+    remember_manifest(manifest);
     // THE MANIFEST GATE (0.9.15): an Admin this client cannot serve is not
     // installed by this client (run() already decided this before closing
     // any Admin; this is the backstop for a manifest that changed between).
@@ -2020,6 +2037,7 @@ inline std::string run(bool shortcut, bool native_feedback = false) {
         std::string why;
         if (fetch_manifest(m, why)) {
             note_client_requirement(m);
+            remember_manifest(m);
             if (m.client_too_old) {
                 return client_update_first(m, shortcut, native_feedback, g_launch_after_requested.load(),
                                            [] { broadcast_result("failed", ""); });

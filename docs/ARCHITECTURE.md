@@ -172,9 +172,15 @@ exact match of the installed version. Manifest signing and a downgrade floor
 rollback's own gate: it refuses unless the target and every withdrawn version
 carry the identical Desktop database schema. A Client before 0.9.32 does not
 read the list; it reaches installed Desktops once the Client updates itself
-(the rollback says so when the approved Client is older). Proven by
+(the rollback says so when the approved Client is older). THE CACHE IS THE LATEST ANSWER (0.9.33): every successful manifest fetch,
+the install/update operation's own included (`remember_manifest`), replaces
+the cached approved version and withdrawn list; before, only the quiet
+check did, and a rollback that arrived while the cache named the withdrawn
+newer version made the relaunched Desktop hand its launch straight back
+(found by the staging rollback rehearsal, 2026-11-13). Proven by
 `tests\admin_version` (the rule, the strict reading) and
-`tools\rollback_pullback_test.mjs` (the three paths, the refusals, the hold).
+`tools\rollback_pullback_test.mjs` (the three paths, the refusals, the hold,
+the cache after a pull-back).
 
 LOCAL CALLERS VERSUS OPERATION AUTHORIZATION (owner decision 2026-11-02,
 `VIRULE/docs/specs/evaluation-security.md` decision 16). Reaching the

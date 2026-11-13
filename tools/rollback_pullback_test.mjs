@@ -26,6 +26,9 @@
 //      website (a PAGE admin_install from the staging origin, what the site's
 //      Update sends): each installs alpha.1 (installed-release.json) and then
 //      claims no further update;
+//   F. THE CACHE FOLLOWS THE OPERATION: a rollback that arrives while the
+//      client caches the forward manifest; after the website's Update pulls
+//      the Desktop back, no update is claimed (the rehearsal finding);
 //   E. THE LOOP BREAKER SURVIVES A RESTART: a failed launch-time pull-back
 //      records the hold for alpha.1; a restarted client keeps it (the old
 //      "moot" rule cleared it at every start because alpha.1 < alpha.2), so the
@@ -280,11 +283,12 @@ const pkgSha = crypto.createHash("sha256").update(pkg).digest("hex");
 let withdrawn;          // undefined = no field
 let shaServed = pkgSha;
 let packageFetches = 0;
+let forward = false;    // true = the forward manifest: approved = the installed alpha.2
 const server = http.createServer((req, res) => {
   if (req.url.startsWith("/admin-manifest.json")) {
-    const m = { version: RESTORED, channel: "alpha", url: `http://127.0.0.1:${server.address().port}/package.zip`,
+    const m = { version: forward ? INSTALLED : RESTORED, channel: "alpha", url: `http://127.0.0.1:${server.address().port}/package.zip`,
       sha256: shaServed, size: pkg.length, minimumClientVersion: "0.9.0" };
-    if (withdrawn !== undefined) m.withdrawn = withdrawn;
+    if (withdrawn !== undefined && !forward) m.withdrawn = withdrawn;
     req.on("data", () => {});
     req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(m)); });
     return;
@@ -368,6 +372,26 @@ try {
   const pageAck = await ask('{"type":"admin_install","shortcut":false,"capability":"dev_tools"}', "admin_install_started", { origin: PAGE_ORIGIN, timeoutMs: 10000 });
   check("the page's Update is accepted", !!pageAck, pageAck);
   check("...the Desktop is now the restored release", await waitFor(() => installedVersion() === RESTORED, 30000), installedVersion());
+
+  console.log("F. the cache follows the operation's own manifest (staging rehearsal finding, 2026-11-13)");
+  // The client caches the FORWARD manifest (approved = the installed alpha.2:
+  // current), then the operator rolls back while it keeps running: the
+  // website's Update (it reads the manifest itself) pulls the Desktop back,
+  // and afterwards NO update may be claimed (before 0.9.33 the cache still
+  // named alpha.2, so the relaunched Desktop handed its launch straight back).
+  await stopClient(); writeAdminTree(ADMIN_DIR, INSTALLED); writeState();
+  forward = true;
+  check("client restarted on alpha.2 with the forward manifest (approved alpha.2)", await startClient(manifestUrl)); await requireSandbox("F");
+  u = await claim(false);
+  check("...current: no update, approved alpha.2 cached", !!u && /"update":false/.test(u) && u.includes(`"approved_version":"${INSTALLED}"`), u);
+  forward = false; withdrawn = [INSTALLED];
+  const pageAck2 = await ask('{"type":"admin_install","shortcut":false,"capability":"dev_tools"}', "admin_install_started", { origin: PAGE_ORIGIN, timeoutMs: 10000 });
+  check("the website's Update after the rollback is accepted", !!pageAck2, pageAck2);
+  check("...the Desktop is now the restored release", await waitFor(() => installedVersion() === RESTORED, 30000), installedVersion());
+  await waitFor(() => false, 1500);
+  u = await claim(true);
+  check("...and the launch check claims NOTHING (the cache is the operation's manifest, not the stale forward one)",
+    !!u && /"update":false/.test(u) && u.includes(`"approved_version":"${RESTORED}"`), u);
 
   console.log("E. the launch-update hold survives a restart");
   await stopClient(); writeAdminTree(ADMIN_DIR, INSTALLED); writeState();
