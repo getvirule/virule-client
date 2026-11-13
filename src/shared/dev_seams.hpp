@@ -21,9 +21,17 @@
 // RESIDUAL, inside the documented same-user trust model (ARCHITECTURE.md,
 // "The origin check defends against the WEB, not against local code"): a
 // process already running as this Windows user that starts the client with a
-// redirected LOCALAPPDATA can still reach them. Setup parses its own two
-// seams (--dev-unsigned, --manifest-url=) in setup/main.cpp, ungated; the
-// permanent signed Setups keep that until the owner re-cuts them.
+// redirected LOCALAPPDATA can still reach them.
+//
+// SETUP'S TWO SEAMS (--dev-unsigned, --manifest-url=; owner brief 2026-11-12
+// section 7) follow a STRICTER rule, setup_permitted() below: a sandboxed run
+// ONLY, never merely a staging build. Setup is the signed executable a user
+// downloads and runs on a real profile, and the staging Setup is signed too
+// while verifying no Authenticode (kRequireAuthenticode is false there), so a
+// staging exemption would let one argument install any payload from any host.
+// --manifest-url= must also be loopback (is_loopback_url). The PERMANENT
+// signed Setups (release/setup/, cut from 3454b27) predate this rule and
+// still parse both seams ungated until the owner authorizes their re-cut.
 //
 // --no-register is NOT gated: it relaxes no gate (it only skips the machine
 // registrations) and every harness, including the unsandboxed bridge_test,
@@ -53,17 +61,29 @@ inline bool allowed() {
     return permitted(env::kStaging, paths::environment_redirected());
 }
 
-// A loopback http(s) url: 127.0.0.1 or localhost followed by a port, with no
-// whitespace or quotes (the value becomes one argv element when forwarded).
+// A loopback http(s) url: exactly 127.0.0.1 or localhost (lowercase), then an
+// explicit decimal port 1..65535, then the end of the url or a '/'. The
+// authority is therefore the loopback host itself: no userinfo
+// (http://127.0.0.1:1@evil.example/), no longer host
+// (http://127.0.0.1.evil.example/), no other 127.x address, no IPv6 literal.
+// No whitespace or quotes anywhere (the value becomes one argv element when
+// forwarded).
 inline bool is_loopback_url(const std::wstring& url) {
     for (const wchar_t* p : { L"http://127.0.0.1:", L"http://localhost:",
                               L"https://127.0.0.1:", L"https://localhost:" }) {
-        if (url.rfind(p, 0) == 0) {
-            for (const wchar_t c : url) {
-                if (c == L' ' || c == L'"' || c == L'\t') return false;
-            }
-            return true;
+        if (url.rfind(p, 0) != 0) continue;
+        for (const wchar_t c : url) {
+            if (c == L' ' || c == L'"' || c == L'\t') return false;
         }
+        size_t i = std::wstring(p).size();
+        const size_t digits_from = i;
+        unsigned long port = 0;
+        while (i < url.size() && url[i] >= L'0' && url[i] <= L'9' && i - digits_from < 5) {
+            port = port * 10 + (unsigned long)(url[i] - L'0');
+            ++i;
+        }
+        if (i == digits_from || port == 0 || port > 65535) return false;
+        return i == url.size() || url[i] == L'/';
     }
     return false;
 }
@@ -126,6 +146,51 @@ inline std::wstring forward(int argc, wchar_t** argv, bool honored) {
         }
     }
     return out;
+}
+
+// ---- SETUP'S SEAMS (setup/main.cpp) ----
+//
+//   --dev-unsigned       waives ONLY the client and service signature gates
+//                        (never the size and SHA-256 gate)
+//   --manifest-url=<u>   the client release manifest from a local server;
+//                        relaxes only the repository pin
+//
+// THE ONE PREDICATE for Setup: a run whose LOCALAPPDATA is redirected away
+// from the real profile, in EVERY build. It deliberately takes no staging
+// flag (header comment): every launch a user makes, from a browser download
+// or Explorer, inherits the real environment, so no argument on it can switch
+// a Setup seam on. A redirected run also writes nothing outside the sandbox:
+// Setup's machine registrations refuse on their own there.
+inline constexpr bool setup_permitted(bool redirected) {
+    return redirected;
+}
+inline bool setup_allowed() {
+    return setup_permitted(paths::environment_redirected());
+}
+
+struct SetupSeams {
+    bool dev_unsigned = false;
+    std::wstring manifest_url; // empty = the compiled-in manifest
+    int ignored = 0;           // seams present on the command line and not honored
+};
+
+inline constexpr size_t kSetupManifestLen = 15; // --manifest-url=
+
+// The seams this Setup run honors. `honored` is setup_allowed() at the call
+// site; a parameter so the rule is testable in either build. A refused seam
+// is ignored (the normal verified install proceeds) and counted.
+inline SetupSeams parse_setup(int argc, wchar_t** argv, bool honored) {
+    SetupSeams s;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--dev-unsigned") {
+            if (honored) s.dev_unsigned = true; else ++s.ignored;
+        } else if (a.rfind(L"--manifest-url=", 0) == 0) {
+            const std::wstring v = a.substr(kSetupManifestLen);
+            if (honored && is_loopback_url(v)) s.manifest_url = v; else ++s.ignored;
+        }
+    }
+    return s;
 }
 
 } // namespace vclient::dev_seams

@@ -254,7 +254,16 @@ exactly as the Admin creates it and the wrapper consumes it. The client
 uses a valid existing file AS-IS (so Admin machines keep ONE identity) and
 creates one (random install id) only when nothing usable exists,
 recording `created_dev_machine_cred` provenance in
-`%LOCALAPPDATA%\VIRULE\client\state.json`.
+`%LOCALAPPDATA%\VIRULE\client\state.json` (informational: nothing reads it
+today; a default uninstall preserves `security\` (`dev_machine.cred` and
+the QA credentials), and Uninstall & Delete Data removes it with the rest of
+the data root; `uninstall.hpp`, `evidence_keep.hpp`). VIRULE Desktop now keeps a
+Client-created credential too (owner brief 2026-11-12, "Owner-Directed
+Completion Assignment", section 4; v2_mvp `dev_machine_license.hpp` "KEPT OR
+REPLACED", in source, not yet in a released Desktop): a Desktop older than
+that fix replaced it on its first run, because it required the file's
+install id to equal its own workspace id, which also orphaned a QA tester
+credential bound to the Client's key.
 
 `security\qa_tester.cred` is written after a `verified` redemption, in the
 exact `qa_tester_credential` JSON shape the wrapper's
@@ -397,6 +406,38 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   saved before the list was kept falls back to the capability alone until
   `/me` answers. It is a menu-offer flag only: confirmed participation is
   the account's `qa_tester` capability and `qa_linked_testers`.
+- DEVELOPER KEY CUSTODY (owner brief 2026-11-12 section 6, the PRESERVE half
+  of optional account-based recovery; in source, not released, no version
+  bump; `src/shared/developer_custody.hpp`, `account.hpp`
+  `deliver_custody_locked`; service half VIRULE_BACKEND `docs/ACCOUNTS.md`
+  "Developer key custody"). AUTOMATIC while signed in: right after a sign-in
+  reads `/v1/account/me`, and after every re-confirmation (`confirm_now`),
+  when the confirmed snapshot says the account is ACTIVE with the ACTIVE
+  `developer` capability, names the device and the account hint, and a
+  USABLE dev_machine.cred already exists (never created for this), the
+  Client sends `POST /v1/account/developer-custody` under the DPoP
+  authorization: `{machine_key, timestamp, machine_signature}`, the machine
+  key signing `virule-developer-custody.v1|<API host>|<device id>|<machine key>|<timestamp>`
+  (the developer machine binding's convention, "Machine proofs"). ONCE PER
+  (account hint, machine key), remembered in `client\developer_custody.json`
+  (no secret: the hint, the public key, the outcome): 200 `registered` or
+  `held` is never sent again; 409 `custody_held_elsewhere` (another account
+  holds this key) is recorded as `held_elsewhere` and never retried; nothing
+  shows it today, and whether and how VIRULE Desktop shows it is PENDING
+  OWNER DECISION; anything else
+  (offline, 5xx, 429, `clock_skew`, a refusal) waits on the evidence
+  delivery's ladder (10 s, 60 s, 5 min, 15 min, then every 30 min) for a
+  later confirmation. A 401 other than `clock_skew` refreshes once and sends
+  the same proof again. It never blocks anything: it runs after the sign-in
+  is reported and after the snapshot is saved. A SANDBOXED Client
+  (LOCALAPPDATA redirected, `paths::environment_redirected`) never sends to
+  the real service, the check-in's rule (`admin_install.hpp`
+  `checkin_suppressed`); with `--account-endpoint` it sends to that test
+  service. Removed with the client state directory at uninstall; a later
+  registration is answered `held`. IT AUTHORIZES NOTHING: the successor
+  authorization (a new key acting for a lost one) is PENDING OWNER DECISION.
+  Units: `tests/developer_custody` (message bytes, body, the record, every
+  gate, 409, the ladder).
 - Development seam: `--account-endpoint=http(s)://127.0.0.1:<port>` (loopback
   only; honored only in a staging build or a sandboxed run, Development
   command-line seams) points the service and site at a test server and replaces opening the
@@ -676,9 +717,11 @@ deliberately narrow and structural:
   the signature gates. The `--dev-unsigned` development seam waives them
   only where every development seam is honored: a staging build, or a
   sandboxed run whose `LOCALAPPDATA` is redirected (Development
-  command-line seams, below). Production Setup is the exception: it parses
-  its own `--dev-unsigned` and `--manifest-url=` ungated, and the
-  permanent signed Setups keep that until the owner re-cuts them;
+  command-line seams, below). Setup is STRICTER in source: its own
+  `--dev-unsigned` and `--manifest-url=` are honored only in a sandboxed
+  run, never merely in a staging build (Setup's development seams, below).
+  The permanent signed Setups (3454b27) predate that and still parse both
+  ungated until the owner re-cuts them;
 - a staging build only ever downloads from the staging release repository
   and the staging Worker, neither of which holds a production artifact;
 - the exact-size and exact-SHA-256 gates are NOT relaxed. A staging
@@ -712,8 +755,11 @@ Every production launch of the client (Setup's start, the Run value, the
 starts, the helpers and the residency restores) inherits the real
 environment and passes no such seam, while every sandboxed harness
 redirects `LOCALAPPDATA` and so keeps driving the production build it
-tests. The manifest urls must be loopback (`127.0.0.1` or `localhost` with
-a port) and the account endpoint `127.0.0.1`, in every build.
+tests. The manifest urls must be loopback (`dev_seams::is_loopback_url`:
+exactly `127.0.0.1` or `localhost`, lowercase, an explicit port 1..65535,
+then the end of the url or `/`, so no userinfo, longer host, other 127.x
+address or IPv6 literal) and the account endpoint `127.0.0.1`, in every
+build.
 `--no-register` is not gated: it relaxes nothing (it only skips the
 machine registrations) and every harness relies on it. This is a RUN-TIME
 rule on purpose, unlike the compile-time origin rule: a browser or protocol
@@ -721,10 +767,44 @@ launch can carry extra arguments but cannot redirect the environment.
 RESIDUAL, inside the same-user trust model (Origin policy above: the
 bridge defends against the web, not against local code): a process already
 running as this Windows user that starts the client with a redirected
-`LOCALAPPDATA` can still reach the seams. Setup's own seams
-(`src/setup/main.cpp`) are unchanged, so the permanent signed Setups keep
-them ungated until the owner re-cuts both. Proof:
+`LOCALAPPDATA` can still reach the seams. Proof:
 `tests/environment/run_tests.bat`.
+
+**Setup's development seams** (owner brief
+`VIRULE/docs/scratchpads/OWNER_DIRECTED_COMPLETION_BRIEF_2026-11-12.md`
+section 7: development-only overrides must not let production-trusted
+Setup install untrusted or unsigned software). In source,
+`src/setup/main.cpp` takes its two seams, `--dev-unsigned` and
+`--manifest-url=`, from `dev_seams::parse_setup`, which honors them ONLY
+where `dev_seams::setup_permitted(redirected)` answers true: a run whose
+`LOCALAPPDATA` is redirected away from the real profile, in BOTH builds.
+Setup deliberately does not get the client's staging exemption: Setup is
+the signed executable a user downloads and runs on a real profile, and the
+staging Setup is signed too while verifying no Authenticode
+(`kRequireAuthenticode` is false there), so a staging exemption would let
+one `--manifest-url=` install any payload from any host. `--manifest-url=`
+must also pass `is_loopback_url` (above). A seam that is present but not
+honored is ignored, the normal verified install proceeds against the
+compiled-in manifest (repository pin, https, Authenticode and the VIRULE
+signer where the build requires them, exact size and SHA-256), and Setup
+writes one line to its log with the count, as the client does. Every
+harness that drives Setup's seams (`tools/takeover_test.mjs`,
+`residency_test.mjs`, `uninstall_lifecycle_test.mjs`,
+`arp_isolation_test.mjs`) redirects `LOCALAPPDATA` and serves its
+manifest from `http://127.0.0.1:<port>/manifest.json`, and a redirected
+Setup writes no machine registration (its registrations refuse on their own
+there). RESIDUAL, inside the same-user trust model: a process already
+running as this Windows user can start Setup with a redirected
+`LOCALAPPDATA` and its own loopback server; that installs into the
+redirected tree only. Proof: `tests/environment/run_tests.bat`.
+THE SHIPPED SETUPS ARE NOT FIXED: the two PERMANENT signed Setups
+(`release/setup/{production,staging}/Virule-Setup.exe`, cut from 3454b27,
+`release/setup/canonical_setup.json`) predate this rule and still honor
+both seams ungated, from any host and on a real profile. Setup changes
+only by explicit owner authorization, and both are re-cut together from
+one commit (owner ruling 2026-10-19, "The canonical Setup" below); until
+the owner authorizes that re-cut through the existing signing and release
+procedure, the defect remains in what users download.
 
 **Staging distribution** uses FIXED tags on `getvirule/virule-staging-releases`
 rather than a `latest` pointer, because that repository also carries the
@@ -991,8 +1071,10 @@ takeover"). From stopping the running client until the new one has been
 started it holds the residency maintenance lock, so VIRULE Service never
 restores the binary being replaced.
 Development seams: `--dev-unsigned` waives only the signature gates;
-`--manifest-url=` fetches the manifest elsewhere and relaxes only the
-repository pin.
+`--manifest-url=` fetches the manifest from a loopback server and relaxes
+only the repository pin; in source both are honored only in a sandboxed run
+(Setup's development seams); the permanent signed Setups still honor them
+ungated until their re-cut.
 
 ### Setup's one native surface
 
@@ -1514,9 +1596,10 @@ sent as a `POST` to the same path (`src/shared/manifest_request.hpp`,
 
 The identity is the existing shared `dev_machine.cred`. When none exists yet
 the client creates it exactly as QA redemption does (same provenance record
-in `state.json`). THE PREVIOUS-KEY LINK: the Admin issues its own machine
-key on its first run when the credential it finds was created by this
-client, so the client remembers the key its last accepted check-in used
+in `state.json`). THE PREVIOUS-KEY LINK: a Desktop older than the
+2026-11-12 fix issues its own machine key on its first run when the
+credential it finds was created by this client (and any Desktop replaces a
+credential this Windows user cannot open), so the client remembers the key its last accepted check-in used
 (`client\checkin.json`) and, while the current key differs, names the old
 one as `pk` until the service answers `seen`. That is what keeps "client
 only" and "Admin user" one installation.
@@ -1754,8 +1837,8 @@ THE LAUNCH CHAIN IS MADE CURRENT BEFORE A LAUNCH (0.9.15; defect correction
 INSTALLED assignment (`ensure_launch_chain`, which the install also runs
 before it places a build): the ticket is asked and written again, and the evaluator credential
 is issued again when the machine key it is bound to is not this computer's
-current one (the Admin re-issues `dev_machine.cred` on its first run, and
-the credential must be bound to the key the wrapper will derive from that
+current one (a Desktop older than the 2026-11-12 fix re-issues
+`dev_machine.cred` on its first run, and the credential must be bound to the key the wrapper will derive from that
 file). The machine key is READ at every call, never remembered. It is
 synchronous (the service is asked, the Admin host waits), never touches the
 job record, and answers `ok:false` with a plain message when nothing can be

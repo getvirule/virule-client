@@ -4,7 +4,8 @@ rem build (no define) and as a staging build (/DVIRULE_ENV_STAGING), so each
 rem rule is proven by the build it belongs to: the local development origins
 rem are staging only (shared\environment.hpp, audit M-6), and the development
 rem command-line seams are honored only in a staging build or a sandboxed run
-rem (shared\dev_seams.hpp, audit L-24).
+rem (shared\dev_seams.hpp, audit L-24), while Setup's own two seams are honored
+rem only in a sandboxed run in BOTH builds, with a loopback manifest url.
 rem Usage: tests\environment\run_tests.bat [outdir]
 rem Starts NO client and never touches port 47612.
 setlocal

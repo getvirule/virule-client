@@ -20,7 +20,9 @@
 //   signature) is silent: the tool simply enforces normally.
 //
 // WHAT THIS NEVER DOES
-//   Create, repair or rewrite a credential (Admin-only), read a database,
+//   Create, repair or rewrite a credential (VIRULE Desktop's
+//   dev_machine_license and the VIRULE Client's machine_identity do that,
+//   each keeping a credential the other made), read a database,
 //   log or return private material. The private seed lives on the stack for
 //   the duration of one proof and is wiped.
 //

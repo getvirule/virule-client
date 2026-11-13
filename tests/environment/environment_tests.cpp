@@ -17,6 +17,12 @@
 //   redirected). A production build on a real profile ignores every one.
 //   --no-register is honored and forwarded in every build.
 //
+//   SETUP'S SEAMS (dev_seams.hpp setup_permitted/parse_setup; owner brief
+//   2026-11-12 section 7): --dev-unsigned and --manifest-url= are honored
+//   ONLY in a sandboxed run, in BOTH builds (a staging Setup is signed and
+//   verifies no Authenticode, so the staging exemption is deliberately not
+//   Setup's), and the manifest url only when it is loopback.
+//
 // Starts no client and touches no port. The process's own LOCALAPPDATA is
 // set (to the real known folder, then to a sandbox path) and restored.
 
@@ -62,6 +68,15 @@ static ds::Seams parse(std::vector<std::wstring> keep, bool honored) {
     std::vector<wchar_t*> argv = argv_of(keep);
     return ds::parse((int)argv.size(), argv.data(), honored);
 }
+static ds::SetupSeams parse_setup(std::vector<std::wstring> keep, bool honored) {
+    std::vector<wchar_t*> argv = argv_of(keep);
+    return ds::parse_setup((int)argv.size(), argv.data(), honored);
+}
+static std::string narrow(const std::wstring& w) {
+    std::string out;
+    for (const wchar_t c : w) out += (c < 128) ? (char)c : '?';
+    return out;
+}
 // The residency layer's own entry point (what VIRULE Service calls).
 static std::wstring forward_seams(std::vector<std::wstring> keep) {
     std::vector<wchar_t*> argv = argv_of(keep);
@@ -96,6 +111,13 @@ int main() {
     check("predicate: production build on a real profile honors no seam", !ds::permitted(false, false));
     check("predicate: a sandboxed production run honors the seams", ds::permitted(false, true));
     check("predicate: a staging build honors the seams", ds::permitted(true, false) && ds::permitted(true, true));
+
+    check("setup predicate: a real profile honors no Setup seam, in either build", !ds::setup_permitted(false));
+    check("setup predicate: a sandboxed run honors the Setup seams, in either build", ds::setup_permitted(true));
+
+    const std::vector<std::wstring> setup_seams = {
+        L"Virule-Setup.exe", L"--dev-unsigned", L"--manifest-url=http://127.0.0.1:4/manifest.json",
+    };
 
     const std::vector<std::wstring> all_seams = {
         L"virule-client.exe", L"--no-register", L"--dev-unsigned",
@@ -137,6 +159,21 @@ int main() {
                       : "real profile, production build: residency forwards only --no-register",
               fwd == (staging ? all_forwarded : std::wstring(L" --no-register")));
     }
+    {
+        // THE DEFECT CLOSED: the signed Setup on a real profile, production or staging.
+        check(staging ? "real profile, staging build: Setup seams refused (unlike the client's)"
+                      : "real profile, production build: Setup seams refused",
+              !ds::setup_allowed());
+        const ds::SetupSeams s = parse_setup(setup_seams, ds::setup_allowed());
+        check("real profile: Setup --dev-unsigned ignored", !s.dev_unsigned);
+        check("real profile: Setup --manifest-url= ignored (compiled-in manifest)", s.manifest_url.empty());
+        check("real profile: both Setup seams counted as ignored", s.ignored == 2);
+        const ds::SetupSeams u = parse_setup({ L"Virule-Setup.exe", L"--dev-unsigned" }, ds::setup_allowed());
+        check("real profile: Setup --dev-unsigned alone ignored", !u.dev_unsigned && u.ignored == 1);
+        const ds::SetupSeams r = parse_setup({ L"Virule-Setup.exe", L"--manifest-url=https://evil.example/manifest.json" },
+                                             ds::setup_allowed());
+        check("real profile: Setup --manifest-url= to a remote host ignored", r.manifest_url.empty() && r.ignored == 1);
+    }
 
     // A sandboxed harness run (LOCALAPPDATA redirected): both builds honor the seams.
     wchar_t temp[MAX_PATH] = {};
@@ -152,6 +189,43 @@ int main() {
                   s.admin_manifest_url == L"http://localhost:2/a.json" &&
                   s.account_endpoint == L"http://127.0.0.1:3" && s.ignored == 0);
         check("sandbox: residency forwards every loopback seam", forward_seams(all_seams) == all_forwarded);
+        check("sandbox: Setup seams honored in either build", ds::setup_allowed());
+        const ds::SetupSeams ss = parse_setup(setup_seams, ds::setup_allowed());
+        check("sandbox: Setup --dev-unsigned and a loopback --manifest-url= honored",
+              ss.dev_unsigned && ss.manifest_url == L"http://127.0.0.1:4/manifest.json" && ss.ignored == 0);
+        const ds::SetupSeams sr = parse_setup({ L"Virule-Setup.exe", L"--dev-unsigned",
+                                                L"--manifest-url=https://evil.example/manifest.json" },
+                                              ds::setup_allowed());
+        check("sandbox: a remote Setup --manifest-url= refused, --dev-unsigned still honored",
+              sr.dev_unsigned && sr.manifest_url.empty() && sr.ignored == 1);
+    }
+
+    // The loopback rule (is_loopback_url), shared by the client's manifest
+    // seams and Setup's --manifest-url=, applied where the seams ARE honored.
+    for (const wchar_t* ok : { L"http://127.0.0.1:4/manifest.json", L"https://127.0.0.1:4/manifest.json",
+                               L"http://localhost:4/manifest.json", L"https://localhost:65535/m.json",
+                               L"http://127.0.0.1:4" }) {
+        const ds::SetupSeams s = parse_setup({ L"Virule-Setup.exe", std::wstring(L"--manifest-url=") + ok }, true);
+        check("loopback accepted: " + narrow(ok), s.manifest_url == ok && s.ignored == 0 && ds::is_loopback_url(ok));
+    }
+    for (const wchar_t* bad : {
+             L"http://evil.example/manifest.json", L"https://evil.example/manifest.json",
+             L"http://127.0.0.1.evil.example/m.json", L"https://127.0.0.1.evil.example:4/m.json",
+             L"http://localhost.evil.example:4/m.json",
+             L"http://127.0.0.1@evil.example/m.json", L"http://127.0.0.1:4@evil.example/m.json",
+             L"https://localhost:4@evil.example/m.json", L"http://127.0.0.1:4:5/m.json",
+             L"http://[::1]:4/m.json", L"https://[::1]:4/m.json",
+             L"http://127.0.0.2:4/m.json", L"http://127.1:4/m.json", L"http://0.0.0.0:4/m.json",
+             L"HTTP://127.0.0.1:4/m.json", L"http://LOCALHOST:4/m.json", L"Https://localhost:4/m.json",
+             L"http://127.0.0.1/m.json", L"http://127.0.0.1:/m.json", L"http://127.0.0.1:0/m.json",
+             L"http://127.0.0.1:65536/m.json", L"http://127.0.0.1:123456/m.json",
+             L"http://127.0.0.1:4x/m.json", L"http://127.0.0.1:4\\evil.example/m.json",
+             L"http://127.0.0.1:4?x", L"http://127.0.0.1:4#x",
+             L"http://127.0.0.1:4/m json", L"http://127.0.0.1:4/m\"json", L"ftp://127.0.0.1:4/m.json",
+             L"//127.0.0.1:4/m.json", L"127.0.0.1:4/m.json", L"" }) {
+        const ds::SetupSeams s = parse_setup({ L"Virule-Setup.exe", std::wstring(L"--manifest-url=") + bad }, true);
+        check("not loopback, refused even where honored: '" + narrow(bad) + "'",
+              s.manifest_url.empty() && s.ignored == 1 && !ds::is_loopback_url(bad));
     }
 
     // Where honored, the values must still be loopback.

@@ -46,7 +46,8 @@
 //   5. the staged file must carry a valid Authenticode signature AND the
 //      expected VIRULE signing identity.
 // Any failure refuses the install. The hash gate always holds;
-// --dev-unsigned (development only) waives only the signature gates.
+// --dev-unsigned (development only) waives only the signature gates, and
+// with --manifest-url= is honored only in a sandboxed run (dev_seams.hpp).
 //
 // VIRULE SERVICE (2026-10-06): when the manifest describes the release's
 // ViruleService.exe (the additive service_* fields), it is acquired through
@@ -71,6 +72,7 @@
 #include "setup/handoff_listener.hpp"
 #include "setup/setup_window.hpp"
 #include "shared/client_state.hpp"
+#include "shared/dev_seams.hpp"   // Setup's development seams (sandboxed runs only)
 #include "shared/environment.hpp"
 #include "shared/http_client.hpp"
 #include "shared/json_scan.hpp"
@@ -384,23 +386,24 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool allow_unsigned = false; // development only; the hash gate always holds
-    std::wstring manifest_url; // development seam; empty = production
-    for (int i = 1; i < argc; ++i) {
-        const std::wstring arg = argv[i];
-        if (arg == L"--dev-unsigned") {
-            allow_unsigned = true;
-        } else if (arg.rfind(L"--manifest-url=", 0) == 0) {
-            // Development seam: fetch the release manifest from a local
-            // server instead of the GitHub release. Relaxes only the
-            // repository pin; the hash gate and (without --dev-unsigned) the
-            // signature gates hold exactly as in production.
-            manifest_url = arg.substr(15);
-        }
-    }
+    // The two development seams (shared/dev_seams.hpp, parse_setup):
+    // --dev-unsigned waives only the signature gates (the hash gate always
+    // holds); --manifest-url= fetches the release manifest from a local
+    // server and relaxes only the repository pin. Both are honored ONLY in a
+    // sandboxed run (LOCALAPPDATA redirected), in every build including
+    // staging, and the manifest url only when it is loopback. Anywhere else
+    // they are ignored and the normal verified install proceeds.
+    const vclient::dev_seams::SetupSeams seams =
+        vclient::dev_seams::parse_setup(argc, argv, vclient::dev_seams::setup_allowed());
     LocalFree(argv);
+    const bool allow_unsigned = seams.dev_unsigned;
+    const std::wstring manifest_url = seams.manifest_url; // empty = production
 
     vclient::log::setup(std::string("setup start, version ") + VIRULE_CLIENT_VERSION_STRING);
+    if (seams.ignored > 0) {
+        vclient::log::setup("setup: " + std::to_string(seams.ignored) +
+                            " development argument(s) ignored (not honored in this run, or not loopback)");
+    }
 
     // FIRST, before any work that takes time: the handoff listener. A
     // still-open virule.app page hands its pending operation over while

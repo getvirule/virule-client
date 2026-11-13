@@ -18,15 +18,17 @@
 //     machine AND whose seed reproduces its recorded public key is used
 //     AS-IS and never rewritten. This is the wrapper's validation model
 //     (the credential's own install_id is the DPAPI entropy); the client
-//     has no database, so the Admin's workspace-id equality check does not
-//     apply here. On a machine with the VIRULE Admin installed the
-//     Admin-created credential passes this validation and is simply
-//     reused, so both products present ONE machine identity.
+//     has no database. VIRULE Desktop applies the same rule since the
+//     owner brief of 2026-11-12 (v2_mvp dev_machine_license.hpp "KEPT OR
+//     REPLACED"): whichever product creates the credential first, the
+//     other keeps it, so both present ONE machine identity. (A Desktop
+//     older than that fix required the install id to equal its workspace
+//     id and replaced a client-created file.)
 //   - Only when nothing usable exists does the client create a credential,
 //     with a freshly generated random 32-hex install id. state.json
-//     records that the client created it, which is what allows a full
-//     VIRULE uninstall to remove it (an Admin-created identity is never
-//     removed: it is the developer's press/QA signing identity).
+//     records that the client created it (informational; a default
+//     uninstall preserves the file and Uninstall & Delete Data removes it
+//     with the data root, uninstall.hpp).
 //
 // The QA machine proof and the redeemed tester credential both key off
 // this file, which is why a credential redeemed by the client verifies at

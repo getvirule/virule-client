@@ -15,10 +15,11 @@
 //     "enabled_evaluator": true|false }         //   installed_capabilities.hpp)
 //
 // `created_dev_machine_cred` records that THIS product created the machine
-// identity file. A full VIRULE uninstall removes dev_machine.cred only when
-// this is true AND no VIRULE Admin database exists, because on an Admin
-// machine that file is the developer's press/QA signing identity and is
-// never the client's to destroy.
+// identity file. Informational only: nothing reads it today. A default
+// uninstall preserves dev_machine.cred (that file is also the developer's
+// press/QA signing identity and the key QA tester credentials are bound
+// to); Uninstall & Delete Data removes it with the rest of the data root
+// (uninstall.hpp, evidence_keep.hpp).
 //
 // `admin_version` is the version of the managed Admin installation under
 // %LOCALAPPDATA%\Programs\VIRULE\Admin\, recorded from the approved release

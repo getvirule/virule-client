@@ -56,6 +56,7 @@
 #include "shared/account_relay.hpp"
 #include "shared/account_roles.hpp"
 #include "shared/account_store.hpp"
+#include "shared/developer_custody.hpp"
 #include "shared/environment.hpp"
 #include "shared/evaluation_purchase_readiness.hpp"
 #include "shared/http_client.hpp"
@@ -536,9 +537,61 @@ inline void deliver_enrollment_locked(const store::DeviceKey& key, const std::st
     }
 }
 
+/** A SANDBOXED CLIENT NEVER REGISTERS CUSTODY WITH THE REAL SERVICE: the
+ *  check-in's rule (admin_install.hpp checkin_suppressed). A run whose
+ *  LOCALAPPDATA is redirected (paths::environment_redirected) sends only
+ *  when a harness pointed it at its own service (--account-endpoint). */
+inline bool custody_suppressed() {
+    return endpoint_override().host.empty() && paths::environment_redirected();
+}
+
+/** DEVELOPER KEY CUSTODY (shared/developer_custody.hpp; owner brief
+ *  2026-11-12 section 6): prove this computer's Developer Machine key to
+ *  the signed-in developer's account, once per (account, machine key),
+ *  from the service's last confirmed snapshot. Never creates a machine
+ *  credential, never blocks anything else (a failure waits on the ladder
+ *  for a later confirmation). Caller holds token_mutex. `fresh_at`: the
+ *  access token a sign-in just received. */
+inline void deliver_custody_locked(const store::DeviceKey& key, const std::string& fresh_at = "") {
+    namespace dc = developer_custody;
+    dc::Inputs in;
+    in.suppressed = custody_suppressed();
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        in.signed_in = st().signed_in;
+        in.account_status = st().session.status;
+        in.cap_developer = st().session.cap_developer;
+        in.account_hint = st().session.account_hint;
+        in.device_id = st().session.device_id;
+    }
+    std::string at = fresh_at;
+    dc::Deps d;
+    d.file = paths::client_state_dir().empty() ? std::filesystem::path() : paths::client_state_dir() / dc::kFileName;
+    d.machine_key = [] { return machine_identity::public_key_hex(); };
+    d.sign_hex = [](const std::string& m) { return machine_identity::sign_hex(m); };
+    d.host = narrow(api_endpoint().host);
+    d.now = (std::int64_t)time(nullptr);
+    d.log = [](const std::string& t) { log::client(t); };
+    d.send = [&](const std::string& body) -> dc::Reply {
+        if (at.empty() && !access_token_locked(key, at)) return {};
+        Reply r = call(L"POST", "POST", dc::kRoute, body, key, at);
+        // An access token the service no longer takes: one refresh, the
+        // same proof again (it names this device and is inside its window).
+        if (r.status == 401 && r.body.find("\"clock_skew\"") == std::string::npos) {
+            if (refresh_locked(key)) {
+                { std::lock_guard<std::mutex> lock(st().m); at = st().access_token; }
+                r = call(L"POST", "POST", dc::kRoute, body, key, at);
+            }
+        }
+        return dc::Reply{ r.status, r.body };
+    };
+    (void)dc::run(in, d);
+}
+
 /** Re-confirm the account, its capabilities and its preferences with the
  *  service, delivering any appearance change made while offline and any
- *  pending Install Dev Tools first. */
+ *  pending Install Dev Tools first; then, from the confirmed snapshot, this
+ *  computer's developer key custody. */
 inline void confirm_now() {
     {
         std::lock_guard<std::mutex> lock(st().m);
@@ -558,12 +611,17 @@ inline void confirm_now() {
         { std::lock_guard<std::mutex> lock(st().m); at = st().access_token; }
         r = call(L"GET", "GET", "/v1/account/me", "", key, at);
     }
-    std::lock_guard<std::mutex> lock(st().m);
-    if (r.status == 200) {
-        if (!apply_me(st(), r.body)) st().last_error = "bad_answer";
-    } else if (r.status == 0 || r.status >= 500 || r.status == 429) {
-        st().offline = true;
+    bool confirmed = false;
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        if (r.status == 200) {
+            confirmed = true; // the custody gates re-read the snapshot itself
+            if (!apply_me(st(), r.body)) st().last_error = "bad_answer";
+        } else if (r.status == 0 || r.status >= 500 || r.status == 429) {
+            st().offline = true;
+        }
     }
+    if (confirmed) deliver_custody_locked(key, at);
 }
 
 inline std::atomic<unsigned long long> g_last_confirm_tick{ 0 };
@@ -852,6 +910,8 @@ inline void run_flow(unsigned long long id) {
     }
     // Outside the state lock: evidence waiting on this account goes now.
     if (g_on_account_changed) g_on_account_changed();
+    // Then this computer's developer key custody, from the snapshot just read.
+    if (me.status == 200) deliver_custody_locked(key, at);
 }
 
 // ------------------------------------------------------ bridge surface --
