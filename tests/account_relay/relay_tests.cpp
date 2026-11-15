@@ -259,6 +259,33 @@ int main() {
               !relay::admin_route_ok("POST", "/v1/assignments/xyz/ended/seen") && !relay::admin_route_ok("POST", "/v1/assignments/" + C + "/ended"));
     }
 
+    // ---- THE ACCOUNT THE CALLER EXPECTS (owner brief 2026-11-15 item 8) ----
+    {
+        const relay::Request named = relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations","account":"dev@e2e.virule.test"})");
+        check("account: a named account is read from the envelope", named.ok && named.has_account && named.account == "dev@e2e.virule.test");
+        const relay::Request none = relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations"})");
+        check("account: none named (an older Desktop) is relayed as before, with no account to compare", none.ok && !none.has_account);
+        const relay::Request inBody = relay::parse(R"({"type":"account_api","method":"POST","path":"/v1/evaluations/purchases","body":{"account":"dev@e2e.virule.test"}})");
+        check("account: a field of that name INSIDE the body never stands for it", inBody.ok && !inBody.has_account);
+        const relay::Request both = relay::parse(R"({"type":"account_api","method":"POST","path":"/v1/evaluations/purchases","account":"a@x.test","body":{"account":"b@x.test"}})");
+        check("account: the envelope's account is the one read, never the body's", both.ok && both.has_account && both.account == "a@x.test" &&
+              both.body == R"({"account":"b@x.test"})");
+        check("account: a named account that is not a plausible email refuses the request",
+              !relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations","account":""})").ok &&
+              !relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations","account":"no-at-sign"})").ok &&
+              !relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations","account":"a b@x.test"})").ok &&
+              !relay::parse(R"({"type":"account_api","method":"GET","path":"/v1/evaluations","account":7})").ok);
+        check("account: emails compare without case, and only whole",
+              relay::same_account("Dev@E2E.virule.test", "dev@e2e.virule.test") && !relay::same_account("dev@e2e.virule.test", "dev@e2e.virule.tes") &&
+              !relay::same_account("other@e2e.virule.test", "dev@e2e.virule.test") && !relay::same_account("dev@e2e.virule.test", ""));
+        check("account: an answer names the account it was made under, the body still last",
+              relay::answer(200, "{\"a\":1}", "dev@e2e.virule.test") == R"({"type":"account_api","status":200,"account":"dev@e2e.virule.test","body":{"a":1}})");
+        check("account: an answer with no account (none known) is the former shape",
+              relay::answer(200, "{\"a\":1}", "") == R"({"type":"account_api","status":200,"body":{"a":1}})");
+        check("account: the refusal of another account says so and carries no service answer",
+              relay::failure("account_changed") == R"({"type":"account_api","status":0,"error":"account_changed"})");
+    }
+
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

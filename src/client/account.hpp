@@ -1368,14 +1368,38 @@ inline std::string api_call(const std::string& message) {
     const std::string resuming = relay::resume_assignment(req);
     std::string resuming_revision;
     if (!resuming.empty()) (void)json_scan::find_string_in(body, 0, body.size(), "revision_id", resuming_revision);
-    store::DeviceKey key;
-    if (!store::device_key(key)) return relay::failure("signed_out");
     const wchar_t* wm = method == "GET" ? L"GET" : L"POST";
     const auto no_token = [] {
         std::lock_guard<std::mutex> lock(st().m);
         return relay::failure(st().signed_in ? "offline" : "signed_out");
     };
     std::lock_guard<std::mutex> tl(token_mutex());
+    // THE ACCOUNT THE CALLER EXPECTS (owner brief 2026-11-15 item 8;
+    // shared/account_relay.hpp account_ok). Decided UNDER THE TOKEN LOCK, the
+    // lock every sign-in's token exchange holds while it replaces the session
+    // and its tokens, so the account read here is the one whose token is
+    // used below: another account, or a sign-in still completing (its
+    // session cleared, no email yet), is refused with nothing sent and no
+    // token touched. A sign-out after this point leaves a call made with this
+    // account's own token, so its answer is still this account's. The email
+    // read here is echoed in the answer (made_as), so the caller can tell
+    // whose answer it is.
+    std::string made_as;
+    {
+        std::lock_guard<std::mutex> lock(st().m);
+        if (!st().signed_in) return relay::failure("signed_out");
+        made_as = st().session.email;
+        for (auto& c : made_as) c = (char)tolower((unsigned char)c);
+    }
+    if (req.has_account && !relay::same_account(req.account, made_as)) {
+        log::client("account: an evaluation relay call named another account than this installation holds; refused, nothing sent");
+        return relay::failure("account_changed");
+    }
+    // The device key of THIS account, read under the same lock (a sign-in
+    // replaces the key with the session), so the proof and the token below
+    // are one account's.
+    store::DeviceKey key;
+    if (!store::device_key(key)) return relay::failure("signed_out");
     std::string at;
     if (!access_token_locked(key, at)) return no_token();
     Reply r = call(wm, method.c_str(), path, body, key, at);
@@ -1392,7 +1416,7 @@ inline std::string api_call(const std::string& message) {
     // RESUMED: this computer verifies the cleared build again now, before
     // anything of it can run (whoever asked; the hook never relaxes a check).
     if (!resuming.empty() && r.status == 200 && on_resumed()) on_resumed()(resuming, resuming_revision);
-    const std::string out = relay::answer(r.status, r.body);
+    const std::string out = relay::answer(r.status, r.body, made_as);
     return out.size() > relay::kMaxAnswerBytes ? relay::failure("too_large") : out;
 }
 

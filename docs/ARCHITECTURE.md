@@ -239,7 +239,7 @@ in both components).
 | local | `{"type":"account_link_qa"}` | the explicit QA identity link (the person chose it in the Admin) |
 | local | `{"type":"account_set_appearance","appearance":"dark"}` (or "light") | an explicit account appearance choice (v0.9.4; refused signed out) |
 | local | `{"type":"account_open_settings"}` | open the website account page for THIS account in the person's browser (v0.9.5; the single-use link is minted and opened here, never returned) |
-| local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` made here under this installation's DPoP authorization; since 2026-11-02 ONLY the Admin's own requests (`account_relay.hpp` `admin_route_ok`, see "Desktop account"), anything else is `bad_request`; the body is the message's LAST field, raw JSON. A purchase (POST `/v1/evaluations/purchases`) on a computer that is not ready answers `{"status":0,"error":"not_ready","reason","message"}` and nothing is sent. Answers `{"type":"account_api","status","body"}` (the service's JSON object, else `null`) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"\|"not_ready"}`. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
+| local | `{"type":"account_api","method":"GET"\|"POST","path":"/v1/evaluations...","account":"<email>","body":{...}}` | THE EVALUATION RELAY (v0.9.7): one call to `/v1/evaluations` or `/v1/assignments` made here under this installation's DPoP authorization; since 2026-11-02 ONLY the Admin's own requests (`account_relay.hpp` `admin_route_ok`, see "Desktop account"), anything else is `bad_request`; the body is the message's LAST field, raw JSON. A purchase (POST `/v1/evaluations/purchases`) on a computer that is not ready answers `{"status":0,"error":"not_ready","reason","message"}` and nothing is sent. Answers `{"type":"account_api","status","account","body"}` (the service's JSON object, else `null`; `account` the email the call was made under, since 0.9.35) or `{"status":0,"error":"signed_out"\|"offline"\|"bad_request"\|"too_large"\|"not_ready"\|"account_changed"}`. Since 0.9.35 the optional `account` (before `body`) names the account the caller expects: another account held now is `account_changed`, nothing sent. Never a token. Local frames for it are bounded at 60,000 bytes (`kMaxLocalFrameBytes`); page frames stay 4,096 |
 | local | `{"type":"evaluation_purchase_readiness"}` | (2026-11-02) can THIS computer buy an evaluation now: THE CLIENT'S ANSWER, which the Admin only shows (`src/shared/evaluation_purchase_readiness.hpp`, the one rule). Answers `{"type":"evaluation_purchase_readiness","ready":bool,"reason":"supported"\|"unsupported_windows"\|"defender_off"\|"defender_out_of_date"\|"antivirus_unsupported","message":"<the owner's sentence, empty when ready>"}`; no product name, path or version leaves the Client (the detail is in its log). Refused to pages |
 | local | `{"type":"transfer_control","assignment_id":"<32 hex>","action":"pause"\|"resume"\|"retry"\|"verify"}` | GAME DISTRIBUTION (v0.9.14): pause, resume or re-queue the evaluator's install job for that assignment; `verify` (0.9.15) makes an INSTALLED assignment's launch chain current before the Admin launches its wrapper (see "Game distribution"); answers `{"type":"transfer_control","ok":bool}` (`verify` adds `"message"`); a malformed id or action answers `error` |
 | local | `{"type":"transfer_wake"}` | signal the transfer driver to run a pass now (the Admin host wrote or changed a job record); answers `{"type":"transfer_wake","ok":true}` |
@@ -393,6 +393,30 @@ allowed origin, gets `error`). Service side: `VIRULE_BACKEND/docs/ACCOUNTS.md`.
   Client. A 401 refreshes once (a refused refresh signs out, as anywhere);
   no answer marks the snapshot offline. VIRULE_BACKEND
   `docs/EVALUATIONS.md` is the contract.
+  - THE ACCOUNT THE CALLER EXPECTS (0.9.35; owner brief 2026-11-15 item 8,
+    "Purchase information must never cross account boundaries", verbatim
+    `VIRULE/docs/scratchpads/OWNER_PURCHASE_INTEGRITY_BRIEF_2026-11-15.md`;
+    the mechanism is the agent's). VIRULE Desktop names in every call the
+    account it believes is signed in (`"account":"<email>"`, written by its
+    host BEFORE `body` and read by `account_relay.hpp` `parse` ONLY from the
+    envelope, so a same-named field inside a body never stands for it; a
+    named value that is not a plausible email refuses the request).
+    `api_call` compares it, case-insensitively, with this installation's
+    signed-in email UNDER `token_mutex`, the lock every sign-in's token
+    exchange and `/me` hold while they replace the session, its tokens and
+    its device key, then reads the device key and the token under the same
+    lock: another account, or a sign-in still completing (its session
+    cleared, no email yet), answers `{"status":0,"error":"account_changed"}`
+    with no token touched and nothing sent. Every answer names the account
+    the call was made under (`"account"`, read under that lock), and Desktop
+    applies only an answer that names ITS account; a sign-out after the
+    compare leaves a call made with this account's own token, so its answer
+    is still this account's. No account named (a Desktop before alpha.87):
+    relayed as before (the same-user local trust model, nothing loosened).
+    A Client signed in whose `/me` failed has no email yet, so every named
+    call is `account_changed` until the account is confirmed (fail closed).
+    VIRULE Desktop requires 0.9.35 (its minimum Client) and names an older
+    one as needing an update, never as an outage.
   - ONLY THE ADMIN'S REQUESTS (owner decision 2026-11-02, `admin_route_ok`):
     GET `/v1/evaluations` and `/v1/assignments`; POST `purchases`, `seen`,
     `games/<id>`, `games/<id>/build`, `<id>/rating`; POST `preferences`,

@@ -166,13 +166,45 @@ inline bool admin_route_ok(const std::string& method, const std::string& path) {
     return false;
 }
 
-/** One relay request as the Client reads it: the method, the path and (for
- *  a POST) the raw body. `ok` false = refused before a token is touched. */
+/** THE ACCOUNT THE CALLER EXPECTS (owner brief 2026-11-15, item 8: "Purchase
+ *  information must never cross account boundaries"). VIRULE Desktop names
+ *  the account it believes is signed in here (the email this Client reported
+ *  to it); api_call refuses the call, before any token is touched, when this
+ *  installation's account is another one now, so an answer of one account can
+ *  never be shown on another account's screen in the window before Desktop
+ *  reads the change. A plausible email only: 3 to 254 characters, no
+ *  control character, quote, backslash or space. */
+inline bool account_ok(const std::string& s) {
+    if (s.size() < 3 || s.size() > 254 || s.find('@') == std::string::npos) return false;
+    for (const unsigned char c : s) {
+        if (c < 0x21 || c == '"' || c == '\\' || c == 0x7f) return false;
+    }
+    return true;
+}
+
+/** Two account emails name the same account (ASCII case-insensitive, as the
+ *  service stores them in lower case). */
+inline bool same_account(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const char x = (a[i] >= 'A' && a[i] <= 'Z') ? (char)(a[i] - 'A' + 'a') : a[i];
+        const char y = (b[i] >= 'A' && b[i] <= 'Z') ? (char)(b[i] - 'A' + 'a') : b[i];
+        if (x != y) return false;
+    }
+    return true;
+}
+
+/** One relay request as the Client reads it: the method, the path, (for
+ *  a POST) the raw body, and the account the caller expects (`account`,
+ *  present only when the message named one). `ok` false = refused before a
+ *  token is touched. */
 struct Request {
     bool ok = false;
     std::string method;
     std::string path;
     std::string body;
+    bool has_account = false;
+    std::string account;
 };
 
 inline Request parse(const std::string& message) {
@@ -183,6 +215,16 @@ inline Request parse(const std::string& message) {
         return Request{};
     }
     if (r.method == "POST") r.body = body_of(message);
+    // The expected account is read ONLY from the envelope, before the body
+    // (which is the message's last field and the caller's free JSON): a field
+    // of the same name inside a body never stands for it. Named but not a
+    // plausible email: refused, never taken as "no account named".
+    const size_t body_at = message.find("\"body\":");
+    const size_t head_end = body_at == std::string::npos ? message.size() : body_at;
+    if (message.find("\"account\":", 0) < head_end) {
+        if (!json_scan::find_string_in(message, 0, head_end, "account", r.account) || !account_ok(r.account)) return Request{};
+        r.has_account = true;
+    }
     r.ok = true;
     return r;
 }
@@ -219,12 +261,21 @@ inline std::string object_or_null(const std::string& body) {
     return "null";
 }
 
-/** The relay's answer for an HTTP status and the service's body. */
-inline std::string answer(unsigned long status, const std::string& body) {
-    return "{\"type\":\"account_api\",\"status\":" + std::to_string(status) + ",\"body\":" + object_or_null(body) + "}";
+/** The relay's answer for an HTTP status and the service's body. `account`
+ *  is the account the call was MADE under (the email whose authorization
+ *  sent it, read under the token lock; owner brief 2026-11-15 item 8): VIRULE
+ *  Desktop applies an answer only when it names the account Desktop expects,
+ *  so an answer without it (a Client before 0.9.35) or of another account is
+ *  never taken as this account's. Omitted only when empty. */
+inline std::string answer(unsigned long status, const std::string& body, const std::string& account = std::string()) {
+    return "{\"type\":\"account_api\",\"status\":" + std::to_string(status) +
+           (account.empty() ? std::string() : ",\"account\":\"" + json_scan::json_escape(account) + "\"") +
+           ",\"body\":" + object_or_null(body) + "}";
 }
 
-/** The relay's answer when there was no HTTP answer at all. */
+/** The relay's answer when there was no HTTP answer at all. `account_changed`:
+ *  the caller named another account than this installation holds now, and
+ *  nothing was sent. */
 inline std::string failure(const char* error) {
     return std::string("{\"type\":\"account_api\",\"status\":0,\"error\":\"") + error + "\"}";
 }
