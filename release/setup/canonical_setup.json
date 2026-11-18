@@ -1,22 +1,22 @@
 {
     "production":  {
                        "file":  "production/Virule-Setup.exe",
-                       "sha256":  "23c8698a06fbb7a1150d27b94d60b0ccd98bd939144fc5e93129b4b6ca96ad35",
-                       "size":  515848,
-                       "setupVersion":  "0.9.31",
-                       "sourceCommit":  "ee930ece85e7d0b505ea81af73b7a26b1dc35750",
+                       "sha256":  "3b4f2b08ae53692cc1617df3bd188c1b210908d94d145fb24b44d82a84d3149d",
+                       "size":  518920,
+                       "setupVersion":  "0.9.35",
+                       "sourceCommit":  "476c8952454a6ec317597949db33e5f5caf1def4",
                        "signer":  "CN=Heath Michaels",
-                       "signerThumbprint":  "BEFA8E95D492D5A6409B8C728AF2839053455088",
-                       "approved":  "2026-11-12"
+                       "signerThumbprint":  "E95AE99E1DE6A18B7837D8F98A116AC812085BD4",
+                       "approved":  "2026-11-18"
                    },
     "staging":  {
                     "file":  "staging/Virule-Setup.exe",
-                    "sha256":  "efb16403962d6a4fba95249541545844b7130b8837cd8f1d8e0c71272dd5444b",
-                    "size":  510216,
-                    "setupVersion":  "0.9.31",
-                    "sourceCommit":  "ee930ece85e7d0b505ea81af73b7a26b1dc35750",
+                    "sha256":  "98249e5d0b86c25dff72c82deeec043044c8afbfaa1d69ef9a091c281393873c",
+                    "size":  512776,
+                    "setupVersion":  "0.9.35",
+                    "sourceCommit":  "476c8952454a6ec317597949db33e5f5caf1def4",
                     "signer":  "CN=Heath Michaels",
-                    "signerThumbprint":  "BEFA8E95D492D5A6409B8C728AF2839053455088",
-                    "approved":  "2026-11-12"
+                    "signerThumbprint":  "E95AE99E1DE6A18B7837D8F98A116AC812085BD4",
+                    "approved":  "2026-11-18"
                 }
 }
