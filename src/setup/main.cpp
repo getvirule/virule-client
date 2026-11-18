@@ -66,6 +66,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 #include "client/bridge.hpp"     // loopback client half (talk to the client)
 #include "client/service_install.hpp" // VIRULE Service acquisition + placement
@@ -100,6 +101,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "version.lib")   // card_owner_takes_lock (file version)
 #endif
 
 namespace {
@@ -173,10 +175,54 @@ std::wstring widen(const std::string& s) {
     return out;
 }
 
+// THE ONE-SETUP LOCK (wWinMain, owner ruling 2026-11-18). Held while this
+// Setup works; released the moment it reaches a terminal failure (fail()).
+HANDLE g_singleton = nullptr;
+
+// The first Setup version that takes the lock. A card owned by such a Setup
+// while the lock is free is a finished failure card; an OLDER Setup takes no
+// lock, so its card may still be working and is never closed.
+constexpr unsigned kFirstLockingSetup[3] = { 0, 9, 35 };
+
+bool card_owner_takes_lock(HWND w) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (p == nullptr) return false;
+    wchar_t path[MAX_PATH * 2] = {};
+    DWORD n = (DWORD)(sizeof(path) / sizeof(path[0]));
+    const bool named = QueryFullProcessImageNameW(p, 0, path, &n) != 0;
+    CloseHandle(p);
+    if (!named) return false;
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &ignored);
+    if (size == 0) return false;
+    std::vector<BYTE> info(size);
+    if (!GetFileVersionInfoW(path, 0, size, info.data())) return false;
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(info.data(), L"\\", (void**)&fixed, &len) || fixed == nullptr) return false;
+    const unsigned v[3] = { HIWORD(fixed->dwFileVersionMS), LOWORD(fixed->dwFileVersionMS),
+                            HIWORD(fixed->dwFileVersionLS) };
+    for (int i = 0; i < 3; ++i) {
+        if (v[i] != kFirstLockingSetup[i]) return v[i] > kFirstLockingSetup[i];
+    }
+    return true;
+}
+
 // Native fallback error UI: one minimal, human-readable line. The
 // technical reason goes to the log, never to the user.
 int fail(const wchar_t* human_line, const std::string& log_line) {
     vclient::log::setup("FAIL: " + log_line);
+    // A FAILED SETUP NEVER BLOCKS THE RETRY ITS CARD ASKS FOR: it has
+    // stopped working, so before the card shows (it stays up to a minute)
+    // the handoff port and the one-Setup lock are released, and a Setup
+    // run again meanwhile installs normally, page handoff included.
+    vclient::setup_handoff::stop();
+    if (g_singleton != nullptr) {
+        CloseHandle(g_singleton);
+        g_singleton = nullptr;
+    }
     // The card is created on its own thread; give it the moment it needs
     // rather than falling back to a message box in a race.
     for (int i = 0; i < 20 && vclient::setup_window::g_hwnd.load() == nullptr; ++i) {
@@ -384,6 +430,58 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                             std::to_string(os.minor) + "." + std::to_string(os.build));
         }
     }
+    // ONE SETUP AT A TIME (owner ruling 2026-11-18, "they should work like
+    // singletons ... only one should remain open"; VIRULE/docs/scratchpads/
+    // OWNER_STAGING_INSTALL_BLOCKER_BRIEF_2026-11-18.md). Two copies started
+    // together (a double click, the browser's Open plus the file) raced over
+    // the same virule-client.exe.new and the same client, so one showed a
+    // failure while the other installed (QA laptop, 2026-11-18). A second
+    // copy brings the running Setup's card forward and leaves BEFORE it
+    // listens, downloads or writes anything. The name is per Windows session
+    // (Local\) and shared by both environments, which install into the same
+    // folder. The handle is held while this Setup works: fail() releases it
+    // before its card shows (a failed Setup never blocks the retry it asks
+    // for), and the system releases it at exit, crash included, so a dead
+    // Setup never blocks the next one.
+    {
+        HANDLE single = CreateMutexW(nullptr, FALSE, L"Local\\ViruleSetup.Singleton");
+        if (single == nullptr) {
+            // Never a reason to refuse an install: proceed unguarded.
+            vclient::log::setup("setup: one-Setup lock unavailable (error " +
+                                std::to_string(GetLastError()) + "); proceeding");
+        } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            vclient::log::setup("setup: another Setup is already running; bringing it forward and leaving");
+            // The running copy may still be creating its card: look briefly.
+            for (int i = 0; i < 40; ++i) {
+                if (HWND w = FindWindowW(vclient::setup_window::kClassName, nullptr)) {
+                    if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+                    SetForegroundWindow(w);
+                    break;
+                }
+                Sleep(50);
+            }
+            CloseHandle(single);
+            return 0;
+        } else {
+            g_singleton = single; // this Setup holds the lock while it works
+            // ONLY ONE SETUP CARD REMAINS: a card still on screen whose
+            // Setup takes the lock belongs to a Setup that already released
+            // it, which it does only on a terminal failure (fail()), so that
+            // card is finished. Close it before this Setup shows its own;
+            // its owner then exits. An older Setup's card is left alone (it
+            // takes no lock, so it may still be installing). This Setup has
+            // no card of its own yet.
+            EnumWindows([](HWND w, LPARAM) -> BOOL {
+                wchar_t cls[64] = {};
+                if (GetClassNameW(w, cls, 64) > 0 &&
+                    lstrcmpW(cls, vclient::setup_window::kClassName) == 0 &&
+                    card_owner_takes_lock(w)) {
+                    PostMessageW(w, vclient::setup_window::kMsgClose, 0, 0);
+                }
+                return TRUE;
+            }, 0);
+        }
+    }
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     // The two development seams (shared/dev_seams.hpp, parse_setup):
@@ -580,6 +678,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (ec) {
             std::error_code ec2;
             std::filesystem::remove(staged, ec2);
+            // The replacement is over (it failed): residency resumes now,
+            // so the retry the card asks for never waits on this lock.
+            maintenance.release();
             return fail(L"VIRULE couldn't be installed. Close VIRULE and run Setup again.",
                         "replace failed: " + ec.message());
         }

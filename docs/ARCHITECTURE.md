@@ -1181,6 +1181,35 @@ the client has confirmed the next feedback surface is already visible, and
 Setup never sits open indefinitely (the release wait is bounded, and a
 failure surface is dismissible and leaves on its own after 60 s).
 
+ONE SETUP AT A TIME (owner ruling 2026-11-18, "they should work like
+singletons ... only one should remain open";
+`VIRULE/docs/scratchpads/OWNER_STAGING_INSTALL_BLOCKER_BRIEF_2026-11-18.md`).
+On the QA laptop two copies of Setup started in the same second (a double
+open); they raced over `virule-client.exe.new` and the client, so one
+showed a failure card while the other installed. Right after the Windows
+version check, before it listens, downloads or writes anything, Setup
+takes the per-session mutex `Local\ViruleSetup.Singleton` (the same name in
+both environments, which install into the same folder). A second copy
+finds it held, brings the running Setup's card (`ViruleSetupWindow`)
+forward, logs one line and exits 0, showing nothing of its own. A FAILED
+SETUP NEVER BLOCKS THE RETRY ITS CARD ASKS FOR: on a terminal failure
+(`fail()`) Setup releases the handoff port (47613) and the lock BEFORE its
+failure card shows (and, at the one failure inside the replacement, the
+residency maintenance lock too), so a Setup run again while that card is
+still up installs normally, page handoff included. ONLY ONE CARD REMAINS:
+the Setup that wins the lock first closes any Setup card still on screen
+whose Setup takes the lock (file version 0.9.35 or later; by construction a
+finished failure card, since its owner released the lock), and that Setup
+then exits. A Setup cut before this change takes no lock and its card may
+still be working, so it is never closed: an OLD Setup and a new one opened
+together can still show two cards (after the re-cut the old Setups survive
+only as stale downloads). The system releases the lock at
+exit, crash included, so a dead Setup never blocks the next. A lock that
+cannot be created never refuses an install (logged, unguarded). The Windows
+version refusal runs before the lock, so a double open on an unsupported
+Windows shows two refusal cards (harmless). Setups cut before this change
+do not take the mutex. Code: `src/setup/main.cpp`.
+
 ### The browser -> Setup handoff channel (2026-09-03)
 
 The retired design guessed the originating browser (process ancestry,
